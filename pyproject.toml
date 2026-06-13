@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bude_vla"
+version = "0.1.0"
+description = "A 22M-parameter soft-prompted flow-matching VLA, re-implemented from scratch"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.11"
+authors = [{name = "Aditya"}]
+
+dependencies = [
+    "torch>=2.4.0",
+    "numpy>=1.26",
+    "pillow>=10.0",
+    "pyyaml>=6.0",
+    "huggingface-hub>=0.24",
+    "tokenizers>=0.19",
+    "pyarrow>=16",
+    "imageio>=2.34",
+]
+
+[project.optional-dependencies]
+sim = [
+    "mujoco>=3.2.0",
+    "mujoco-mjx>=3.2.0",
+    "jax[cuda12]>=0.4.30",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
