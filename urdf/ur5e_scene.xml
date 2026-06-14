@@ -1,0 +1,146 @@
+<mujoco model="UR5e-style arm + gripper">
+  <option timestep="0.005" iterations="50" solver="Newton" integrator="RK4" cone="pyramidal"/>
+
+  <compiler angle="radian" meshdir="../share/mujoco/meshes"/>
+
+  <visual>
+    <global offheight="1024" offwidth="1024"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <quality shadowsize="4096"/>
+  </visual>
+
+  <default>
+    <motor ctrlrange="-1 1" ctrllimited="true"/>
+    <joint damping="1.5" armature="0.5" frictionloss="0.1"/>
+    <position forcerange="-50 50"/>
+    <geom type="capsule" rgba="0.95 0.95 0.95 1"/>
+  </default>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.4 0.5 0.7" rgb2="0.1 0.15 0.2"
+             width="512" height="512"/>
+    <texture name="texplane" type="2d" builtin="checker" rgb1="0.3 0.3 0.4"
+             rgb2="0.4 0.4 0.5" width="512" height="512" mark="cross" markrgb="0.8 0.8 0.9"/>
+    <material name="matplane" reflectance="0.4" texture="texplane" texrepeat="3 3"
+              texuniform="true" rgba="0.7 0.7 0.8 1"/>
+    <material name="mat_white" rgba="0.95 0.95 0.95 1" specular="0.4" shininess="0.6"/>
+    <material name="mat_gray" rgba="0.55 0.55 0.6 1" specular="0.6" shininess="0.8"/>
+    <material name="mat_dark" rgba="0.18 0.18 0.22 1" specular="0.3" shininess="0.4"/>
+    <material name="mat_red" rgba="0.85 0.2 0.2 1" specular="0.5" shininess="0.7"/>
+    <material name="mat_green" rgba="0.2 0.7 0.3 1" specular="0.5" shininess="0.7"/>
+    <material name="mat_blue" rgba="0.2 0.4 0.85 1" specular="0.5" shininess="0.7"/>
+    <material name="mat_cube_red" rgba="0.9 0.2 0.2 1" specular="0.5" shininess="0.8"/>
+    <material name="mat_bowl_blue" rgba="0.2 0.4 0.85 1" specular="0.6" shininess="0.9"/>
+  </asset>
+
+  <worldbody>
+    <light directional="true" diffuse=".9 .9 .9" specular=".3 .3 .3" pos="0 0 5" dir="0 0 -1"/>
+    <light directional="true" diffuse=".5 .5 .5" specular="0 0 0" pos="2 -2 3" dir="-0.5 0.5 -1"/>
+
+    <geom name="floor" pos="0 0 0" size="1 1 0.05" type="plane" material="matplane" condim="3"/>
+    <geom name="table" pos="0.5 0 0.4" size="0.6 0.5 0.02" type="box" material="mat_white" rgba="0.95 0.92 0.85 1"/>
+
+    <!-- Camera mounted above and to the side for an over-the-shoulder view -->
+    <camera name="over_shoulder" pos="1.1 0.0 1.0" xyaxes="0 -1 0 0.5 0 1"
+            mode="fixed" resolution="224 224" fovy="60"/>
+
+    <!-- Workspace origin (the arm sits behind it) at z=0.42 (table top) -->
+    <site name="workspace_origin" pos="0.6 0 0.42" size="0.01" rgba="0 1 0 0.5"/>
+
+    <!-- Robot base -->
+    <body name="base" pos="0 0 0.42">
+      <!-- Base disc -->
+      <geom name="base_disc" type="capsule" size="0.07" fromto="0 0 0  0 0 0.05"
+            material="mat_dark" mass="2"/>
+
+      <!-- Shoulder pan joint (rotates around z) -->
+      <body name="shoulder" pos="0 0 0.06">
+        <joint name="shoulder_pan" type="hinge" axis="0 0 1" range="-3.14 3.14"/>
+        <geom name="shoulder_lnk" type="capsule" size="0.05" fromto="0 0 0  0 0 0.12"
+              material="mat_white" mass="1.2"/>
+        <geom name="shoulder_pad" type="capsule" fromto="0.0 0.0 0.06  0.0 0.025 0.06" size="0.05"
+              material="mat_dark"/>
+
+        <!-- Upper arm pivots around y (shoulder_lift) -->
+        <body name="upper_arm" pos="0 0 0.12">
+          <joint name="shoulder_lift" type="hinge" axis="0 1 0" range="-3.14 3.14"/>
+          <geom name="upper_arm_lnk" type="capsule" size="0.04" fromto="0 0 0  0.36 0 0"
+                material="mat_white" mass="1.5"/>
+
+          <!-- Inner upper arm pivots around y (elbow) -->
+          <body name="elbow" pos="0.36 0 0">
+            <joint name="elbow" type="hinge" axis="0 1 0" range="-3.14 3.14"/>
+            <geom name="elbow_pad" type="capsule" fromto="0.0 0.0 0.0  0.0 0.02 0.0" size="0.045"
+                  material="mat_dark"/>
+            <geom name="forearm" type="capsule" size="0.035" fromto="0 0 0  0.30 0 0"
+                  material="mat_white" mass="1.0"/>
+
+            <!-- Forearm roll -->
+            <body name="forearm_roll" pos="0.30 0 0">
+              <joint name="forearm_roll" type="hinge" axis="1 0 0" range="-3.14 3.14"/>
+              <geom name="forearm2" type="capsule" size="0.03" fromto="0 0 0  0.08 0 0"
+                    material="mat_gray" mass="0.5"/>
+
+              <!-- Wrist pitch -->
+              <body name="wrist_pitch" pos="0.08 0 0">
+                <joint name="wrist_pitch" type="hinge" axis="0 1 0" range="-3.14 3.14"/>
+                <geom name="wrist1" type="capsule" fromto="0.0 0.0 0.0  0.0 0.04 0.0" size="0.03"
+                      material="mat_dark" mass="0.3"/>
+
+                <!-- Wrist roll (gripper rotates around tool axis) -->
+                <body name="wrist_roll" pos="0 0 0">
+                  <joint name="wrist_roll" type="hinge" axis="1 0 0" range="-3.14 3.14"/>
+                  <geom name="wrist2" type="capsule" fromto="0.0 0.05 0.0  0.0 0.1 0.0" size="0.025"
+                        material="mat_dark" mass="0.3"/>
+
+                  <!-- Gripper base -->
+                  <body name="gripper" pos="0 0.10 0">
+                    <geom name="gripper_base" type="box" size="0.03 0.02 0.025"
+                          material="mat_gray" mass="0.2" pos="0 0 0" euler="0 0 0"/>
+
+                    <!-- Left finger (slides along x) -->
+                    <body name="finger_left" pos="0 0.02 0">
+                      <joint name="finger_left" type="slide" axis="1 0 0"
+                             range="-0.04 0" limited="true"/>
+                      <geom name="finger_left_geom" type="box" size="0.005 0.02 0.025"
+                            material="mat_white" mass="0.08"/>
+                    </body>
+                    <!-- Right finger (slides along x in opposite direction) -->
+                    <body name="finger_right" pos="0 -0.02 0">
+                      <joint name="finger_right" type="slide" axis="1 0 0"
+                             range="0 0.04" limited="true"/>
+                      <geom name="finger_right_geom" type="box" size="0.005 0.02 0.025"
+                            material="mat_white" mass="0.08"/>
+                    </body>
+
+                    <site name="ee_center" pos="0 0.04 0" size="0.005"
+                          rgba="0 1 0 0.8"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <!-- Actuators: 6 arm motors + 1 coupled gripper motor -->
+  <actuator>
+    <motor name="shoulder_pan_motor" joint="shoulder_pan" gear="60"/>
+    <motor name="shoulder_lift_motor" joint="shoulder_lift" gear="60"/>
+    <motor name="elbow_motor" joint="elbow" gear="40"/>
+    <motor name="forearm_roll_motor" joint="forearm_roll" gear="20"/>
+    <motor name="wrist_pitch_motor" joint="wrist_pitch" gear="10"/>
+    <motor name="wrist_roll_motor" joint="wrist_roll" gear="10"/>
+
+    <!-- Coupled gripper motor: positive control closes fingers (slides inward) -->
+    <motor name="gripper_motor" joint="finger_left" gear="20" ctrllimited="true"
+           ctrlrange="-1 1"/>
+    <!-- Mimic finger_right to mirror finger_left -->
+  </actuator>
+
+  <equality>
+    <joint joint1="finger_right" joint2="finger_left" polycoef="0 1 0 0 0"/>
+  </equality>
+</mujoco>
