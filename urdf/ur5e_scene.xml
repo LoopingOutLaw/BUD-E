@@ -40,6 +40,19 @@
     <geom name="floor" pos="0 0 0" size="1 1 0.05" type="plane" material="matplane" condim="3"/>
     <geom name="table" pos="0.5 0 0.4" size="0.6 0.5 0.02" type="box" material="mat_white" rgba="0.95 0.92 0.85 1"/>
 
+    <!-- Pushable cube: 5cm red box on the table with 6-DOF joint so it can move freely -->
+    <body name="cube" pos="0.6 0.0 0.435">
+      <freejoint name="cube_free"/>
+      <geom name="cube_geom" type="box" size="0.025 0.025 0.025" material="mat_cube_red" mass="0.2" condim="3"/>
+    </body>
+
+    <!-- Push target zone (visual only, flat box so MJX can collide-skip easily).
+         We use a thin box, not a cylinder, because MJX doesn't compute cylinder collisions. -->
+    <body name="target_zone" pos="0.85 0.0 0.421">
+      <geom name="target_zone_disc" type="box" size="0.05 0.05 0.001"
+            material="mat_bowl_blue" rgba="0.3 0.6 0.9 0.6" contype="0" conaffinity="0"/>
+    </body>
+
     <!-- Camera mounted above and to the side for an over-the-shoulder view -->
     <camera name="over_shoulder" pos="1.1 0.0 1.0" xyaxes="0 -1 0 0.5 0 1"
             mode="fixed" resolution="224 224" fovy="60"/>

@@ -12,6 +12,7 @@ from typing import Callable, List, Tuple
 import numpy as np
 
 from bude_vla.envs.so101_mjx import UR5eMJMJX
+from bude_vla.data.scripted_policies import scripted_push_step
 
 
 INSTRUCTION_BY_TASK = {
@@ -100,3 +101,84 @@ def save_episode_npz(episode: dict, out_dir: str | Path) -> str:
         success=episode["success"],
     )
     return str(path)
+
+
+def collect_push_episode(env, target_2d: np.ndarray, n_steps: int = 40,
+                          seed: int = 0,
+                          start_qpos: np.ndarray | None = None) -> dict:
+    """One push demonstration episode.
+
+    Cube starts at (0.6, 0, 0.435). target_2d is the (x, y) of the target zone.
+    Camera; policy pushes the cube toward target_2d.
+    """
+    rng = np.random.default_rng(seed)
+    # Randomize cube start position
+    cube_start_y = rng.uniform(-0.15, 0.15)
+    if start_qpos is None:
+        start_qpos = np.array([0.0, -0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+    # Set qpos so first 7 entries are arm joints+gripper; positions 7+ are freejoint of cube
+    nq = env.model_mj.nq
+    qpos = np.zeros(nq, dtype=np.float64)
+    qpos[:8] = np.concatenate([start_qpos[:7], [cube_start_y]]) if nq >= 8 else start_qpos[:nq]
+    # If there are positions for the cube freejoint (7 of them: 3 pos + 4 quat), set them
+    # qpos layout: [arm 6 joints + 1 gripper, cube freejoint 7 (xyz, quat)]. Total = 14.
+    # Above I only filled positions 0..7. Need cube xyz at pos 8..10 and quat 11..14.
+    if nq >= 15:
+        qpos[8] = 0.6
+        qpos[9] = cube_start_y
+        qpos[10] = 0.435
+        qpos[11:15] = [1.0, 0.0, 0.0, 0.0]  # unit quat
+
+    s = env.reset(joint_angles=qpos.astype(np.float32))
+
+    # Find the cube and target body indices by name scan
+    cube_body_id = next(i for i in range(env.model_mj.nbody)
+                         if env.model_mj.body(i).name == "cube")
+    target_geom_id = next(i for i in range(env.model_mj.ngeom)
+                            if env.model_mj.geom(i).name == "target_zone_disc")
+    target_pos_static = np.asarray(env.model_mj.geom_pos[target_geom_id], dtype=np.float32)
+    target_2d_full = np.array([target_pos_static[0] + target_2d[0],
+                                target_pos_static[1] + target_2d[1],
+                                target_pos_static[2]],
+                               dtype=np.float32)
+
+    images: List[np.ndarray] = []
+    qposes: List[np.ndarray] = []
+    actions: List[np.ndarray] = []
+    phase = 0
+    success = False
+    rewards_sum = 0.0
+
+    cube_id = cube_body_id
+    for t in range(n_steps):
+        img = env.render(s, height=64, width=64)
+        qpos_now = np.asarray(s.qpos, dtype=np.float32)
+        ee = np.asarray(s.site_xpos[0], dtype=np.float32)
+        cube_pos = np.asarray(s.xpos[cube_id], dtype=np.float32)
+        action, phase = scripted_push_step(ee, cube_pos, target_2d_full,
+                                            phase, nu=env.model_mj.nu)
+        # On reaching phase 1, open gripper (gripper is finger_left, +collapse pulls fingers in,
+        # so -1 opens fully — qpos=0 here is the default middle; we just drive toward -0.04)
+        action[-1] = -0.6  # open gripper fully via negative ctrl
+
+        rewards_sum += -float(np.linalg.norm(cube_pos - target_2d_full))
+
+        s_new = env.step_static(s, action)
+        s = s_new
+        images.append(img)
+        qposes.append(qpos_now)
+        actions.append(action)
+
+        if np.linalg.norm(cube_pos[:2] - target_2d_full[:2]) < 0.05:
+            success = True
+            break
+
+    return {
+        "instruction": INSTRUCTION_BY_TASK["push"],
+        "images": np.stack(images),
+        "qpos": np.stack(qposes),
+        "actions": np.stack(actions),
+        "total_reward": rewards_sum,
+        "success": success,
+    }
