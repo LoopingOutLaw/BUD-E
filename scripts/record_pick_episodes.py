@@ -42,7 +42,8 @@ def _main_loop(model, data, policy, renderer, cam_id, viewer=None,
         proprios.append(data.qpos[7:15].astype(np.float32).copy())
 
         ctrl, arm_target, done, _ = policy.step(model, data)
-        actions.append(ctrl.copy())
+        kinematic_action = np.concatenate([arm_target, [ctrl[6]]]).astype(np.float32)
+        actions.append(kinematic_action)
 
         data.ctrl[:] = 0.0
         data.ctrl[6] = ctrl[6]
@@ -95,6 +96,8 @@ def main():
     ap.add_argument("--cam", default=None,
                     help="Camera name (e.g. front_top). Default: free camera "
                          "(auto-framing, same as push_v3)")
+    ap.add_argument("--img-size", type=int, default=64,
+                    help="Render resolution (default 64; use 224 for VLA training)")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -121,7 +124,7 @@ def main():
 
         policy = ScriptedPickAndPlace(model, data,
                                       cube_start_xy=np.array([cx, cy]))
-        renderer = mujoco.Renderer(model, height=64, width=64)
+        renderer = mujoco.Renderer(model, height=args.img_size, width=args.img_size)
 
         if args.render:
             with mujoco.viewer.launch_passive(model, data) as viewer:

@@ -47,7 +47,8 @@ def record_pick_episode(root: str | Path, episode_idx: int = 0,
         proprios.append(data.qpos[7:15].astype(np.float32).copy())
 
         ctrl, arm_target, done, info = policy.step(model, data)
-        actions.append(ctrl.copy())
+        kinematic_action = np.concatenate([arm_target, [ctrl[6]]]).astype(np.float32)
+        actions.append(kinematic_action)
 
         data.ctrl[:] = 0.0
         data.ctrl[6] = ctrl[6]
