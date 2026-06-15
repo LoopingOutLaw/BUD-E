@@ -16,6 +16,30 @@ from pathlib import Path
 from typing import List
 
 import numpy as np
+import torch
+
+# ── Character-level tokenizer for instructions ──────────────────────────
+
+_CHAR_VOCAB = {chr(i): i + 2 for i in range(32, 127)}  # printable ASCII -> 2..126
+_CHAR_VOCAB["<pad>"] = 0
+_CHAR_VOCAB["<unk>"] = 1
+_TEXT_MAX_LEN = 64
+
+
+def _tokenize_instruction(text: str, max_len: int = _TEXT_MAX_LEN) -> np.ndarray:
+    """Convert instruction string to token IDs array of length max_len."""
+    ids = [_CHAR_VOCAB.get(c, 1) for c in text.strip()[:max_len]]
+    if len(ids) < max_len:
+        ids += [0] * (max_len - len(ids))
+    return np.array(ids, dtype=np.int64)
+
+
+def _domain_from_instruction(text: str) -> int:
+    """Heuristic: reach=0, push=1."""
+    t = text.lower()
+    if "push" in t:
+        return 1
+    return 0
 
 
 META = {
@@ -39,13 +63,13 @@ def write_episode(root: str | Path, episode: dict) -> Path:
     """Write one episode to the v3 layout. Return path to the parquet file."""
     root = Path(root)
     images = episode["images"]                        # (T, H, W, 3) uint8
-    qpos = episode["qpos"].astype(np.float32)         # (T, 8)
+    proprio = episode["proprio"].astype(np.float32)     # (T, 8) arm+gripper
     actions = episode["actions"].astype(np.float32)   # (T, 7)
     instruction = episode["instruction"]
 
     T = images.shape[0]
-    assert qpos.shape[0] == T, f"qpos length {qpos.shape[0]} != T {T}"
-    assert actions.shape[0] == T
+    assert proprio.shape[0] == T, f"proprio length {proprio.shape[0]} != T {T}"
+    assert proprio.shape[1] == 8, f"proprio dim {proprio.shape[1]} != 8"
 
     # Find next episode_idx
     episodes_index = _frame_index_dir(root)
@@ -75,7 +99,7 @@ def write_episode(root: str | Path, episode: dict) -> Path:
     instr_arr = np.array([instruction] * T, dtype=object)
 
     table = pa.table({
-        "observation.state": pa.array(list(qpos)),
+        "observation.state": pa.array(list(proprio)),
         "action": pa.array(list(actions)),
         "language_instruction": pa.array(instr_arr, type=pa.string()),
     })
@@ -140,3 +164,117 @@ class BUDEDataset:
 
     def num_episodes(self) -> int:
         return len(self.frames)
+
+
+class BUDETrainingDataset:
+    """PyTorch Dataset for training BUD-E policy from LeRobot v3 data.
+
+    On first .read(), decodes all MP4 frames into a single .npy file in the
+    dataset root and memory-maps it. Subsequent reads skip the decode and
+    just mmap the .npy — instant startup, zero MP4 decoding at training time.
+    """
+
+    def __init__(self, root: str | Path, chunk_size: int = 4):
+        self.root = Path(root)
+        self.chunk_size = chunk_size
+        self._episodes: list[dict] = []
+        self._cum_frames: list[int] = []
+        self._total_frames = 0
+        self._images: np.ndarray | None = None
+
+    def read(self) -> "BUDETrainingDataset":
+        from pyarrow import parquet as pq
+
+        ep_index = _frame_index_dir(self.root)
+        ep_files = sorted(ep_index.glob("*.json"))
+
+        for ep_meta_path in ep_files:
+            ep_meta = json.loads(ep_meta_path.read_text())
+            ep_idx = ep_meta["episode_index"]
+            chunk_idx = ep_idx // 1000
+            base = self.root / "data" / f"chunk-{chunk_idx:03d}"
+
+            pq_path = base / f"episode_{ep_idx:06d}.parquet"
+            table = pq.read_table(str(pq_path))
+            states = np.stack([np.asarray(row.as_py(), dtype=np.float32)
+                               for row in table["observation.state"]])
+            actions = np.stack([np.asarray(row.as_py(), dtype=np.float32)
+                                for row in table["action"]])
+            instruction = table["language_instruction"][0].as_py()
+            T = states.shape[0]
+
+            self._episodes.append({
+                "states": states,
+                "actions": actions,
+                "instruction": instruction,
+                "token_ids": _tokenize_instruction(instruction),
+                "domain_id": _domain_from_instruction(instruction),
+                "length": T,
+                "ep_idx": ep_idx,
+                "chunk_idx": chunk_idx,
+            })
+            self._cum_frames.append(self._total_frames)
+            self._total_frames += T
+
+        npy_path = self.root / "all_images.npy"
+        if npy_path.exists():
+            self._images = np.load(str(npy_path), mmap_mode="r")
+            assert self._images.shape[0] == self._total_frames, \
+                f"npy has {self._images.shape[0]} frames, expected {self._total_frames}"
+        else:
+            self._precache_images(npy_path)
+
+        return self
+
+    def _precache_images(self, npy_path: Path):
+        import imageio.v3 as iio
+        all_imgs = np.zeros((self._total_frames, 64, 64, 3), dtype=np.uint8)
+        offset = 0
+        for ep in self._episodes:
+            chunk_idx = ep["chunk_idx"]
+            ep_idx = ep["ep_idx"]
+            vid_path = (self.root / "videos" / f"chunk-{chunk_idx:03d}" /
+                        "observation.images.top" / f"episode_{ep_idx:06d}.mp4")
+            frames = iio.imread(str(vid_path), plugin="pyav")
+            T = frames.shape[0]
+            all_imgs[offset:offset + T] = frames
+            offset += T
+        np.save(str(npy_path), all_imgs)
+        self._images = np.load(str(npy_path), mmap_mode="r")
+
+    def __len__(self) -> int:
+        return self._total_frames
+
+    def __getitem__(self, idx: int) -> dict:
+        ep_i = 0
+        while ep_i < len(self._cum_frames) - 1 and idx >= self._cum_frames[ep_i + 1]:
+            ep_i += 1
+        frame_in_ep = idx - self._cum_frames[ep_i]
+        ep = self._episodes[ep_i]
+
+        img = torch.from_numpy(
+            self._images[idx].astype(np.float32)
+        ).permute(2, 0, 1) / 255.0
+        st = torch.from_numpy(ep["states"][frame_in_ep])
+        txt = torch.from_numpy(ep["token_ids"])
+        dom = torch.tensor(ep["domain_id"], dtype=torch.long)
+
+        a_slice = ep["actions"][frame_in_ep: frame_in_ep + self.chunk_size]
+        n = a_slice.shape[0]
+        if n < self.chunk_size:
+            pad = np.zeros((self.chunk_size - n, 7), dtype=np.float32)
+            a_slice = np.concatenate([a_slice, pad], axis=0)
+        act = torch.from_numpy(a_slice)
+
+        tau = torch.rand(1).squeeze()
+        noise = torch.randn_like(act)
+
+        return {
+            "images": img,
+            "text_ids": txt,
+            "proprio": st,
+            "domain_id": dom,
+            "actions": act,
+            "tau": tau,
+            "noise": noise,
+        }

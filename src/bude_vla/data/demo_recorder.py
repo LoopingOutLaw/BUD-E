@@ -13,6 +13,7 @@ import numpy as np
 
 from bude_vla.envs.so101_mjx import UR5eMJMJX
 from bude_vla.data.scripted_policies import scripted_push_step
+from bude_vla.data.lerobot_v3 import write_episode
 
 
 INSTRUCTION_BY_TASK = {
@@ -75,7 +76,8 @@ def collect_reach_episode(env: UR5eMJMJX, target_xyz: np.ndarray,
     return {
         "instruction": INSTRUCTION_BY_TASK["reach"],
         "images": np.stack(images),         # (T, 64, 64, 3)
-        "qpos": np.stack(qposes),           # (T, njnt)
+        "qpos": np.stack(qposes),           # (T, njnt) full state incl cube
+        "proprio": np.stack(qposes)[:, 7:15],  # (T, 8) arm+gripper only
         "actions": np.stack(actions),       # (T, nu)
         "total_reward": rewards_sum,
         "success": success,
@@ -108,7 +110,7 @@ def collect_push_episode(env, target_2d: np.ndarray, n_steps: int = 40,
                           start_qpos: np.ndarray | None = None) -> dict:
     """One push demonstration episode.
 
-    Cube starts at (0.6, 0, 0.435). target_2d is the (x, y) of the target zone.
+    Cube starts at (0.6, 0, 0.445). target_2d is the (x, y) of the target zone.
     Camera; policy pushes the cube toward target_2d.
     """
     rng = np.random.default_rng(seed)
@@ -127,7 +129,7 @@ def collect_push_episode(env, target_2d: np.ndarray, n_steps: int = 40,
     if nq >= 15:
         qpos[8] = 0.6
         qpos[9] = cube_start_y
-        qpos[10] = 0.435
+        qpos[10] = 0.445
         qpos[11:15] = [1.0, 0.0, 0.0, 0.0]  # unit quat
 
     s = env.reset(joint_angles=qpos.astype(np.float32))
@@ -135,9 +137,9 @@ def collect_push_episode(env, target_2d: np.ndarray, n_steps: int = 40,
     # Find the cube and target body indices by name scan
     cube_body_id = next(i for i in range(env.model_mj.nbody)
                          if env.model_mj.body(i).name == "cube")
-    target_geom_id = next(i for i in range(env.model_mj.ngeom)
-                            if env.model_mj.geom(i).name == "target_zone_disc")
-    target_pos_static = np.asarray(env.model_mj.geom_pos[target_geom_id], dtype=np.float32)
+    target_body_id = next(i for i in range(env.model_mj.nbody)
+                          if env.model_mj.body(i).name == "target_zone")
+    target_pos_static = np.asarray(env.model_mj.body_pos[target_body_id], dtype=np.float32)
     target_2d_full = np.array([target_pos_static[0] + target_2d[0],
                                 target_pos_static[1] + target_2d[1],
                                 target_pos_static[2]],
@@ -178,7 +180,38 @@ def collect_push_episode(env, target_2d: np.ndarray, n_steps: int = 40,
         "instruction": INSTRUCTION_BY_TASK["push"],
         "images": np.stack(images),
         "qpos": np.stack(qposes),
+        "proprio": np.stack(qposes)[:, 7:15],
         "actions": np.stack(actions),
         "total_reward": rewards_sum,
         "success": success,
     }
+
+
+def record_dataset(env: UR5eMJMJX, task: str = "reach", n_episodes: int = 100,
+                    n_steps: int = 30, root: str | Path = "data/lerobot_v3") -> Path:
+    """Record n_episodes of a task and write them to LeRobot v3 layout.
+
+    Args:
+        env: UR5eMJMJX instance.
+        task: "reach" or "push".
+        n_episodes: number of episodes to record.
+        n_steps: max steps per episode.
+        root: output directory for the v3 dataset.
+
+    Returns:
+        Path to the dataset root.
+    """
+    rng = np.random.default_rng(0)
+    for i in range(n_episodes):
+        if task == "reach":
+            target = rng.uniform([0.4, -0.3, 0.42], [0.8, 0.3, 0.65], size=3).astype(np.float32)
+            ep = collect_reach_episode(env, target, n_steps=n_steps, seed=i)
+        elif task == "push":
+            target_2d = rng.uniform([-0.1, -0.15], [0.1, 0.15], size=2).astype(np.float32)
+            ep = collect_push_episode(env, target_2d, n_steps=n_steps, seed=i)
+        else:
+            raise ValueError(f"Unknown task: {task}")
+        write_episode(root, ep)
+        if (i + 1) % 50 == 0 or i == 0:
+            print(f"  [{task}] episode {i + 1}/{n_episodes} done")
+    return Path(root)

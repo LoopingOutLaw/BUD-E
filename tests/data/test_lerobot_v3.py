@@ -30,7 +30,7 @@ def test_dataset_reads_back_written_episode():
     env = UR5eMJMJX()
     T = 5
     ep = _make_episode(env, T=T)
-    n_state = ep["qpos"].shape[1]
+    n_state = ep["proprio"].shape[1]
     n_action = ep["actions"].shape[1]
     with tempfile.TemporaryDirectory() as td:
         write_episode(td, ep)

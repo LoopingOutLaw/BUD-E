@@ -1,5 +1,5 @@
 <mujoco model="UR5e-style arm + gripper">
-  <option timestep="0.005" iterations="50" solver="Newton" integrator="RK4" cone="pyramidal"/>
+  <option timestep="0.005" iterations="50" solver="Newton" integrator="Euler" cone="pyramidal"/>
 
   <compiler angle="radian" meshdir="../share/mujoco/meshes"/>
 
@@ -12,7 +12,6 @@
   <default>
     <motor ctrlrange="-1 1" ctrllimited="true"/>
     <joint damping="1.5" armature="0.5" frictionloss="0.1"/>
-    <position forcerange="-50 50"/>
     <geom type="capsule" rgba="0.95 0.95 0.95 1"/>
   </default>
 
@@ -44,7 +43,7 @@
     <!-- Pushable cube: 5cm red box on the table with 6-DOF freejoint.
          condim=4 with matching solref/solimp gives MJX a stable contact so the
          cube stays resting on the table instead of falling through. -->
-    <body name="cube" pos="0.6 0.0 0.435">
+    <body name="cube" pos="0.6 0.0 0.445">
       <freejoint name="cube_free"/>
       <geom name="cube_geom" type="box" size="0.025 0.025 0.025"
             material="mat_cube_red" mass="0.2" condim="4"
@@ -59,8 +58,17 @@
     </body>
 
     <!-- Camera mounted above and to the side for an over-the-shoulder view -->
-    <camera name="over_shoulder" pos="1.1 0.0 1.0" xyaxes="0 -1 0 0.5 0 1"
-            mode="fixed" resolution="224 224" fovy="60"/>
+    <camera name="over_shoulder" pos="0.1 0.55 0.70" xyaxes="0 -1 0 0.9 0 0.44"
+            mode="fixed" fovy="48"/>
+    <!-- POV: forward from wrist looking down at workspace -->
+    <camera name="pov" pos="0.4 -0.5 0.80" xyaxes="0 -1 0 0.6 0 0.8"
+            mode="fixed" fovy="55"/>
+    <!-- Front top: high cinematic up-shot (default of free camera tends to similar) -->
+    <camera name="front_top" pos="0.4 0.0 1.0" xyaxes="0 -1 0 0.5 0 0.86"
+            mode="fixed" fovy="42"/>
+    <!-- Wrist cam: close-up low third-person -->
+    <camera name="wrist" pos="0.6 0.45 0.7" xyaxes="0 -1 0 0.7 0 0.71"
+            mode="fixed" fovy="55"/>
 
     <!-- Workspace origin (the arm sits behind it) at z=0.42 (table top) -->
     <site name="workspace_origin" pos="0.6 0 0.42" size="0.01" rgba="0 1 0 0.5"/>
@@ -77,7 +85,7 @@
         <geom name="shoulder_lnk" type="capsule" size="0.05" fromto="0 0 0  0 0 0.12"
               material="mat_white" mass="1.2"/>
         <geom name="shoulder_pad" type="capsule" fromto="0.0 0.0 0.06  0.0 0.025 0.06" size="0.05"
-              material="mat_dark"/>
+              material="mat_dark" contype="0" conaffinity="0"/>
 
         <!-- Upper arm pivots around y (shoulder_lift) -->
         <body name="upper_arm" pos="0 0 0.12">
@@ -89,7 +97,7 @@
           <body name="elbow" pos="0.36 0 0">
             <joint name="elbow" type="hinge" axis="0 1 0" range="-3.14 3.14"/>
             <geom name="elbow_pad" type="capsule" fromto="0.0 0.0 0.0  0.0 0.02 0.0" size="0.045"
-                  material="mat_dark"/>
+                  material="mat_dark" contype="0" conaffinity="0"/>
             <geom name="forearm" type="capsule" size="0.035" fromto="0 0 0  0.30 0 0"
                   material="mat_white" mass="1.0"/>
 

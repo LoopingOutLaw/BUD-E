@@ -1,6 +1,6 @@
 """Push scripted policy: lower gripper toward cube, push toward target zone.
 
-The cube starts at (~0.6, 0, 0.435) with some random y-offset. Target zone is at
+The cube starts at (~0.6, 0, 0.445) with some random y-offset. Target zone is at
 (0.85, 0, 0.421). Policy:
   - Phase 1 (approach): drive EE toward (cube.x, cube.y - 0.05) for ~10 steps
   - Phase 2 (push): hold EE at cube.y and ride the cube in +x until z target reached
