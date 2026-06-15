@@ -11,6 +11,7 @@ venv/
 wandb/
 checkpoints/
 datasets/
+data/
 *.mp4
 *.parquet
 .DS_Store

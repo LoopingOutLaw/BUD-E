@@ -42,7 +42,7 @@ def _domain_from_instruction(text: str) -> int:
     return 0
 
 
-    META = {
+META = {
     "fps": 30,
     "robot_type": "ur5e_so101_sim",
     "codebase_version": "v3.0",
