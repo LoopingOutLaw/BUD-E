@@ -42,14 +42,14 @@ def _domain_from_instruction(text: str) -> int:
     return 0
 
 
-META = {
+    META = {
     "fps": 30,
     "robot_type": "ur5e_so101_sim",
     "codebase_version": "v3.0",
     "features": {
         "observation.state": {"dtype": "float32", "shape": [8]},
         "action": {"dtype": "float32", "shape": [7]},
-        "observation.images.top": {"dtype": "video", "shape": [64, 64, 3]},
+        "observation.images.top": {"dtype": "video", "shape": "auto"},
         "language_instruction": {"dtype": "string", "shape": [1]},
     },
 }
@@ -228,7 +228,12 @@ class BUDETrainingDataset:
 
     def _precache_images(self, npy_path: Path):
         import imageio.v3 as iio
-        all_imgs = np.zeros((self._total_frames, 64, 64, 3), dtype=np.uint8)
+        first_ep = self._episodes[0]
+        vid0 = (self.root / "videos" / f"chunk-{first_ep['chunk_idx']:03d}" /
+                "observation.images.top" / f"episode_{first_ep['ep_idx']:06d}.mp4")
+        sample = iio.imread(str(vid0), plugin="pyav")
+        H, W, C = sample.shape[1], sample.shape[2], sample.shape[3]
+        all_imgs = np.zeros((self._total_frames, H, W, C), dtype=np.uint8)
         offset = 0
         for ep in self._episodes:
             chunk_idx = ep["chunk_idx"]
