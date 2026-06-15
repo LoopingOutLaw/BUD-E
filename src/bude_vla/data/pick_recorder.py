@@ -33,7 +33,7 @@ def record_pick_episode(root: str | Path, episode_idx: int = 0,
 
     policy = ScriptedPickAndPlace(model, data, cube_start_xy=np.array(cube_xy))
 
-    images, proprios, actions = [], [], []
+    images, proprios, actions, cube_xyzs = [], [], [], []
     cube_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
     target_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
 
@@ -44,7 +44,11 @@ def record_pick_episode(root: str | Path, episode_idx: int = 0,
             renderer.update_scene(data)
         img = renderer.render()
         images.append(np.asarray(img).copy())
-        proprios.append(data.qpos[7:15].astype(np.float32).copy())
+        arm_proprio = data.qpos[7:15].astype(np.float32).copy()
+        cube_xyz = data.xpos[cube_body_id].astype(np.float32).copy()
+        cube_xyzs.append(cube_xyz)
+        proprio = np.concatenate([arm_proprio, cube_xyz]).astype(np.float32)
+        proprios.append(proprio)
 
         ctrl, arm_target, done, info = policy.step(model, data)
         kinematic_action = np.concatenate([arm_target, [ctrl[6]]]).astype(np.float32)

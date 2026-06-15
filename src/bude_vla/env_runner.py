@@ -149,7 +149,8 @@ class PolicyRolloutRunner:
         self.renderer.update_scene(data)
         return np.asarray(self.renderer.render()).copy()
 
-    def run_one(self, data, policy, cube_xy) -> RolloutResult:
+    def run_one(self, data, policy, cube_xy,
+                viewer=None, step_delay: float = 0.0) -> RolloutResult:
         frames: list = []
         try_labels: list = []
         success = False
@@ -160,17 +161,25 @@ class PolicyRolloutRunner:
             _reset_cube(data, cube_xy)
             offset = None
             grip_close_count = 0
+            chunk = None
+            cursor = 0
 
             for step in range(self.max_steps_per_try):
                 img = self._render(data)
-                proprio = data.qpos[7:15].astype(np.float32).copy()
+                arm_proprio = data.qpos[7:15].astype(np.float32).copy()
+                cube_xyz = _cube_xyz(self.model, data).astype(np.float32)
+                proprio = np.concatenate([arm_proprio, cube_xyz]).astype(np.float32)
                 frames.append(img)
                 try_labels.append(f"try {try_idx + 1}/{self.max_tries}")
 
-                batch = _build_batch(img, proprio, self.text_ids,
-                                     domain_id=0, device=self.device)
-                actions = policy.sample(batch)
-                a = actions[0, 0, :].detach().cpu().numpy()
+                if chunk is None or cursor >= chunk.shape[0]:
+                    batch = _build_batch(img, proprio, self.text_ids,
+                                         domain_id=0, device=self.device)
+                    chunk = policy.sample(batch)[0].detach().cpu().numpy()
+                    cursor = 0
+
+                a = chunk[cursor]
+                cursor += 1
 
                 if np.any(np.isnan(a)):
                     arm_target = HOME_QPOS[:6].copy()
@@ -211,6 +220,12 @@ class PolicyRolloutRunner:
 
                 if _is_failure(self.model, data, step, self.max_steps_per_try):
                     break
+
+                if viewer is not None:
+                    viewer.sync()
+                if step_delay > 0:
+                    import time as _t
+                    _t.sleep(step_delay)
 
             final_try_idx = try_idx + 1
             if success:

@@ -42,12 +42,38 @@ def _domain_from_instruction(text: str) -> int:
     return 0
 
 
+def _augment_image(img_chw: torch.Tensor, rng: np.random.Generator,
+                   brightness_range: float = 0.10,
+                   crop_pad: int = 8) -> torch.Tensor:
+    """Augment an image tensor (C, H, W float32 in [0, 1]) with random crop
+    and brightness jitter. Returns same shape.
+
+    Crop is reflective-padding by `crop_pad` then cropping back. Pads are
+    small relative to 224×224 — keeps the cube and target zone mostly inside
+    the crop while giving 55% pixel translation variance. Brightness jitter
+    adds a uniform scalar in [-brightness_range, +brightness_range].",
+    """
+    c, h, w = img_chw.shape
+    pad = int(crop_pad)
+    if pad > 0:
+        padded = torch.nn.functional.pad(
+            img_chw.unsqueeze(0), (pad, pad, pad, pad), mode="reflect"
+        ).squeeze(0)
+        dy = int(rng.integers(0, 2 * pad + 1))
+        dx = int(rng.integers(0, 2 * pad + 1))
+        img_chw = padded[:, dy:dy + h, dx:dx + w]
+    if brightness_range > 0.0:
+        delta = float(rng.uniform(-brightness_range, brightness_range))
+        img_chw = (img_chw + delta).clamp(0.0, 1.0)
+    return img_chw
+
+
 META = {
     "fps": 30,
     "robot_type": "ur5e_so101_sim",
     "codebase_version": "v3.0",
     "features": {
-        "observation.state": {"dtype": "float32", "shape": [8]},
+        "observation.state": {"dtype": "float32", "shape": [11]},
         "action": {"dtype": "float32", "shape": [7]},
         "observation.images.top": {"dtype": "video", "shape": "auto"},
         "language_instruction": {"dtype": "string", "shape": [1]},
@@ -59,17 +85,26 @@ def _frame_index_dir(root: Path) -> Path:
     return root / "meta" / "episodes_index"
 
 
+def _proprio_dim(episode: dict) -> int:
+    """Return proprio dim from episode dict (default 8 for backward compat)."""
+    return int(episode["proprio"].shape[1])
+
+
 def write_episode(root: str | Path, episode: dict) -> Path:
     """Write one episode to the v3 layout. Return path to the parquet file."""
     root = Path(root)
     images = episode["images"]                        # (T, H, W, 3) uint8
-    proprio = episode["proprio"].astype(np.float32)     # (T, 8) arm+gripper
+    proprio = episode["proprio"].astype(np.float32)     # (T, state_dim)
     actions = episode["actions"].astype(np.float32)   # (T, 7)
     instruction = episode["instruction"]
 
     T = images.shape[0]
     assert proprio.shape[0] == T, f"proprio length {proprio.shape[0]} != T {T}"
-    assert proprio.shape[1] == 8, f"proprio dim {proprio.shape[1]} != 8"
+    state_dim = int(proprio.shape[1])
+    assert state_dim in (8, 11), (
+        f"proprio dim {state_dim} not in (8, 11) — pick_recorder uses 11, "
+        f"old reach/push datasets use 8"
+    )
 
     # Find next episode_idx
     episodes_index = _frame_index_dir(root)
@@ -110,7 +145,14 @@ def write_episode(root: str | Path, episode: dict) -> Path:
     info_path = root / "meta" / "info.json"
     if not info_path.exists():
         info_path.parent.mkdir(parents=True, exist_ok=True)
-        info_path.write_text(json.dumps(META, indent=2))
+        # Adapt META to actual proprio shape (8 for reach/push, 11 for pick)
+        local_meta = {**META,
+                      "features": {**META["features"],
+                                   "observation.state": {
+                                       "dtype": "float32",
+                                       "shape": [state_dim],
+                                   }}}
+        info_path.write_text(json.dumps(local_meta, indent=2))
 
     ep_meta = {
         "episode_index": episode_idx,
@@ -174,13 +216,20 @@ class BUDETrainingDataset:
     just mmap the .npy — instant startup, zero MP4 decoding at training time.
     """
 
-    def __init__(self, root: str | Path, chunk_size: int = 4):
+    def __init__(self, root: str | Path, chunk_size: int = 4,
+                 augment: bool = False,
+                 brightness_range: float = 0.10,
+                 crop_pad: int = 8):
         self.root = Path(root)
         self.chunk_size = chunk_size
+        self.augment = augment
+        self.brightness_range = brightness_range
+        self.crop_pad = crop_pad
         self._episodes: list[dict] = []
         self._cum_frames: list[int] = []
         self._total_frames = 0
         self._images: np.ndarray | None = None
+        self._rng = np.random.default_rng()
 
     def read(self) -> "BUDETrainingDataset":
         from pyarrow import parquet as pq
@@ -260,6 +309,10 @@ class BUDETrainingDataset:
         img = torch.from_numpy(
             self._images[idx].astype(np.float32)
         ).permute(2, 0, 1) / 255.0
+        if self.augment:
+            img = _augment_image(img, self._rng,
+                                 brightness_range=self.brightness_range,
+                                 crop_pad=self.crop_pad)
         st = torch.from_numpy(ep["states"][frame_in_ep])
         txt = torch.from_numpy(ep["token_ids"])
         dom = torch.tensor(ep["domain_id"], dtype=torch.long)

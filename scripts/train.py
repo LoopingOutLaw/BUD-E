@@ -31,10 +31,11 @@ def collate_fn(batch: list[dict]) -> dict:
 
 
 def build_dataloader(roots: list[str | Path], chunk_size: int = 4,
-                     batch_size: int = 32, num_workers: int = 0) -> torch.utils.data.DataLoader:
+                     batch_size: int = 32, num_workers: int = 0,
+                     augment: bool = False) -> torch.utils.data.DataLoader:
     all_frames = []
     for root in roots:
-        ds = BUDETrainingDataset(root, chunk_size=chunk_size)
+        ds = BUDETrainingDataset(root, chunk_size=chunk_size, augment=augment)
         ds.read()
         all_frames.append(ds)
         print(f"  loaded {len(ds)} frames from {root}")
@@ -65,6 +66,7 @@ def train(
     weight_decay: float = 1e-4,
     save_every: int = 5000,
     device: str = "cuda",
+    augment: bool = False,
     task_name: str = "policy",
 ):
     if data_roots is None:
@@ -90,7 +92,8 @@ def train(
         print(f"  {k}: {v:,}")
 
     dl = build_dataloader(data_roots, chunk_size=chunk_size,
-                          batch_size=batch_size, num_workers=0)
+                          batch_size=batch_size, num_workers=0,
+                          augment=augment)
 
     optimizer = AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=n_steps, eta_min=lr * 0.01)
@@ -173,6 +176,9 @@ if __name__ == "__main__":
     parser.add_argument("--task", default="policy",
                         help="Subdirectory under checkpoints/ for this run, "
                              "and filename prefix (e.g. 'pick', 'reach').")
+    parser.add_argument("--augment", action="store_true",
+                        help="Enable image augmentation (random crop + "
+                             "brightness jitter) on the training dataset.")
     args = parser.parse_args()
 
     roots = args.data_root
@@ -188,5 +194,6 @@ if __name__ == "__main__":
         img_size=args.img_size,
         lr=args.lr,
         save_every=args.save_every,
+        augment=args.augment,
         task_name=args.task,
     )

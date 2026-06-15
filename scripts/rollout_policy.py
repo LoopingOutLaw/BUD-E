@@ -10,21 +10,32 @@ Headless usage:
         --ckpt checkpoints/pick_224/pick_224_final.pt \
         --out demos/videos/pick_vla_rollout.mp4 \
         --num-rollouts 5 --img-size 224
+
+Live viewer usage (needs $DISPLAY):
+    cd /home/aditya/BUD-E && \
+    MUJOCO_GL=glfw DISPLAY=:1 XDG_RUNTIME_DIR=/tmp \
+    PYTHONPATH=src python scripts/rollout_policy.py \
+        --ckpt /home/aditya/bude_vla/checkpoints/pick_224/pick_224_final.pt \
+        --out /home/aditya/BUD-E/demos/videos/pick_vla_rollout_live.mp4 \
+        --num-rollouts 5 --img-size 224 --viewer --slow 0.04
 """
 from __future__ import annotations
 
 import argparse
 import os
 import sys
+import time
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
 import cv2
 import imageio
 import mujoco
+import mujoco.viewer  # noqa: F401  ensure module is loaded for launch_passive
 import numpy as np
 import torch
 from pathlib import Path
+from typing import Optional
 
 from bude_vla.env_runner import PolicyRolloutRunner
 from bude_vla.envs.so101_mjx import ARM_MODEL_PATH
@@ -82,6 +93,13 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default=None,
                     help="cuda or cpu; default auto-detect")
+    ap.add_argument("--viewer", action="store_true",
+                    help="open a live MuJoCo viewer per rollout (needs DISPLAY). "
+                         "Hits env_runner internals via a sync hook — visualizes "
+                         "the arm in real time, doesn't replace MP4 frame capture.")
+    ap.add_argument("--slow", type=float, default=0.0,
+                    help="seconds to sleep per sim step in viewer mode "
+                         "(0.04 ~= real-time). Ignored when --viewer is off.")
     args = ap.parse_args()
 
     if args.device is None:
@@ -102,6 +120,9 @@ def main():
         device=device,
     )
 
+    if args.viewer and os.environ.get("MUJOCO_GL") != "glfw":
+        os.environ["MUJOCO_GL"] = "glfw"
+
     all_frames: list = []
     n_success = 0
 
@@ -114,7 +135,26 @@ def main():
         data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
         mujoco.mj_forward(model, data)
 
-        result = runner.run_one(data, policy, cube_xy)
+        viewer = None
+        if args.viewer:
+            try:
+                viewer = mujoco.viewer.launch_passive(model, data)
+                print(f"  [viewer] live window open on DISPLAY={os.environ.get('DISPLAY', ':0')}")
+            except Exception as exc:
+                print(f"  [viewer] could not open: {exc}; continuing headless")
+                viewer = None
+
+        result = runner.run_one(
+            data, policy, cube_xy,
+            viewer=viewer, step_delay=args.slow,
+        )
+
+        if viewer is not None:
+            try:
+                viewer.close()
+            except Exception:
+                pass
+
         status = "SUCCESS" if result.success else "FAILED"
         n_success += int(result.success)
         print(f"  -> {status} in {result.n_tries} try/tries")

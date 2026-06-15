@@ -39,7 +39,11 @@ def _main_loop(model, data, policy, renderer, cam_id, viewer=None,
         else:
             renderer.update_scene(data, camera=cam_id)
         images.append(np.asarray(renderer.render()).copy())
-        proprios.append(data.qpos[7:15].astype(np.float32).copy())
+        arm_proprio = data.qpos[7:15].astype(np.float32).copy()
+        cube_xyz = data.xpos[cube_body_id].astype(np.float32).copy()
+        proprios.append(
+            np.concatenate([arm_proprio, cube_xyz]).astype(np.float32)
+        )
 
         ctrl, arm_target, done, _ = policy.step(model, data)
         kinematic_action = np.concatenate([arm_target, [ctrl[6]]]).astype(np.float32)
