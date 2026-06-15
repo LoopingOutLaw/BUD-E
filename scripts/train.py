@@ -60,6 +60,7 @@ def train(
     n_steps: int = 50000,
     batch_size: int = 32,
     chunk_size: int = 4,
+    img_size: int = 64,
     lr: float = 3e-4,
     weight_decay: float = 1e-4,
     save_every: int = 5000,
@@ -78,7 +79,7 @@ def train(
     print(f"Training on {device}")
 
     cfg = BUDEConfig()
-    cfg.img_size = 64
+    cfg.img_size = img_size
     cfg.patch_size = 16
     cfg.chunk_size = chunk_size
 
@@ -162,6 +163,8 @@ if __name__ == "__main__":
     parser.add_argument("--n-steps", type=int, default=50000)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--chunk-size", type=int, default=4)
+    parser.add_argument("--img-size", type=int, default=64,
+                        help="Image resolution for ViT input (default 64, use 224 for hi-res)")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--save-every", type=int, default=5000)
     parser.add_argument("--data-root", action="append", default=None,
@@ -182,6 +185,7 @@ if __name__ == "__main__":
         n_steps=args.n_steps,
         batch_size=args.batch_size,
         chunk_size=args.chunk_size,
+        img_size=args.img_size,
         lr=args.lr,
         save_every=args.save_every,
         task_name=args.task,
