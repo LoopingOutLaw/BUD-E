@@ -119,20 +119,20 @@
                   <geom name="wrist2" type="capsule" fromto="0.0 0.05 0.0  0.0 0.1 0.0" size="0.025"
                         material="mat_dark" mass="0.3"/>
 
-                  <!-- Gripper base -->
+                  <!-- Gripper base, EE site aligned with grasp center. -->
                   <body name="gripper" pos="0 0.10 0">
                     <geom name="gripper_base" type="box" size="0.03 0.02 0.025"
                           material="mat_gray" mass="0.2" pos="0 0 0" euler="0 0 0"/>
 
-                    <!-- Left finger (slides along x) -->
-                    <body name="finger_left" pos="0 0.02 0">
+                    <!-- Left finger at +y side, right finger at -y side.
+                         Each slides along x toward the EE y=0 line. Both meet at y=0 when closed. -->
+                    <body name="finger_left" pos="0 0.04 0">
                       <joint name="finger_left" type="slide" axis="1 0 0"
                              range="-0.04 0" limited="true"/>
                       <geom name="finger_left_geom" type="box" size="0.005 0.02 0.025"
                             material="mat_white" mass="0.08"/>
                     </body>
-                    <!-- Right finger (slides along x in opposite direction) -->
-                    <body name="finger_right" pos="0 -0.02 0">
+                    <body name="finger_right" pos="0 -0.04 0">
                       <joint name="finger_right" type="slide" axis="1 0 0"
                              range="0 0.04" limited="true"/>
                       <geom name="finger_right_geom" type="box" size="0.005 0.02 0.025"

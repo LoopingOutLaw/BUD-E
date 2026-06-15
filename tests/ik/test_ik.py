@@ -1,8 +1,8 @@
-"""Tests for bude_vla.ik inverse-kinematics solver."""
+"""Tests for bude_vla.ik inverse-kinematics solvers."""
 import mujoco
 import numpy as np
 from pathlib import Path
-from bude_vla.ik import solve_ik_to_xyz
+from bude_vla.ik import solve_ik_to_xyz, solve_ik_to_xyz_dls
 
 
 MODEL_PATH = Path(__file__).resolve().parents[2] / "urdf" / "ur5e_scene.xml"
@@ -40,10 +40,31 @@ def test_solve_ik_converges_within_tolerance():
     target = ee_xyz + np.array([0.03, -0.02, 0.01])
 
     new_arm_qpos = solve_ik_to_xyz(model, data, target, data.qpos.copy(),
-                                     pos_tol=0.01, max_step=0.05, max_iters=50)
+                                     pos_tol=0.01, step=0.05, max_iters=50)
     data.qpos[7:13] = new_arm_qpos
     mujoco.mj_forward(model, data)
     ee_final = data.site_xpos[site_id].copy()
 
     dist = np.linalg.norm(target - ee_final)
     assert dist < 0.03, f"EE did not converge: dist={dist:.4f}"
+
+
+def test_solve_ik_dls_reaches_cube_region():
+    """DLS solver must reach the workspace region where the cube lives."""
+    model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
+    data = mujoco.MjData(model)
+    mujoco.mj_resetData(model, data)
+    mujoco.mj_forward(model, data)
+
+    site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "ee_center")
+    target = np.array([0.6, 0.0, 0.55])
+
+    new_arm_qpos = solve_ik_to_xyz_dls(model, data, target, data.qpos.copy(),
+                                        pos_tol=0.005, step=0.5, damping=0.05,
+                                        max_iters=80)
+    data.qpos[7:13] = new_arm_qpos
+    mujoco.mj_forward(model, data)
+    ee_final = data.site_xpos[site_id].copy()
+
+    dist = np.linalg.norm(target - ee_final)
+    assert dist < 0.02, f"DLS IK did not reach cube region: dist={dist:.4f}"
