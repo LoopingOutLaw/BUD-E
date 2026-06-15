@@ -38,11 +38,23 @@ def load_arm_model(xml_path: str | Path | None = None) -> mujoco.MjModel:
 
 
 def default_joint_angles(model: mujoco.MjModel) -> np.ndarray:
-    """The 'home' config the arm resets to."""
-    home = np.asarray([-1.5708, -1.5708, 1.5708, -1.5708, -1.5708, 0.0])
+    """The 'home' config the arm resets to (6 arm joints, in joint-ID order)."""
+    home = np.asarray([0.0, -0.5, 0.9, 0.0, 0.0, 0.0])
     if len(home) < model.njnt:
         home = np.concatenate([home, np.zeros(model.njnt - len(home))])
     return home[: model.njnt]
+
+
+# qpos layout for ur5e_scene.xml:
+#   qpos[0:7] = cube freejoint (xyz + quat wxyz)
+#   qpos[7:13] = 6 arm joints (shoulder_pan, shoulder_lift, elbow, forearm_roll, wrist_pitch, wrist_roll)
+#   qpos[13:14] = finger_left slider
+#   qpos[14:15] = finger_right slider (mirror of finger_left via equality)
+ARM_QPOS_START = 7
+ARM_QPOS_END = 13
+CUBE_QPOS_END = 7
+GRIPPER_QPOS_START = 13
+GRIPPER_QPOS_END = 15
 
 
 class UR5eMJMJX:
@@ -55,22 +67,42 @@ class UR5eMJMJX:
         self.model_mj = load_arm_model(xml_path)
         self.model = mjx.put_model(self.model_mj)
         self.n_arm = 6
-        # Number of actuators is whatever MJX reports
         self.nu = self.model_mj.nu
         self.action_dim = self.nu
         self.n_qpos = self.model_mj.nq
         self.n_qvel = self.model_mj.nv
 
-    def make_data(self, joint_angles: np.ndarray | None = None) -> mjx.Data:
-        data = mujoco.MjData(self.model_mj)
-        if joint_angles is not None:
-            data.qpos[: len(joint_angles)] = joint_angles
-        mujoco.mj_forward(self.model_mj, data)
-        return mjx.put_data(self.model_mj, data)
+    def make_data(self, joint_angles: np.ndarray | None = None,
+                  cube_xyz: tuple[float, float, float] = (0.6, 0.0, 0.445)
+                  ) -> mjx.Data:
+        """Reset MJX data.
 
-    def reset(self, joint_angles: np.ndarray | None = None) -> mjx.Data:
-        d = self.make_data(joint_angles)
+        Args:
+            joint_angles: 6-vector of arm joint angles. Goes to qpos[7:13].
+                          Optional; if None, uses XML defaults.
+            cube_xyz: cube position. Default (0.6, 0, 0.445).
+        """
+        # Use mjx.make_data (correct per MJX docs for batched use)
+        d = mjx.make_data(self.model)
+        if joint_angles is not None:
+            angles = jnp.asarray(joint_angles, dtype=jnp.float32)
+            # Pad to 6 if shorter, then place at qpos[7:13]
+            if angles.shape[0] < self.n_arm:
+                pad = jnp.zeros(self.n_arm - angles.shape[0], dtype=jnp.float32)
+                angles = jnp.concatenate([angles, pad])
+            angles = angles[: self.n_arm]
+            d = d.replace(qpos=d.qpos.at[ARM_QPOS_START:ARM_QPOS_END].set(angles))
+        # Cube xyz
+        cube = jnp.asarray(cube_xyz, dtype=jnp.float32)
+        d = d.replace(qpos=d.qpos.at[0:3].set(cube))
+        # Cube identity quaternion (w, x, y, z)
+        d = d.replace(qpos=d.qpos.at[3:7].set(jnp.array([1.0, 0.0, 0.0, 0.0], dtype=jnp.float32)))
         return d
+
+    def reset(self, joint_angles: np.ndarray | None = None,
+              cube_xyz: tuple[float, float, float] = (0.6, 0.0, 0.445)
+              ) -> mjx.Data:
+        return self.make_data(joint_angles, cube_xyz)
 
     @staticmethod
     def _to_action(action) -> jnp.ndarray:
@@ -80,18 +112,38 @@ class UR5eMJMJX:
         return a
 
     def step_static(self, state: mjx.Data, action) -> mjx.Data:
-        """Apply action[0] (single env step) and return new state."""
-        a = self._to_action(action)[0]
-        # If action dim has 7 entries and there are 7 actuators, ctrl = a directly
+        """Apply action and step. Action can be 1D (single env) or 2D (batched).
+
+        MJX requires `mjx.step` to be vmapped for batched execution (it doesn't
+        auto-vectorize a stacked qpos); we detect that here.
+        """
+        a = self._to_action(action)
+        if a.ndim != 2:
+            raise ValueError(f"action must be 1D or 2D, got shape {a.shape}")
         n_controls = self.model_mj.nu
-        if a.shape[0] != n_controls:
+        if a.shape[-1] != n_controls:
             raise ValueError(
-                f"Action dim {a.shape[0]} != model.nu {n_controls}. "
+                f"Action last-dim {a.shape[-1]} != model.nu {n_controls}. "
                 f"Action order must match the XML's actuator order."
             )
-        new = state.replace(ctrl=a)
-        new = mjx.step(self.model, new)
-        return new
+        is_batched = state.qpos.ndim > 1
+        if not is_batched:
+            # 1D state: use single-env path
+            new = state.replace(ctrl=a[0])
+            return mjx.step(self.model, new)
+        # Batched state: must vmapped mjx.step, and the action's batch must
+        # match the state's leading batch dim.
+        if a.shape[0] != state.qpos.shape[0]:
+            raise ValueError(
+                f"action batch {a.shape[0]} != state batch {state.qpos.shape[0]}"
+            )
+
+        @jax.vmap
+        def _vmap_step(d, act):
+            d = d.replace(ctrl=act)
+            return mjx.step(self.model, d)
+
+        return _vmap_step(state, a)
 
     def jitted_step(self):
         jit_step = jax.jit(lambda state, action: self.step_static(state, action))

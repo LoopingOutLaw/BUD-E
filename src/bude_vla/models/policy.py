@@ -29,7 +29,7 @@ class BUDEConfig:
     text_max_len: int = 64
     text_depth: int = 4
     text_heads: int = 4
-    state_dim: int = 7
+    state_dim: int = 8
     d: int = 256
     backbone_depth: int = 8
     backbone_heads: int = 8

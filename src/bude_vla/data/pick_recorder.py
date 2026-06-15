@@ -15,7 +15,7 @@ INSTRUCTION = "pick up the red cube and place it in the blue target zone"
 
 def record_pick_episode(root: str | Path, episode_idx: int = 0,
                         cube_xy: tuple[float, float] = (0.6, 0.0),
-                        camera: str = "front_top", img_size: int = 64,
+                        camera: str | None = None, img_size: int = 64,
                         max_steps: int = 350) -> dict:
     from bude_vla.envs.so101_mjx import ARM_MODEL_PATH
 
@@ -28,7 +28,8 @@ def record_pick_episode(root: str | Path, episode_idx: int = 0,
     mujoco.mj_forward(model, data)
 
     renderer = mujoco.Renderer(model, height=img_size, width=img_size)
-    cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera)
+    cam_id = (mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera)
+              if camera else -1)
 
     policy = ScriptedPickAndPlace(model, data, cube_start_xy=np.array(cube_xy))
 
@@ -37,7 +38,10 @@ def record_pick_episode(root: str | Path, episode_idx: int = 0,
     target_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
 
     for _ in range(max_steps):
-        renderer.update_scene(data, camera=cam_id)
+        if camera:
+            renderer.update_scene(data, camera=cam_id)
+        else:
+            renderer.update_scene(data)
         img = renderer.render()
         images.append(np.asarray(img).copy())
         proprios.append(data.qpos[7:15].astype(np.float32).copy())

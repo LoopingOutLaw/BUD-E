@@ -69,6 +69,11 @@
     <!-- Wrist cam: close-up low third-person -->
     <camera name="wrist" pos="0.6 0.45 0.7" xyaxes="0 -1 0 0.7 0 0.71"
             mode="fixed" fovy="55"/>
+    <!-- Portfolio wide: cinematic 3/4 view that frames the whole arm + table.
+         Positioned in front-left, slightly above the workspace, looking back
+         toward the base. Used only for the final demo video. -->
+    <camera name="portfolio" pos="-0.2 -1.2 0.95" xyaxes="0 -1 0 0.85 0 0.53"
+            mode="fixed" fovy="36"/>
 
     <!-- Workspace origin (the arm sits behind it) at z=0.42 (table top) -->
     <site name="workspace_origin" pos="0.6 0 0.42" size="0.01" rgba="0 1 0 0.5"/>

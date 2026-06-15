@@ -18,7 +18,7 @@ def _make_batch(cfg: BUDEConfig, B: int = 2):
 def test_policy_forward_shape():
     cfg = BUDEConfig(img_size=32, vision_dim=32, vision_depth=1, vision_heads=2,
                      text_max_len=8, text_depth=1, d=64, backbone_depth=1,
-                     backbone_heads=2, state_dim=7, action_dim=7, chunk_size=4,
+                     backbone_heads=2, state_dim=8, action_dim=7, chunk_size=4,
                      n_domains=2, text_vocab=64, action_head_hidden_dim=64,
                      action_head_time_dim=32, ffn_dim=64)
     p = BUDEPolicy(cfg)
@@ -44,7 +44,7 @@ def test_policy_backbone_token_count():
 def test_policy_sample_shape():
     cfg = BUDEConfig(img_size=32, vision_dim=32, vision_depth=1, vision_heads=2,
                      text_max_len=8, text_depth=1, d=64, backbone_depth=1,
-                     backbone_heads=2, state_dim=7, action_dim=7, chunk_size=4,
+                     backbone_heads=2, state_dim=8, action_dim=7, chunk_size=4,
                      n_domains=1, text_vocab=64, action_head_hidden_dim=64,
                      action_head_time_dim=32, ffn_dim=64)
     p = BUDEPolicy(cfg)
@@ -52,7 +52,7 @@ def test_policy_sample_shape():
     batch = {
         "images": torch.randn(2, 3, 32, 32),
         "text_ids": torch.randint(1, cfg.text_vocab, (2, 8)),
-        "proprio": torch.randn(2, 7),
+        "proprio": torch.randn(2, 8),
         "domain_id": torch.zeros(2, dtype=torch.long),
     }
     with torch.no_grad():
@@ -82,7 +82,7 @@ def test_policy_soft_prompts_separate_per_domain():
     base = {
         "images": torch.randn(1, 3, 32, 32),
         "text_ids": torch.randint(1, cfg.text_vocab, (1, 8)),
-        "proprio": torch.randn(1, 7),
+        "proprio": torch.randn(1, cfg.state_dim),
         "actions": torch.randn(1, cfg.chunk_size, cfg.action_dim),
         "tau": torch.rand(1),
         "noise": torch.randn(1, cfg.chunk_size, cfg.action_dim),
