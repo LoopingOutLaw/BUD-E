@@ -27,7 +27,12 @@ def collate_fn(batch: list[dict]) -> dict:
     keys = batch[0].keys()
     out = {}
     for k in keys:
-        out[k] = torch.stack([b[k] for b in batch])
+        v0 = batch[0][k]
+        if isinstance(v0, str):
+            # Leave language instruction as list[str] — never tensor-stack strings.
+            out[k] = [b[k] for b in batch]
+        else:
+            out[k] = torch.stack([b[k] for b in batch])
     return out
 
 
