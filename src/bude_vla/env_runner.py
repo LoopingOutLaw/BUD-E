@@ -12,10 +12,18 @@ PolicyRolloutRunner - main loop class
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
 
 import mujoco
 import numpy as np
 import torch
+
+from bude_vla.data.action_normalization import (
+    DEFAULT_HI,
+    DEFAULT_LO,
+    denormalize_actions,
+    load_action_stats,
+)
 
 
 TABLE_Z = 0.42
@@ -121,12 +129,13 @@ def _is_success(model, data, threshold: float = 0.10) -> bool:
 
 
 def _build_batch(image: np.ndarray, proprio: np.ndarray,
-                 text_ids: np.ndarray, domain_id: int,
+                 text_ids: np.ndarray, instruction: str, domain_id: int,
                  device: str) -> dict:
     img = torch.from_numpy(image.astype(np.float32)).permute(2, 0, 1) / 255.0
     return {
         "images": img.unsqueeze(0).to(device),
         "text_ids": torch.from_numpy(text_ids).unsqueeze(0).to(device),
+        "instruction": [instruction],
         "proprio": torch.from_numpy(proprio.astype(np.float32)).unsqueeze(0).to(device),
         "domain_id": torch.tensor([domain_id], dtype=torch.long).to(device),
     }
@@ -136,18 +145,56 @@ class PolicyRolloutRunner:
     def __init__(self, model, img_size: int = 224,
                  max_steps_per_try: int = 350,
                  max_tries: int = 3,
-                 device: str = "cpu"):
+                 device: str = "cpu",
+                 action_norm_root: str | None = None,
+                 action_lo: np.ndarray | list | None = None,
+                 action_hi: np.ndarray | list | None = None,
+                 n_history_frames: int = 1):
         self.model = model
         self.img_size = img_size
         self.max_steps_per_try = max_steps_per_try
         self.max_tries = max_tries
         self.device = device
+        self.n_history_frames = max(1, int(n_history_frames))
+        self._frame_buffer: list = []
         self.renderer = mujoco.Renderer(model, height=img_size, width=img_size)
+        self.overhead_cam_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_CAMERA, "front_top")
+        self.wrist_cam_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_CAMERA, "gripper_cam")
         self.text_ids = _pick_token_ids()
 
+        # ── action normalization ──────────────────────────────────────────
+        # Priority: explicit lo/hi > data-root file > DEFAULT
+        # ALWAYS denormalize because training normalizes to [-1,1].
+        if action_lo is not None and action_hi is not None:
+            self._action_lo = np.asarray(action_lo, dtype=np.float32)
+            self._action_hi = np.asarray(action_hi, dtype=np.float32)
+        elif action_norm_root is not None:
+            self._action_lo, self._action_hi = load_action_stats(
+                Path(action_norm_root) / "meta" / "info.json"
+            )
+        else:
+            self._action_lo = DEFAULT_LO.copy()
+            self._action_hi = DEFAULT_HI.copy()
+        self._use_norm = True
+
     def _render(self, data) -> np.ndarray:
-        self.renderer.update_scene(data)
-        return np.asarray(self.renderer.render()).copy()
+        self.renderer.update_scene(data, camera=self.overhead_cam_id)
+        img_overhead = np.asarray(self.renderer.render()).copy()
+        self.renderer.update_scene(data, camera=self.wrist_cam_id)
+        img_wrist = np.asarray(self.renderer.render()).copy()
+        return np.concatenate([img_overhead, img_wrist], axis=-1)
+
+    def _stacked_view(self, frame: np.ndarray) -> np.ndarray:
+        if self.n_history_frames <= 1:
+            return frame
+        self._frame_buffer.append(frame)
+        if len(self._frame_buffer) > self.n_history_frames:
+            self._frame_buffer.pop(0)
+        while len(self._frame_buffer) < self.n_history_frames:
+            self._frame_buffer.insert(0, frame)
+        return np.concatenate(self._frame_buffer, axis=-1)
 
     def run_one(self, data, policy, cube_xy,
                 viewer=None, step_delay: float = 0.0) -> RolloutResult:
@@ -163,23 +210,27 @@ class PolicyRolloutRunner:
             grip_close_count = 0
             chunk = None
             cursor = 0
+            self._frame_buffer = []
 
             for step in range(self.max_steps_per_try):
                 img = self._render(data)
+                stacked = self._stacked_view(img)
                 arm_proprio = data.qpos[7:15].astype(np.float32).copy()
-                cube_xyz = _cube_xyz(self.model, data).astype(np.float32)
-                proprio = np.concatenate([arm_proprio, cube_xyz]).astype(np.float32)
-                frames.append(img)
+                frames.append(stacked)
                 try_labels.append(f"try {try_idx + 1}/{self.max_tries}")
 
                 if chunk is None or cursor >= chunk.shape[0]:
-                    batch = _build_batch(img, proprio, self.text_ids,
-                                         domain_id=0, device=self.device)
+                    batch = _build_batch(stacked, arm_proprio, self.text_ids,
+                                         _PICK_INSTRUCTION, domain_id=0,
+                                         device=self.device)
                     chunk = policy.sample(batch)[0].detach().cpu().numpy()
                     cursor = 0
 
                 a = chunk[cursor]
                 cursor += 1
+
+                if self._use_norm:
+                    a = denormalize_actions(a, self._action_lo, self._action_hi)
 
                 if np.any(np.isnan(a)):
                     arm_target = HOME_QPOS[:6].copy()
@@ -213,7 +264,7 @@ class PolicyRolloutRunner:
 
                 if _is_success(self.model, data):
                     success = True
-                    frames.append(self._render(data))
+                    frames.append(self._stacked_view(self._render(data)))
                     try_labels.append(
                         f"try {try_idx + 1}/{self.max_tries} SUCCESS")
                     break

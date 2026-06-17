@@ -159,6 +159,7 @@ def main():
         action_norm_root=args.data_root,
         action_lo=action_lo,
         action_hi=action_hi,
+        n_history_frames=args.n_history_frames,
     )
 
     if args.viewer and os.environ.get("MUJOCO_GL") != "glfw":
