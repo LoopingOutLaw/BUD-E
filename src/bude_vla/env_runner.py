@@ -203,11 +203,36 @@ class PolicyRolloutRunner:
         success = False
         final_try_idx = 0
 
+        ARM_SMOOTH_STEPS = 14
+        ARM_STEP_FRAC = 0.22
+
+        def _smooth_arm_to(target_qpos):
+            cur = data.qpos[7:13].astype(np.float64).copy()
+            tgt = np.clip(target_qpos, -3.5, 3.5).astype(np.float64)
+            for k in range(ARM_SMOOTH_STEPS):
+                err = tgt - cur
+                cur = cur + err * ARM_STEP_FRAC
+                data.ctrl[:] = 0.0
+                data.ctrl[6] = gripper_ctrl
+                data.qvel[6:12] = 0.0
+                data.qpos[7:13] = cur
+                _carry_cube_with(self.model, data, offset)
+                mujoco.mj_step(self.model, data)
+                img_mid = self._render(data)
+                stacked_mid = self._stacked_view(img_mid)
+                frames.append(stacked_mid)
+                try_labels.append(
+                    f"try {try_idx + 1}/{self.max_tries}")
+            data.qpos[7:13] = tgt
+            _carry_cube_with(self.model, data, offset)
+            return tgt
+
         for try_idx in range(self.max_tries):
             _reset_arm_to_home(self.model, data)
             _reset_cube(data, cube_xy)
             offset = None
             grip_close_count = 0
+            gripper_ctrl = 0.0
             chunk = None
             cursor = 0
             self._frame_buffer = []
@@ -239,10 +264,8 @@ class PolicyRolloutRunner:
                     arm_target = np.clip(a[:6], -3.5, 3.5).astype(np.float64)
                     gripper_ctrl = float(np.clip(a[6], -1.0, 1.0))
 
-                data.ctrl[:] = 0.0
-                data.ctrl[6] = gripper_ctrl
-                data.qvel[6:12] = 0.0
-                data.qpos[7:13] = arm_target
+                _carry_cube_with(self.model, data, offset)
+                _smooth_arm_to(arm_target)
 
                 ee = _ee_xyz(self.model, data)
                 cube = _cube_xyz(self.model, data)
@@ -256,11 +279,6 @@ class PolicyRolloutRunner:
                     grip_close_count = 0
                     if gripper_ctrl < -0.5:
                         offset = None
-
-                _carry_cube_with(self.model, data, offset)
-                mujoco.mj_step(self.model, data)
-                data.qpos[7:13] = arm_target
-                _carry_cube_with(self.model, data, offset)
 
                 if _is_success(self.model, data):
                     success = True
