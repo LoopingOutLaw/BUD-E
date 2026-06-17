@@ -13,6 +13,7 @@ import os
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
@@ -32,10 +33,12 @@ def collate_fn(batch: list[dict]) -> dict:
 
 def build_dataloader(roots: list[str | Path], chunk_size: int = 4,
                      batch_size: int = 32, num_workers: int = 0,
-                     augment: bool = False) -> torch.utils.data.DataLoader:
+                     augment: bool = False,
+                     n_history_frames: int = 1) -> torch.utils.data.DataLoader:
     all_frames = []
     for root in roots:
-        ds = BUDETrainingDataset(root, chunk_size=chunk_size, augment=augment)
+        ds = BUDETrainingDataset(root, chunk_size=chunk_size, augment=augment,
+                                 n_history_frames=n_history_frames)
         ds.read()
         all_frames.append(ds)
         print(f"  loaded {len(ds)} frames from {root}")
@@ -48,9 +51,11 @@ def build_dataloader(roots: list[str | Path], chunk_size: int = 4,
     dl = torch.utils.data.DataLoader(
         combined, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, collate_fn=collate_fn,
-        pin_memory=True, drop_last=True,
+        pin_memory=False, drop_last=True,
+        persistent_workers=num_workers > 0,
     )
-    print(f"  total frames: {len(combined)}, batches/epoch: {len(dl)}")
+    print(f"  total frames: {len(combined)}, batches/epoch: {len(dl)}, "
+          f"history_frames: {n_history_frames}")
     return dl
 
 
@@ -68,6 +73,11 @@ def train(
     device: str = "cuda",
     augment: bool = False,
     task_name: str = "policy",
+    resume: str | None = None,
+    num_workers: int = 0,
+    use_dinov2: bool = False,
+    use_minilm: bool = False,
+    n_history_frames: int = 1,
 ):
     if data_roots is None:
         data_roots = ["/home/aditya/bude_vla/data/reach_v3",
@@ -84,6 +94,9 @@ def train(
     cfg.img_size = img_size
     cfg.patch_size = 16
     cfg.chunk_size = chunk_size
+    cfg.use_dinov2 = use_dinov2
+    cfg.use_minilm = use_minilm
+    cfg.n_history_frames = n_history_frames
 
     policy = BUDEPolicy(cfg).to(device)
     n_params = policy.n_params()
@@ -92,8 +105,19 @@ def train(
         print(f"  {k}: {v:,}")
 
     dl = build_dataloader(data_roots, chunk_size=chunk_size,
-                          batch_size=batch_size, num_workers=0,
-                          augment=augment)
+                          batch_size=batch_size, num_workers=num_workers,
+                          augment=augment,
+                          n_history_frames=n_history_frames)
+
+    from bude_vla.data.action_normalization import load_action_stats, DEFAULT_LO, DEFAULT_HI
+    _action_lo, _action_hi = DEFAULT_LO.copy(), DEFAULT_HI.copy()
+    for _root in data_roots:
+        _info = Path(_root) / "meta" / "info.json"
+        _lo, _hi = load_action_stats(_info)
+        if not (np.array_equal(_lo, DEFAULT_LO) and np.array_equal(_hi, DEFAULT_HI)):
+            _action_lo, _action_hi = _lo, _hi
+            break
+    print(f"  action_norm lo={_action_lo[:3]}  hi={_action_hi[:3]}")
 
     optimizer = AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=n_steps, eta_min=lr * 0.01)
@@ -103,8 +127,20 @@ def train(
     running_loss = 0.0
     t0 = time.time()
     dl_iter = iter(dl)
-
     loss_history = []
+
+    if resume is not None:
+        ckpt = torch.load(resume, map_location=device, weights_only=False)
+        policy.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        step = ckpt["step"]
+        loss_history = ckpt.get("loss_history", [])
+        for _ in range(step):
+            scheduler.step()
+        running_loss = 0.0
+        dl_iter = iter(dl)
+        print(f"  resumed from step {step}, loss_hist entries={len(loss_history)}")
+
 
     while step < n_steps:
         try:
@@ -146,6 +182,15 @@ def train(
                 "model_state_dict": policy.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "loss_history": loss_history,
+                "action_norm_lo": _action_lo.tolist(),
+                "action_norm_hi": _action_hi.tolist(),
+                "config": {
+                    "use_dinov2": cfg.use_dinov2,
+                    "use_minilm": cfg.use_minilm,
+                    "n_history_frames": cfg.n_history_frames,
+                    "img_size": cfg.img_size,
+                    "chunk_size": cfg.chunk_size,
+                },
             }, ckpt_path)
             print(f"  saved checkpoint: {ckpt_path}")
 
@@ -155,6 +200,15 @@ def train(
         "model_state_dict": policy.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "loss_history": loss_history,
+        "action_norm_lo": _action_lo.tolist(),
+        "action_norm_hi": _action_hi.tolist(),
+        "config": {
+            "use_dinov2": cfg.use_dinov2,
+            "use_minilm": cfg.use_minilm,
+            "n_history_frames": cfg.n_history_frames,
+            "img_size": cfg.img_size,
+            "chunk_size": cfg.chunk_size,
+        },
     }, final_ckpt)
     print(f"Training done in {time.time()-t0:.0f}s. Final checkpoint: {final_ckpt}")
 
@@ -179,6 +233,22 @@ if __name__ == "__main__":
     parser.add_argument("--augment", action="store_true",
                         help="Enable image augmentation (random crop + "
                              "brightness jitter) on the training dataset.")
+    parser.add_argument("--num-workers", type=int, default=0,
+                        help="DataLoader workers (0=single-thread). Use 2-4 "
+                             "to keep GPU fed when augmentation is on.")
+    parser.add_argument("--resume", default=None,
+                        help="Path to a checkpoint to resume training from. "
+                             "Restores model, optimizer, step counter, and "
+                             "loss history; continues until --n-steps.")
+    parser.add_argument("--use-dinov2", action="store_true",
+                        help="Replace from-scratch ViT with frozen pretrained "
+                             "DINOv2-small backbone (P0 architecture review fix).")
+    parser.add_argument("--use-minilm", action="store_true",
+                        help="Replace TinyTextEncoder with frozen pretrained "
+                             "MiniLM (sentence-transformers/all-MiniLM-L6-v2).")
+    parser.add_argument("--n-history-frames", type=int, default=1,
+                        help="Number of stacked history frames per observation. "
+                             "1=Markovian (default), 2=allows velocity inference.")
     args = parser.parse_args()
 
     roots = args.data_root
@@ -195,5 +265,10 @@ if __name__ == "__main__":
         lr=args.lr,
         save_every=args.save_every,
         augment=args.augment,
+        resume=args.resume,
         task_name=args.task,
+        num_workers=args.num_workers,
+        use_dinov2=args.use_dinov2,
+        use_minilm=args.use_minilm,
+        n_history_frames=args.n_history_frames,
     )

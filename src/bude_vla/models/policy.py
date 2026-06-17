@@ -14,14 +14,18 @@ from bude_vla.models.action_head import FlowMatchingActionHead
 from bude_vla.models.backbone import PolicyTransformer
 from bude_vla.models.proprio import ProprioProjector
 from bude_vla.models.soft_prompts import SoftPrompts
-from bude_vla.models.text_encoder import TinyTextEncoder
-from bude_vla.models.vision import ViTSmall
+from bude_vla.models.text_encoder import MiniLMTextEncoder, TinyTextEncoder
+from bude_vla.models.vision import DINOv2Tower, ViTSmall
 
 
 @dataclass
 class BUDEConfig:
+    use_dinov2: bool = False
+    use_minilm: bool = False
+    n_history_frames: int = 1  # 1 = single frame (Markovian)
     img_size: int = 224
     patch_size: int = 16
+    in_channels: int = 6  # dual-cam; will multiply by n_history_frames
     vision_dim: int = 192
     vision_depth: int = 8
     vision_heads: int = 3
@@ -29,7 +33,7 @@ class BUDEConfig:
     text_max_len: int = 64
     text_depth: int = 4
     text_heads: int = 4
-    state_dim: int = 11  # arm (6) + gripper (2 freejoint vals flattened) + cube_xyz (3)
+    state_dim: int = 8   # arm (6) + gripper (2 freejoint vals flattened)
     d: int = 256
     backbone_depth: int = 8
     backbone_heads: int = 8
@@ -40,6 +44,9 @@ class BUDEConfig:
     n_prompts: int = 32
     action_head_time_dim: int = 128
     action_head_hidden_dim: int = 512
+    action_head_temporal_depth: int = 2  # P1: causal transformer layers
+    action_head_temporal_heads: int = 4
+    use_temporal_head: bool = True
     flow_n_steps: int = 10
 
 
@@ -48,7 +55,7 @@ class BUDEPolicy(nn.Module):
 
     Forward signature (training):
         batch = {
-            "images":    (B, 3, H, W),
+            "images":    (B, 6, H, W),
             "text_ids":  (B, T_text),
             "proprio":   (B, state_dim),
             "domain_id": (B,) int64,
@@ -67,23 +74,39 @@ class BUDEPolicy(nn.Module):
         cfg = cfg or BUDEConfig()
         self.cfg = cfg
 
-        self.vision = ViTSmall(
-            img_size=cfg.img_size,
-            patch_size=cfg.patch_size,
-            in_channels=3,
-            dim=cfg.vision_dim,
-            depth=cfg.vision_depth,
-            heads=cfg.vision_heads,
-            mlp_ratio=4.0,
-            out_dim=cfg.d,
-        )
-        self.text = TinyTextEncoder(
-            vocab_size=cfg.text_vocab,
-            max_len=cfg.text_max_len,
-            d=cfg.d,
-            depth=cfg.text_depth,
-            heads=cfg.text_heads,
-        )
+        # History stacking: channels are concatenated across time
+        in_channels = cfg.in_channels * cfg.n_history_frames
+
+        if cfg.use_dinov2:
+            self.vision = DINOv2Tower(
+                img_size=cfg.img_size,
+                in_channels=in_channels,
+                out_dim=cfg.d,
+            )
+        else:
+            self.vision = ViTSmall(
+                img_size=cfg.img_size,
+                patch_size=cfg.patch_size,
+                in_channels=in_channels,
+                dim=cfg.vision_dim,
+                depth=cfg.vision_depth,
+                heads=cfg.vision_heads,
+                mlp_ratio=4.0,
+                out_dim=cfg.d,
+            )
+        if cfg.use_minilm:
+            self.text = MiniLMTextEncoder(
+                d=cfg.d,
+                max_len=cfg.text_max_len,
+            )
+        else:
+            self.text = TinyTextEncoder(
+                vocab_size=cfg.text_vocab,
+                max_len=cfg.text_max_len,
+                d=cfg.d,
+                depth=cfg.text_depth,
+                heads=cfg.text_heads,
+            )
         self.proprio = ProprioProjector(state_dim=cfg.state_dim, out_dim=cfg.d)
         self.soft_prompts = SoftPrompts(n_domains=cfg.n_domains,
                                         n_prompts=cfg.n_prompts, d=cfg.d)
@@ -98,6 +121,8 @@ class BUDEPolicy(nn.Module):
             time_dim=cfg.action_head_time_dim,
             hidden_dim=cfg.action_head_hidden_dim,
             n_steps=cfg.flow_n_steps,
+            temporal_depth=cfg.action_head_temporal_depth if cfg.use_temporal_head else 0,
+            temporal_heads=cfg.action_head_temporal_heads,
         )
 
         self.chunk_size = cfg.chunk_size
@@ -111,14 +136,16 @@ class BUDEPolicy(nn.Module):
         The state_token is at index `n_prompts` (the position after soft prompts).
         """
         images = batch["images"]
-        text_ids = batch["text_ids"]
         proprio = batch["proprio"]
         domain_id = batch["domain_id"]
         if domain_id.dtype != torch.long:
             domain_id = domain_id.long()
 
         patch_tokens = self.vision(images)              # (B, N_patch, d)
-        text_tokens = self.text(text_ids)               # (B, T_text, d)
+        if self.cfg.use_minilm:
+            text_tokens = self.text(batch["instruction"])
+        else:
+            text_tokens = self.text(batch["text_ids"])  # (B, T_text, d)
         state_token = self.proprio(proprio).unsqueeze(1)  # (B, 1, d)
         prompts = self.soft_prompts.gather(domain_id)    # (B, N_p, d)
 

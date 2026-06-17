@@ -42,13 +42,29 @@ from bude_vla.envs.so101_mjx import ARM_MODEL_PATH
 from bude_vla.models.policy import BUDEPolicy, BUDEConfig
 
 
-def _load_policy(ckpt_path: str, img_size: int, device: str):
+def _load_policy(ckpt_path: str, img_size: int, device: str,
+                 use_dinov2: bool = False, use_minilm: bool = False,
+                 n_history_frames: int = 1):
     cfg = BUDEConfig()
     cfg.img_size = img_size
     cfg.patch_size = 16
     cfg.chunk_size = 4
-    policy = BUDEPolicy(cfg).to(device)
+
+    # Load checkpoint first to discover architecture config (so we don't need
+    # CLI flags for inference when ckpt embeds it).
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    if "config" in ckpt:
+        cfg.use_dinov2 = ckpt["config"].get("use_dinov2", use_dinov2)
+        cfg.use_minilm = ckpt["config"].get("use_minilm", use_minilm)
+        cfg.n_history_frames = ckpt["config"].get("n_history_frames",
+                                                  n_history_frames)
+        cfg.chunk_size = ckpt["config"].get("chunk_size", cfg.chunk_size)
+    else:
+        cfg.use_dinov2 = use_dinov2
+        cfg.use_minilm = use_minilm
+        cfg.n_history_frames = n_history_frames
+
+    policy = BUDEPolicy(cfg).to(device)
     policy.load_state_dict(ckpt["model_state_dict"])
     policy.eval()
     loss_hist = ckpt.get("loss_history", [])
@@ -57,7 +73,9 @@ def _load_policy(ckpt_path: str, img_size: int, device: str):
         print(f"  loaded checkpoint step={step}, final loss={loss_hist[-1][1]:.6f}")
     else:
         print(f"  loaded checkpoint step={step}")
-    return policy
+    action_lo = ckpt.get("action_norm_lo", None)
+    action_hi = ckpt.get("action_norm_hi", None)
+    return policy, action_lo, action_hi
 
 
 def _random_cube_positions(n: int, seed: int = 42):
@@ -68,8 +86,10 @@ def _random_cube_positions(n: int, seed: int = 42):
 
 
 def _add_overlay(frame: np.ndarray, text: str,
-                 status: str = "", img_size: int = 224) -> np.ndarray:
+                  status: str = "", img_size: int = 224) -> np.ndarray:
     out = frame.copy()
+    if out.shape[-1] == 6:
+        out = np.ascontiguousarray(out[..., :3])
     font_scale = max(0.4, img_size / 600)
     thickness = max(1, img_size // 300)
     color = (0, 255, 0) if status == "SUCCESS" else (255, 255, 255)
@@ -98,8 +118,21 @@ def main():
                          "Hits env_runner internals via a sync hook — visualizes "
                          "the arm in real time, doesn't replace MP4 frame capture.")
     ap.add_argument("--slow", type=float, default=0.0,
-                    help="seconds to sleep per sim step in viewer mode "
-                         "(0.04 ~= real-time). Ignored when --viewer is off.")
+                        help="seconds to sleep per sim step in viewer mode "
+                             "(0.04 ~= real-time). Ignored when --viewer is off.")
+    ap.add_argument("--data-root", default=None,
+                        help="Path to the dataset root used to train the checkpoint. "
+                             "Reads meta/info.json:action_normalization so VLA "
+                             "predictions are denormalized before stepping the "
+                             "sim. Defaults to the old-priors pass-through "
+                             "(no denormalization) for legacy checkpoints.")
+    ap.add_argument("--use-dinov2", action="store_true",
+                    help="Force DINOv2 vision backbone for legacy checkpoints "
+                         "that don't embed config.")
+    ap.add_argument("--use-minilm", action="store_true",
+                    help="Force MiniLM text encoder for legacy ckpt.")
+    ap.add_argument("--n-history-frames", type=int, default=1,
+                    help="Override history frame count for legacy ckpt.")
     args = ap.parse_args()
 
     if args.device is None:
@@ -107,7 +140,12 @@ def main():
     else:
         device = args.device
     print(f"loading policy from {args.ckpt} (device={device})")
-    policy = _load_policy(args.ckpt, args.img_size, device)
+    policy, action_lo, action_hi = _load_policy(
+        args.ckpt, args.img_size, device,
+        use_dinov2=args.use_dinov2,
+        use_minilm=args.use_minilm,
+        n_history_frames=args.n_history_frames,
+    )
 
     model = mujoco.MjModel.from_xml_path(str(ARM_MODEL_PATH))
     data = mujoco.MjData(model)
@@ -118,6 +156,9 @@ def main():
         max_steps_per_try=args.max_steps_per_try,
         max_tries=args.max_tries,
         device=device,
+        action_norm_root=args.data_root,
+        action_lo=action_lo,
+        action_hi=action_hi,
     )
 
     if args.viewer and os.environ.get("MUJOCO_GL") != "glfw":

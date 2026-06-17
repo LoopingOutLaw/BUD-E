@@ -27,23 +27,29 @@ def sinusoidal_time_embedding(t: torch.Tensor, dim: int = 128) -> torch.Tensor:
 
 
 class FlowMatchingActionHead(nn.Module):
-    """Predicts velocity field given (noisy_action, time tau, conditioning)."""
+    """Predicts velocity field given (noisy_action, time tau, conditioning).
+
+    P1: when temporal_depth > 0, applies a causal transformer over the
+    per-timestep MLP outputs so each timestep can attend to earlier
+    timesteps in the action chunk. This makes trajectories smooth.
+    """
 
     def __init__(self, action_dim: int = 7, chunk_size: int = 32, d: int = 256,
-                 time_dim: int = 128, hidden_dim: int = 512, n_steps: int = 10):
+                 time_dim: int = 128, hidden_dim: int = 512, n_steps: int = 10,
+                 temporal_depth: int = 2, temporal_heads: int = 4,
+                 max_temporal_len: int = 64):
         super().__init__()
         self.action_dim = action_dim
         self.chunk_size = chunk_size
         self.n_steps = n_steps
+        self.temporal_depth = temporal_depth
 
-        # conditioning projector: from backbone hidden state (one row) -> hidden_dim
         self.cond_proj = nn.Sequential(
             nn.Linear(d, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # time + action MLP
         self.time_dim = time_dim
         self.time_proj = nn.Sequential(
             nn.Linear(time_dim, hidden_dim),
@@ -51,18 +57,8 @@ class FlowMatchingActionHead(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.action_in_proj = nn.Linear(action_dim, hidden_dim)
-        self.mlp = nn.ModuleList(
-            [nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.SiLU(),
-                nn.Linear(hidden_dim, action_dim),
-            ) for _ in range(chunk_size)]
-        )
-        # The block above indexes per token rather than per chunk; instead, use a
-        # shared 4-layer MLP operating on per-token features. We replace it:
-        self.mlp = None  # placeholder for clarity
 
-        # Actually use a shared MLP applied per token after time+cond+action fusion.
+        # Per-token shared MLP applied across the timestep dimension
         self.shared_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
@@ -72,6 +68,33 @@ class FlowMatchingActionHead(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, action_dim),
         )
+
+        if temporal_depth > 0:
+            # Project action_dim -> hidden, run causal transformer, project back
+            self.temporal_in = nn.Linear(action_dim, hidden_dim)
+            layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim, nhead=temporal_heads,
+                dim_feedforward=hidden_dim * 2, activation="gelu",
+                dropout=0.0, batch_first=True, norm_first=True,
+            )
+            self.temporal = nn.TransformerEncoder(
+                layer, num_layers=temporal_depth,
+            )
+            self.temporal_out = nn.Linear(hidden_dim, action_dim)
+            causal = torch.triu(
+                torch.ones(max_temporal_len, max_temporal_len, dtype=torch.bool),
+                diagonal=1,
+            )
+            self.register_buffer("causal_mask", causal)
+
+    def _apply_temporal(self, v: torch.Tensor) -> torch.Tensor:
+        if self.temporal_depth == 0:
+            return v
+        T = v.shape[1]
+        h = self.temporal_in(v)
+        h = self.temporal(h, mask=self.causal_mask[:T, :T])
+        h = self.temporal_out(h)
+        return v + h
 
     def forward(self, noisy_action: torch.Tensor, tau: torch.Tensor,
                 cond: torch.Tensor) -> torch.Tensor:
@@ -83,14 +106,14 @@ class FlowMatchingActionHead(nn.Module):
         Returns: (B, chunk_size, action_dim) predicted velocity field.
         """
         b, t, a = noisy_action.shape
-        tau_emb = sinusoidal_time_embedding(tau, self.time_dim)  # (B, time_dim)
-        tau_proj = self.time_proj(tau_emb)                       # (B, hidden_dim)
-        cond_proj = self.cond_proj(cond)                         # (B, hidden_dim)
+        tau_emb = sinusoidal_time_embedding(tau, self.time_dim)
+        tau_proj = self.time_proj(tau_emb)
+        cond_proj = self.cond_proj(cond)
 
-        # Broadcast: (B, 1, hidden_dim) added to per-token action projection
-        act_proj = self.action_in_proj(noisy_action)             # (B, T, hidden_dim)
+        act_proj = self.action_in_proj(noisy_action)
         h = act_proj + tau_proj.unsqueeze(1) + cond_proj.unsqueeze(1)
-        v = self.shared_mlp(h)                                   # (B, T, action_dim)
+        v = self.shared_mlp(h)
+        v = self._apply_temporal(v)
         return v
 
     @torch.no_grad()

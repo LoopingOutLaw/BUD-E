@@ -18,6 +18,17 @@ from typing import List
 import numpy as np
 import torch
 
+from bude_vla.data.action_normalization import (
+    DEFAULT_HI,
+    DEFAULT_LO,
+    compute_action_stats,
+    denormalize_actions,
+    load_action_stats,
+    normalize_actions,
+    pad_scale,
+    write_action_stats,
+)
+
 # ── Character-level tokenizer for instructions ──────────────────────────
 
 _CHAR_VOCAB = {chr(i): i + 2 for i in range(32, 127)}  # printable ASCII -> 2..126
@@ -73,7 +84,7 @@ META = {
     "robot_type": "ur5e_so101_sim",
     "codebase_version": "v3.0",
     "features": {
-        "observation.state": {"dtype": "float32", "shape": [11]},
+        "observation.state": {"dtype": "float32", "shape": [8]},
         "action": {"dtype": "float32", "shape": [7]},
         "observation.images.top": {"dtype": "video", "shape": "auto"},
         "language_instruction": {"dtype": "string", "shape": [1]},
@@ -91,7 +102,14 @@ def _proprio_dim(episode: dict) -> int:
 
 
 def write_episode(root: str | Path, episode: dict) -> Path:
-    """Write one episode to the v3 layout. Return path to the parquet file."""
+    """Write one episode to the v3 layout. Return path to the parquet file.
+
+    Action values are stored in the natural (un-normalized) range. After
+    all episodes are recorded, `finalize_dataset(root)` should be called to
+    compute per-dim min/max stats and persist them in `meta/info.json` under
+    `action_normalization`. The training path then loads and applies this
+    transform at __getitem__ time so the flow head works in [-1, 1].
+    """
     root = Path(root)
     images = episode["images"]                        # (T, H, W, 3) uint8
     proprio = episode["proprio"].astype(np.float32)     # (T, state_dim)
@@ -101,9 +119,8 @@ def write_episode(root: str | Path, episode: dict) -> Path:
     T = images.shape[0]
     assert proprio.shape[0] == T, f"proprio length {proprio.shape[0]} != T {T}"
     state_dim = int(proprio.shape[1])
-    assert state_dim in (8, 11), (
-        f"proprio dim {state_dim} not in (8, 11) — pick_recorder uses 11, "
-        f"old reach/push datasets use 8"
+    assert state_dim == 8, (
+        f"proprio dim {state_dim} != 8 (expected arm-only)"
     )
 
     # Find next episode_idx
@@ -116,15 +133,31 @@ def write_episode(root: str | Path, episode: dict) -> Path:
     chunk_dir = root / "data" / f"chunk-{chunk_idx:03d}"
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Write MP4 video ----
+    # ---- Write dual-cam MP4 videos (split 6-ch → two 3-ch streams) ----
     import imageio
-    vid_dir = root / "videos" / f"chunk-{chunk_idx:03d}" / "observation.images.top"
-    vid_dir.mkdir(parents=True, exist_ok=True)
-    vid_path = vid_dir / f"episode_{episode_idx:06d}.mp4"
-    writer = imageio.get_writer(str(vid_path), fps=META["fps"], codec="libx264", quality=8)
-    for frame in images:
-        writer.append_data(frame)
-    writer.close()
+    overhead_dir = root / "videos" / f"chunk-{chunk_idx:03d}" / "observation.images.top"
+    wrist_dir = root / "videos" / f"chunk-{chunk_idx:03d}" / "observation.images.wrist"
+    overhead_dir.mkdir(parents=True, exist_ok=True)
+    wrist_dir.mkdir(parents=True, exist_ok=True)
+
+    overhead_path = overhead_dir / f"episode_{episode_idx:06d}.mp4"
+    wrist_path = wrist_dir / f"episode_{episode_idx:06d}.mp4"
+
+    if images.shape[-1] == 6:
+        split_overhead = images[:, :, :, :3]
+        split_wrist = images[:, :, :, 3:]
+    elif images.shape[-1] == 3:
+        split_overhead = images
+        split_wrist = images
+    else:
+        raise ValueError(f"images has {images.shape[-1]} channels, expected 3 or 6")
+
+    for vid_path, vid_frames in [(overhead_path, split_overhead), (wrist_path, split_wrist)]:
+        writer = imageio.get_writer(str(vid_path), fps=META["fps"],
+                                    codec="libx264", quality=8)
+        for frame in vid_frames:
+            writer.append_data(frame)
+        writer.close()
 
     # ---- Write parquet (tabular state/action/instruction) ----
     import pyarrow as pa
@@ -145,7 +178,6 @@ def write_episode(root: str | Path, episode: dict) -> Path:
     info_path = root / "meta" / "info.json"
     if not info_path.exists():
         info_path.parent.mkdir(parents=True, exist_ok=True)
-        # Adapt META to actual proprio shape (8 for reach/push, 11 for pick)
         local_meta = {**META,
                       "features": {**META["features"],
                                    "observation.state": {
@@ -161,6 +193,45 @@ def write_episode(root: str | Path, episode: dict) -> Path:
     }
     (episodes_index / f"episode_{episode_idx:06d}.json").write_text(json.dumps(ep_meta, indent=2))
     return pq_path
+
+
+def finalize_dataset(root: str | Path, action_margin: float = 0.02) -> dict:
+    from pyarrow import parquet as pq
+
+    root = Path(root)
+    info_path = root / "meta" / "info.json"
+    if info_path.exists():
+        existing = json.loads(info_path.read_text())
+        if "action_normalization" in existing:
+            return existing["action_normalization"]
+
+    episodes_index = _frame_index_dir(root)
+    ep_files = sorted(episodes_index.glob("*.json"))
+    if not ep_files:
+        raise FileNotFoundError(f"No episodes in {root}")
+
+    def _iter_actions():
+        for ep_meta_path in ep_files:
+            ep_meta = json.loads(ep_meta_path.read_text())
+            ep_idx = ep_meta["episode_index"]
+            chunk_idx = ep_idx // 1000
+            pq_path = root / "data" / f"chunk-{chunk_idx:03d}" / f"episode_{ep_idx:06d}.parquet"
+            table = pq.read_table(str(pq_path))
+            actions = np.stack([np.asarray(row.as_py(), dtype=np.float32)
+                                for row in table["action"]])
+            yield actions
+
+    lo, hi = compute_action_stats(_iter_actions())
+    lo_p, hi_p = np.zeros_like(lo), np.zeros_like(hi)
+    for d in range(lo.shape[0]):
+        lo_p[d], hi_p[d] = pad_scale(float(lo[d]), float(hi[d]), margin=action_margin)
+
+    write_action_stats(info_path, lo_p, hi_p)
+
+    return {
+        "lo": lo_p.astype(float).tolist(),
+        "hi": hi_p.astype(float).tolist(),
+    }
 
 
 class BUDEDataset:
@@ -219,17 +290,23 @@ class BUDETrainingDataset:
     def __init__(self, root: str | Path, chunk_size: int = 4,
                  augment: bool = False,
                  brightness_range: float = 0.10,
-                 crop_pad: int = 8):
+                 crop_pad: int = 8,
+                 normalize: bool = True,
+                 n_history_frames: int = 1):
         self.root = Path(root)
         self.chunk_size = chunk_size
         self.augment = augment
         self.brightness_range = brightness_range
         self.crop_pad = crop_pad
+        self.normalize = normalize
+        self.n_history_frames = n_history_frames
         self._episodes: list[dict] = []
         self._cum_frames: list[int] = []
         self._total_frames = 0
         self._images: np.ndarray | None = None
         self._rng = np.random.default_rng()
+        self._action_lo: np.ndarray | None = None
+        self._action_hi: np.ndarray | None = None
 
     def read(self) -> "BUDETrainingDataset":
         from pyarrow import parquet as pq
@@ -273,27 +350,54 @@ class BUDETrainingDataset:
         else:
             self._precache_images(npy_path)
 
+        if self.normalize:
+            info_path = self.root / "meta" / "info.json"
+            self._action_lo, self._action_hi = load_action_stats(info_path)
+            if (self._action_lo == DEFAULT_LO).all() and (self._action_hi == DEFAULT_HI).all():
+                import warnings
+                warnings.warn(
+                    f"action_normalization missing in {info_path}; falling back "
+                    f"to defaults. Call finalize_dataset() after recording to fix."
+                )
+
         return self
 
     def _precache_images(self, npy_path: Path):
         import imageio.v3 as iio
         first_ep = self._episodes[0]
-        vid0 = (self.root / "videos" / f"chunk-{first_ep['chunk_idx']:03d}" /
-                "observation.images.top" / f"episode_{first_ep['ep_idx']:06d}.mp4")
-        sample = iio.imread(str(vid0), plugin="pyav")
-        H, W, C = sample.shape[1], sample.shape[2], sample.shape[3]
-        all_imgs = np.zeros((self._total_frames, H, W, C), dtype=np.uint8)
+        chunk0 = first_ep["chunk_idx"]
+        ep0 = first_ep["ep_idx"]
+        vid_top0 = (self.root / "videos" / f"chunk-{chunk0:03d}" /
+                    "observation.images.top" / f"episode_{ep0:06d}.mp4")
+        vid_wrist0 = (self.root / "videos" / f"chunk-{chunk0:03d}" /
+                      "observation.images.wrist" / f"episode_{ep0:06d}.mp4")
+        sample_top = iio.imread(str(vid_top0), plugin="pyav")
+        H, W = sample_top.shape[1], sample_top.shape[2]
+        has_wrist = vid_wrist0.exists()
+        C = 6 if has_wrist else 3
+        all_imgs = np.lib.format.open_memmap(
+            str(npy_path), mode="w+",
+            dtype=np.uint8, shape=(self._total_frames, H, W, C))
         offset = 0
         for ep in self._episodes:
             chunk_idx = ep["chunk_idx"]
             ep_idx = ep["ep_idx"]
-            vid_path = (self.root / "videos" / f"chunk-{chunk_idx:03d}" /
-                        "observation.images.top" / f"episode_{ep_idx:06d}.mp4")
-            frames = iio.imread(str(vid_path), plugin="pyav")
-            T = frames.shape[0]
-            all_imgs[offset:offset + T] = frames
+            vid_top = (self.root / "videos" / f"chunk-{chunk_idx:03d}" /
+                       "observation.images.top" / f"episode_{ep_idx:06d}.mp4")
+            frames_top = iio.imread(str(vid_top), plugin="pyav")
+            T = frames_top.shape[0]
+            if has_wrist:
+                vid_wrist = (self.root / "videos" / f"chunk-{chunk_idx:03d}" /
+                             "observation.images.wrist" / f"episode_{ep_idx:06d}.mp4")
+                frames_wrist = iio.imread(str(vid_wrist), plugin="pyav")
+                all_imgs[offset:offset + T] = np.concatenate(
+                    [frames_top, frames_wrist], axis=-1)
+            else:
+                all_imgs[offset:offset + T, :, :, :3] = frames_top
+                all_imgs[offset:offset + T, :, :, 3:] = frames_top
             offset += T
-        np.save(str(npy_path), all_imgs)
+        all_imgs.flush()
+        del all_imgs
         self._images = np.load(str(npy_path), mmap_mode="r")
 
     def __len__(self) -> int:
@@ -306,9 +410,26 @@ class BUDETrainingDataset:
         frame_in_ep = idx - self._cum_frames[ep_i]
         ep = self._episodes[ep_i]
 
+        # Stack n_history_frames: current frame plus up to n_history_frames-1
+        # earlier frames from the same episode. Clamped to episode start.
+        n_h = self.n_history_frames
+        if n_h <= 1:
+            stacked = self._images[idx]  # (H, W, 6)
+        else:
+            start = max(0, frame_in_ep - (n_h - 1))
+            window = self._images[idx - (frame_in_ep - start): idx + 1]
+            # Repeat the earliest frame if we're at the boundary
+            if window.shape[0] < n_h:
+                pad_n = n_h - window.shape[0]
+                pad = np.repeat(window[:1], pad_n, axis=0)
+                window = np.concatenate([pad, window], axis=0)
+            stacked = window.reshape(window.shape[0] * window.shape[-1],
+                                     window.shape[1], window.shape[2])
+            stacked = np.transpose(stacked, (1, 2, 0))  # (H, W, n_h*6)
+
         img = torch.from_numpy(
-            self._images[idx].astype(np.float32)
-        ).permute(2, 0, 1) / 255.0
+            stacked.astype(np.float32)
+        ).permute(2, 0, 1).contiguous() / 255.0
         if self.augment:
             img = _augment_image(img, self._rng,
                                  brightness_range=self.brightness_range,
@@ -322,7 +443,9 @@ class BUDETrainingDataset:
         if n < self.chunk_size:
             pad = np.zeros((self.chunk_size - n, 7), dtype=np.float32)
             a_slice = np.concatenate([a_slice, pad], axis=0)
-        act = torch.from_numpy(a_slice)
+        if self.normalize and self._action_lo is not None:
+            a_slice = normalize_actions(a_slice, self._action_lo, self._action_hi)
+        act = torch.from_numpy(a_slice.astype(np.float32))
 
         tau = torch.rand(1).squeeze()
         noise = torch.randn_like(act)
@@ -330,6 +453,7 @@ class BUDETrainingDataset:
         return {
             "images": img,
             "text_ids": txt,
+            "instruction": ep["instruction"],
             "proprio": st,
             "domain_id": dom,
             "actions": act,

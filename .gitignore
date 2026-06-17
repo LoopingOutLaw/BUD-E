@@ -12,6 +12,8 @@ wandb/
 checkpoints/
 datasets/
 data/
+!src/bude_vla/data/
+!src/bude_vla/data/**
 *.mp4
 *.parquet
 .DS_Store

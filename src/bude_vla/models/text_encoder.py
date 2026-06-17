@@ -1,16 +1,15 @@
-"""Tiny from-scratch text encoder + a small BPE-style tokenizer wrapper.
+"""Text encoders for BUD-E.
 
-Spec target: vocab=512, max_len=64, 4-layer encoder, dim=256, ~3M params.
-
-The text encoder is intentionally small because instructions are short and very
-domain-specific ("pick red cube", "reach target", etc). A learned 4-layer
-Transformer encoder over integer tokens is more than enough.
+TinyTextEncoder  - from-scratch 4-layer BPE transformer (original, backward compat).
+MiniLMTextEncoder - frozen pretrained all-MiniLM-L6-v2 with trainable projection.
 
 This module exposes:
 - `SimpleTokenizer`: a tiny integer-encoding tokenizer built on HuggingFace
   `tokenizers` (BPE). Used to train a vocab from instruction strings.
 - `TinyTextEncoder`: nn.Module — token embeddings + sinusoidal pos embed +
   N-layer Transformer encoder + LayerNorm.
+- `MiniLMTextEncoder`: nn.Module — frozen sentence-transformers MiniLM model
+  with a trainable linear projection to the backbone dimension.
 """
 from __future__ import annotations
 
@@ -136,4 +135,65 @@ class TinyTextEncoder(nn.Module):
         kpm = (ids == self.pad_id)
         x = self.transformer(x, src_key_padding_mask=kpm)
         x = self.norm(x)
+        return x
+
+
+class MiniLMTextEncoder(nn.Module):
+    """Frozen pretrained MiniLM (sentence-transformers/all-MiniLM-L6-v2) +
+    trainable linear projection to the backbone dim.
+
+    The MiniLM backbone produces per-token hidden states of shape (B, T, 384).
+    We project to `d` so the output is (B, T, d) — same contract as
+    TinyTextEncoder, so the policy doesn't need to know which encoder is active.
+
+    All MiniLM parameters are frozen (`requires_grad=False`) so we only train
+    the projection. This gives real semantic understanding of instructions
+    ("pick", "push", "reach") learned from natural language pretraining,
+    while keeping trainable param count low.
+
+    Input: list[str] of instruction strings.
+    Output: (B, max_seq_len, d)
+    """
+
+    def __init__(self, d: int = 256, max_len: int = 64,
+                 model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+        super().__init__()
+        from sentence_transformers import SentenceTransformer
+        from transformers import AutoTokenizer
+
+        # Load model + tokenizer. SentenceTransformer wraps the BertModel.
+        self._st = SentenceTransformer(model_name)
+        self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = self._st._first_module().auto_model
+        self.d = d
+        self.max_len = max_len
+        self.embed_dim = self.model.config.hidden_size
+
+        for p in self.model.parameters():
+            p.requires_grad = False
+        if hasattr(self._st, "_modules"):
+            for module in self._st._modules.values():
+                for p in module.parameters():
+                    p.requires_grad = False
+
+        self.proj = nn.Linear(self.embed_dim, d)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # Keep MiniLM frozen regardless of mode
+        self.model.eval()
+        return self
+
+    def forward(self, texts) -> torch.Tensor:
+        """texts: list[str] of instruction strings. Returns (B, T, d)."""
+        device = next(self.proj.parameters()).device
+        enc = self._tokenizer(
+            texts, padding="max_length", truncation=True,
+            max_length=self.max_len, return_tensors="pt",
+        )
+        enc = {k: v.to(device) for k, v in enc.items()}
+        with torch.no_grad():
+            hidden = self.model(**enc).last_hidden_state
+        B, T, _ = hidden.shape
+        x = self.proj(hidden.view(B * T, -1)).view(B, T, self.d)
         return x
