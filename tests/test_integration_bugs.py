@@ -141,3 +141,27 @@ def test_build_batch_includes_instruction():
     assert batch["images"].shape == (1, 6, 64, 64)
     assert batch["proprio"].shape == (1, 8)
     assert batch["domain_id"].shape == (1,)
+
+
+# ────────────── Bug #1b: train.py .to(device) on string fields ──────────────
+
+def test_to_device_skips_strings():
+    """train.py loop calls .to(device) per-key; strings must be skipped."""
+    from scripts.train import collate_fn  # type: ignore  # noqa: F401
+
+    batch = [
+        {
+            "instruction": "hello",
+            "x": torch.tensor([1.0]),
+        },
+        {
+            "instruction": "world",
+            "x": torch.tensor([2.0]),
+        },
+    ]
+    out = collate_fn(batch)
+    # Simulate the train.py loop: only call .to on tensors
+    moved = {k: v.to("cpu") if isinstance(v, torch.Tensor) else v
+             for k, v in out.items()}
+    assert moved["instruction"] == ["hello", "world"]
+    assert torch.equal(moved["x"], torch.tensor([[1.0], [2.0]]))

@@ -155,7 +155,8 @@ def train(
             dl_iter = iter(dl)
             batch = next(dl_iter)
 
-        batch = {k: v.to(device) for k, v in batch.items()}
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
 
         out = policy(batch)
         v_pred = out["velocity"]
