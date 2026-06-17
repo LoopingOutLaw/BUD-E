@@ -75,7 +75,8 @@ def _load_policy(ckpt_path: str, img_size: int, device: str,
         print(f"  loaded checkpoint step={step}")
     action_lo = ckpt.get("action_norm_lo", None)
     action_hi = ckpt.get("action_norm_hi", None)
-    return policy, action_lo, action_hi
+    return (policy, action_lo, action_hi,
+            cfg.use_dinov2, cfg.use_minilm, cfg.n_history_frames)
 
 
 def _random_cube_positions(n: int, seed: int = 42):
@@ -88,7 +89,8 @@ def _random_cube_positions(n: int, seed: int = 42):
 def _add_overlay(frame: np.ndarray, text: str,
                   status: str = "", img_size: int = 224) -> np.ndarray:
     out = frame.copy()
-    if out.shape[-1] == 6:
+    if out.shape[-1] >= 3 and out.shape[-1] != 3:
+        # 6-ch dual-cam or 12-ch history stacks: keep just the front camera.
         out = np.ascontiguousarray(out[..., :3])
     font_scale = max(0.4, img_size / 600)
     thickness = max(1, img_size // 300)
@@ -140,12 +142,15 @@ def main():
     else:
         device = args.device
     print(f"loading policy from {args.ckpt} (device={device})")
-    policy, action_lo, action_hi = _load_policy(
+    (policy, action_lo, action_hi,
+     resolved_dinov2, resolved_minilm, resolved_history
+     ) = _load_policy(
         args.ckpt, args.img_size, device,
         use_dinov2=args.use_dinov2,
         use_minilm=args.use_minilm,
         n_history_frames=args.n_history_frames,
     )
+    print(f"  resolved flags: dinov2={resolved_dinov2} minilm={resolved_minilm} history={resolved_history}")
 
     model = mujoco.MjModel.from_xml_path(str(ARM_MODEL_PATH))
     data = mujoco.MjData(model)
@@ -159,7 +164,7 @@ def main():
         action_norm_root=args.data_root,
         action_lo=action_lo,
         action_hi=action_hi,
-        n_history_frames=args.n_history_frames,
+        n_history_frames=resolved_history,
     )
 
     if args.viewer and os.environ.get("MUJOCO_GL") != "glfw":

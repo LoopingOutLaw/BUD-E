@@ -364,6 +364,10 @@ class BUDETrainingDataset:
 
     def _precache_images(self, npy_path: Path):
         import imageio.v3 as iio
+        if not self._episodes:
+            raise RuntimeError(
+                f"No episodes loaded from {self.root}. "
+                f"Check that the dataset path is correct and contains episode files.")
         first_ep = self._episodes[0]
         chunk0 = first_ep["chunk_idx"]
         ep0 = first_ep["ep_idx"]
