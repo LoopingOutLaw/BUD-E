@@ -56,4 +56,4 @@ def test_record_dataset_cpu_writes_videos_and_parquets():
         parquets = list(root.rglob("*.parquet"))
         mp4s = list(root.rglob("*.mp4"))
         assert len(parquets) == 2
-        assert len(mp4s) == 2
+        assert len(mp4s) == 4   # 2 episodes × 2 cameras (overhead + wrist)

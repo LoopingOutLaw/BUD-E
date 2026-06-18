@@ -12,7 +12,7 @@ def test_train_step_runs_on_gpu():
     p = BUDEPolicy(cfg).to("cuda")
     opt = torch.optim.AdamW(p.parameters(), lr=1e-4)
     B = 2
-    imgs = torch.zeros(B, 3, cfg.img_size, cfg.img_size, device="cuda")
+    imgs = torch.zeros(B, 6, cfg.img_size, cfg.img_size, device="cuda")
     qpos = torch.randn(B, cfg.state_dim, device="cuda")
     text_ids = torch.randint(0, 100, (B, 8), device="cuda")
     domain_ids = torch.zeros(B, dtype=torch.long, device="cuda")
@@ -43,7 +43,7 @@ def test_sample_runs_on_gpu():
     B = 2
     with torch.no_grad():
         a = p.sample(dict(
-            images=torch.zeros(B, 3, cfg.img_size, cfg.img_size, device="cuda"),
+            images=torch.zeros(B, 6, cfg.img_size, cfg.img_size, device="cuda"),
             text_ids=torch.randint(0, 100, (B, 8), device="cuda"),
             proprio=torch.randn(B, cfg.state_dim, device="cuda"),
             domain_id=torch.zeros(B, dtype=torch.long, device="cuda"),

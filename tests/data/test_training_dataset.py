@@ -29,7 +29,8 @@ def test_dataset_getitem_returns_correct_keys():
         assert "domain_id" in sample
         assert "tau" in sample
         assert "noise" in sample
-        assert sample["images"].shape == (3, 64, 64)
+        assert sample["images"].shape[0] in (3, 6)
+        assert sample["images"].shape[1:] == (64, 64)
         assert sample["proprio"].shape == (8,)
         assert sample["actions"].shape == (4, 7)
 

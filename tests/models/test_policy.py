@@ -5,7 +5,7 @@ from bude_vla.models.policy import BUDEPolicy, BUDEConfig
 
 def _make_batch(cfg: BUDEConfig, B: int = 2):
     return {
-        "images": torch.randn(B, 3, cfg.img_size, cfg.img_size),
+        "images": torch.randn(B, 6, cfg.img_size, cfg.img_size),
         "text_ids": torch.randint(1, cfg.text_vocab, (B, cfg.text_max_len)),
         "proprio": torch.randn(B, cfg.state_dim),
         "domain_id": torch.zeros(B, dtype=torch.long),
@@ -50,7 +50,7 @@ def test_policy_sample_shape():
     p = BUDEPolicy(cfg)
     p.eval()
     batch = {
-        "images": torch.randn(2, 3, 32, 32),
+        "images": torch.randn(2, 6, 32, 32),
         "text_ids": torch.randint(1, cfg.text_vocab, (2, 8)),
         "proprio": torch.randn(2, 8),
         "domain_id": torch.zeros(2, dtype=torch.long),
@@ -80,7 +80,7 @@ def test_policy_soft_prompts_separate_per_domain():
     p = BUDEPolicy(cfg)
     p.eval()
     base = {
-        "images": torch.randn(1, 3, 32, 32),
+        "images": torch.randn(1, 6, 32, 32),
         "text_ids": torch.randint(1, cfg.text_vocab, (1, 8)),
         "proprio": torch.randn(1, cfg.state_dim),
         "actions": torch.randn(1, cfg.chunk_size, cfg.action_dim),

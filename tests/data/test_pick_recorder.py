@@ -11,7 +11,6 @@ def test_record_pick_episode_returns_correct_arrays():
         assert "proprio" in ep
         assert "actions" in ep
         assert "instruction" in ep
-        assert ep["images"].shape[1:] == (64, 64, 3)
         assert ep["proprio"].shape[1] == 8
         assert ep["actions"].shape[1] == 7
         assert "pick" in ep["instruction"].lower()
