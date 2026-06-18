@@ -21,6 +21,42 @@ TABLE_Z = 0.42
 CUBE_HALF = 0.025
 
 
+def _mat_to_quat(mat_flat: np.ndarray) -> np.ndarray:
+    """Convert 9-flat rotation matrix (xmat) into a (w, x, y, z) quaternion."""
+    m = mat_flat.reshape(3, 3)
+    trace = m[0, 0] + m[1, 1] + m[2, 2]
+    if trace > 0.0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (m[2, 1] - m[1, 2]) * s
+        y = (m[0, 2] - m[2, 0]) * s
+        z = (m[1, 0] - m[0, 1]) * s
+    else:
+        if m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+            s = 2.0 * np.sqrt(max(1e-12, 1.0 + m[0, 0] - m[1, 1] - m[2, 2]))
+            w = (m[2, 1] - m[1, 2]) / s
+            x = 0.25 * s
+            y = (m[0, 1] + m[1, 0]) / s
+            z = (m[0, 2] + m[2, 0]) / s
+        elif m[1, 1] > m[2, 2]:
+            s = 2.0 * np.sqrt(max(1e-12, 1.0 + m[1, 1] - m[0, 0] - m[2, 2]))
+            w = (m[0, 2] - m[2, 0]) / s
+            x = (m[0, 1] + m[1, 0]) / s
+            y = 0.25 * s
+            z = (m[1, 2] + m[2, 1]) / s
+        else:
+            s = 2.0 * np.sqrt(max(1e-12, 1.0 + m[2, 2] - m[0, 0] - m[1, 1]))
+            w = (m[1, 0] - m[0, 1]) / s
+            x = (m[0, 2] + m[2, 0]) / s
+            y = (m[1, 2] + m[2, 1]) / s
+            z = 0.25 * s
+    q = np.array([w, x, y, z], dtype=np.float64)
+    n = np.linalg.norm(q)
+    if n > 0:
+        q = q / n
+    return q
+
+
 class ScriptedPickAndPlace:
     def __init__(self, model, data, cube_start_xy, target_xy=(0.85, 0.0)):
         self.model = model
@@ -65,13 +101,15 @@ class ScriptedPickAndPlace:
         self._cube_attached_offset = local_xyz
 
     def _carry_cube_with(self, data):
-        """Override cube world position based on gripper's current pose + captured offset."""
         if self._cube_attached_offset is None:
             return
         gripper_xyz = data.xpos[self.gripper_body_id].copy()
         gripper_rot = data.xmat[self.gripper_body_id].reshape(3, 3).copy()
         new_cube_xyz = gripper_xyz + gripper_rot @ self._cube_attached_offset
         data.qpos[0:3] = new_cube_xyz
+
+        ee_quat = _mat_to_quat(data.xmat[self.gripper_body_id].copy())
+        data.qpos[3:7] = ee_quat
 
     def step(self, model, data):
         self._total_steps += 1
@@ -113,7 +151,10 @@ class ScriptedPickAndPlace:
             arm_target = self._ik_target(data, goal)
             ctrl = self._ctrl_from_target(data, arm_target)
             ctrl[6] = 1.0
-            if self.phase_step >= 5 and self._cube_attached_offset is None:
+            ee_to_cube = float(np.linalg.norm(ee - cube))
+            if (self._cube_attached_offset is None
+                    and self.phase_step >= 5
+                    and ee_to_cube < 0.04):
                 self._attach_cube_to_gripper(data)
             if self.phase_step > 20:
                 self.phase = LIFT

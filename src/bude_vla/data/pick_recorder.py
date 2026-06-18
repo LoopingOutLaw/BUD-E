@@ -15,7 +15,7 @@ INSTRUCTION = "pick up the red cube and place it in the blue target zone"
 
 def record_pick_episode(root: str | Path, episode_idx: int = 0,
                         cube_xy: tuple[float, float] = (0.6, 0.0),
-                        camera: str | None = None, img_size: int = 64,
+                        img_size: int = 64,
                         max_steps: int = 350) -> dict:
     from bude_vla.envs.so101_mjx import ARM_MODEL_PATH
 
@@ -28,27 +28,25 @@ def record_pick_episode(root: str | Path, episode_idx: int = 0,
     mujoco.mj_forward(model, data)
 
     renderer = mujoco.Renderer(model, height=img_size, width=img_size)
-    cam_id = (mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera)
-              if camera else -1)
+    overhead_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA,
+                                        "front_top")
+    gripper_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA,
+                                       "gripper_cam")
 
     policy = ScriptedPickAndPlace(model, data, cube_start_xy=np.array(cube_xy))
 
-    images, proprios, actions, cube_xyzs = [], [], [], []
+    images, proprios, actions = [], [], []
     cube_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
     target_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
 
     for _ in range(max_steps):
-        if camera:
-            renderer.update_scene(data, camera=cam_id)
-        else:
-            renderer.update_scene(data)
-        img = renderer.render()
-        images.append(np.asarray(img).copy())
+        renderer.update_scene(data, camera=overhead_cam_id)
+        img_overhead = np.asarray(renderer.render()).copy()
+        renderer.update_scene(data, camera=gripper_cam_id)
+        img_wrist = np.asarray(renderer.render()).copy()
+        images.append(np.concatenate([img_overhead, img_wrist], axis=-1).copy())
         arm_proprio = data.qpos[7:15].astype(np.float32).copy()
-        cube_xyz = data.xpos[cube_body_id].astype(np.float32).copy()
-        cube_xyzs.append(cube_xyz)
-        proprio = np.concatenate([arm_proprio, cube_xyz]).astype(np.float32)
-        proprios.append(proprio)
+        proprios.append(arm_proprio)
 
         ctrl, arm_target, done, info = policy.step(model, data)
         kinematic_action = np.concatenate([arm_target, [ctrl[6]]]).astype(np.float32)

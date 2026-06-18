@@ -19,43 +19,50 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 import numpy as np
 import mujoco
 import mujoco.viewer
-from bude_vla.data.lerobot_v3 import write_episode
+from bude_vla.data.lerobot_v3 import write_episode, finalize_dataset
 from bude_vla.scripted_pick_and_place import ScriptedPickAndPlace
 from bude_vla.envs.so101_mjx import ARM_MODEL_PATH
 
 INSTRUCTION = "pick up the red cube and place it in the blue target zone"
 
 
-def _main_loop(model, data, policy, renderer, cam_id, viewer=None,
-               max_steps=350, step_delay=0.0, use_free_cam=True):
+def _main_loop(model, data, policy, renderer, cam_ids, viewer=None,
+               max_steps=350, step_delay=0.0):
+    SMOOTH_STEPS = 10
+    SMOOTH_FRAC = 0.25
+
     images, proprios, actions = [], [], []
     cube_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
     target_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY,
                                        "target_zone")
 
+    def _render_dual():
+        renderer.update_scene(data, camera=cam_ids[0])
+        oh = np.asarray(renderer.render()).copy()
+        renderer.update_scene(data, camera=cam_ids[1])
+        wr = np.asarray(renderer.render()).copy()
+        return np.concatenate([oh, wr], axis=-1).copy()
+
     for step in range(max_steps):
-        if use_free_cam:
-            renderer.update_scene(data)
-        else:
-            renderer.update_scene(data, camera=cam_id)
-        images.append(np.asarray(renderer.render()).copy())
-        arm_proprio = data.qpos[7:15].astype(np.float32).copy()
-        cube_xyz = data.xpos[cube_body_id].astype(np.float32).copy()
-        proprios.append(
-            np.concatenate([arm_proprio, cube_xyz]).astype(np.float32)
-        )
+        images.append(_render_dual())
+        proprios.append(data.qpos[7:15].astype(np.float32).copy())
 
         ctrl, arm_target, done, _ = policy.step(model, data)
         kinematic_action = np.concatenate([arm_target, [ctrl[6]]]).astype(np.float32)
         actions.append(kinematic_action)
 
-        data.ctrl[:] = 0.0
-        data.ctrl[6] = ctrl[6]
-        data.qvel[6:12] = 0.0
-        data.qpos[7:13] = arm_target
-        policy._carry_cube_with(data)
-        mujoco.mj_step(model, data)
-        data.qpos[7:13] = arm_target
+        tgt = np.clip(arm_target, -3.5, 3.5).astype(np.float64)
+        cur = data.qpos[7:13].astype(np.float64).copy()
+        for k in range(SMOOTH_STEPS):
+            err = tgt - cur
+            cur = cur + err * SMOOTH_FRAC
+            data.ctrl[:] = 0.0
+            data.ctrl[6] = ctrl[6]
+            data.qvel[6:12] = 0.0
+            data.qpos[7:13] = cur
+            policy._carry_cube_with(data)
+            mujoco.mj_step(model, data)
+        data.qpos[7:13] = tgt
         policy._carry_cube_with(data)
 
         if viewer is not None and step % 4 == 0:
@@ -97,9 +104,6 @@ def main():
                     help="show live MuJoCo viewer per episode (needs DISPLAY)")
     ap.add_argument("--slow", type=float, default=0.0,
                     help="seconds to sleep per step (~0.04 = real-time)")
-    ap.add_argument("--cam", default=None,
-                    help="Camera name (e.g. front_top). Default: free camera "
-                         "(auto-framing, same as push_v3)")
     ap.add_argument("--img-size", type=int, default=64,
                     help="Render resolution (default 64; use 224 for VLA training)")
     args = ap.parse_args()
@@ -109,9 +113,11 @@ def main():
     os.makedirs(root, exist_ok=True)
 
     model = mujoco.MjModel.from_xml_path(str(ARM_MODEL_PATH))
-    use_free_cam = args.cam is None
-    cam_id = (mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, args.cam)
-              if args.cam else -1)
+    overhead_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA,
+                                        "front_top")
+    gripper_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA,
+                                       "gripper_cam")
+    cam_ids = (overhead_cam_id, gripper_cam_id)
 
     n_success = 0
     t0 = time.time()
@@ -130,16 +136,8 @@ def main():
                                       cube_start_xy=np.array([cx, cy]))
         renderer = mujoco.Renderer(model, height=args.img_size, width=args.img_size)
 
-        if args.render:
-            with mujoco.viewer.launch_passive(model, data) as viewer:
-                ep = _main_loop(model, data, policy, renderer, cam_id,
-                                viewer=viewer, step_delay=args.slow,
-                                use_free_cam=use_free_cam)
-                del viewer
-        else:
-            ep = _main_loop(model, data, policy, renderer, cam_id,
-                            viewer=None, step_delay=args.slow,
-                            use_free_cam=use_free_cam)
+        ep = _main_loop(model, data, policy, renderer, cam_ids,
+                        viewer=None, step_delay=args.slow)
 
         renderer.close()
         write_episode(root, ep)
@@ -152,6 +150,10 @@ def main():
     rate = n_success / args.max_eps * 100 if args.max_eps > 0 else 0
     print(f"\n=== DONE  {n_success}/{args.max_eps} success ({rate:.0f}%)  "
           f"in {elapsed:.0f}s  out={root} ===")
+
+    stats = finalize_dataset(root)
+    print(f"action_normalization persisted to {root}/meta/info.json: "
+          f"lo[0:3]={stats['lo'][:3]} ... hi[0:3]={stats['hi'][:3]}")
 
 
 if __name__ == "__main__":
