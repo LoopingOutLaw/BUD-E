@@ -30,7 +30,7 @@ def test_runner_produces_rollout_result_smoke():
     assert not result.success
     assert result.n_tries == 2
     assert len(result.frames) > 0
-    assert all(f.shape == (64, 64, 3) for f in result.frames)
+    assert all(f.shape == (64, 64, 6) for f in result.frames)
     assert all("try" in label for label in result.try_labels)
 
 

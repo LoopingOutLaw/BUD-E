@@ -28,7 +28,7 @@ from bude_vla.data.action_normalization import (
 
 TABLE_Z = 0.42
 CUBE_HALF = 0.025
-CARRY_ATTACH_DIST = 0.04
+CARRY_ATTACH_DIST = 0.20
 HOME_QPOS = np.zeros(8, dtype=np.float64)
 CUBE_REST_Z = 0.445
 
@@ -149,7 +149,11 @@ class PolicyRolloutRunner:
                  action_norm_root: str | None = None,
                  action_lo: np.ndarray | list | None = None,
                  action_hi: np.ndarray | list | None = None,
-                 n_history_frames: int = 1):
+                 n_history_frames: int = 1,
+                 ensembling: bool = False,
+                 ensembling_k: float = 0.5,
+                 arm_smooth_steps: int = 1,
+                 arm_step_frac: float = 1.0):
         self.model = model
         self.img_size = img_size
         self.max_steps_per_try = max_steps_per_try
@@ -162,7 +166,14 @@ class PolicyRolloutRunner:
             model, mujoco.mjtObj.mjOBJ_CAMERA, "front_top")
         self.wrist_cam_id = mujoco.mj_name2id(
             model, mujoco.mjtObj.mjOBJ_CAMERA, "gripper_cam")
+        self.portfolio_cam_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_CAMERA, "portfolio")
         self.text_ids = _pick_token_ids()
+        self.ensembling = ensembling
+        self.ensembling_k = ensembling_k  # weight of new chunk vs in-queue action
+        self._action_queue: list = []  # pending denormalized actions
+        self.arm_smooth_steps = max(1, int(arm_smooth_steps))
+        self.arm_step_frac = float(arm_step_frac)
 
         # ── action normalization ──────────────────────────────────────────
         # Priority: explicit lo/hi > data-root file > DEFAULT
@@ -179,7 +190,10 @@ class PolicyRolloutRunner:
             self._action_hi = DEFAULT_HI.copy()
         self._use_norm = True
 
-    def _render(self, data) -> np.ndarray:
+    def _render(self, data, camera: str = "default") -> np.ndarray:
+        if camera == "portfolio":
+            self.renderer.update_scene(data, camera=self.portfolio_cam_id)
+            return np.asarray(self.renderer.render()).copy()
         self.renderer.update_scene(data, camera=self.overhead_cam_id)
         img_overhead = np.asarray(self.renderer.render()).copy()
         self.renderer.update_scene(data, camera=self.wrist_cam_id)
@@ -197,16 +211,18 @@ class PolicyRolloutRunner:
         return np.concatenate(self._frame_buffer, axis=-1)
 
     def run_one(self, data, policy, cube_xy,
-                viewer=None, step_delay: float = 0.0) -> RolloutResult:
+                viewer=None, step_delay: float = 0.0,
+                record_video_mode: bool = False,
+                record_camera: str = "default") -> RolloutResult:
         frames: list = []
         try_labels: list = []
         success = False
         final_try_idx = 0
 
-        ARM_SMOOTH_STEPS = 14
-        ARM_STEP_FRAC = 0.22
+        ARM_SMOOTH_STEPS = max(6, self.arm_smooth_steps) if record_video_mode else self.arm_smooth_steps
+        ARM_STEP_FRAC = (1.0 / ARM_SMOOTH_STEPS) if record_video_mode else self.arm_step_frac
 
-        def _smooth_arm_to(target_qpos):
+        def _smooth_arm_to(target_qpos, try_idx_inner):
             cur = data.qpos[7:13].astype(np.float64).copy()
             tgt = np.clip(target_qpos, -3.5, 3.5).astype(np.float64)
             for k in range(ARM_SMOOTH_STEPS):
@@ -218,11 +234,17 @@ class PolicyRolloutRunner:
                 data.qpos[7:13] = cur
                 _carry_cube_with(self.model, data, offset)
                 mujoco.mj_step(self.model, data)
-                img_mid = self._render(data)
-                stacked_mid = self._stacked_view(img_mid)
-                frames.append(stacked_mid)
+                if record_video_mode and record_camera != "default":
+                    img_obs = self._render(data, camera="default")
+                    self._stacked_view(img_obs)
+                    img_vid = self._render(data, camera=record_camera)
+                    frames.append(img_vid)
+                else:
+                    img_mid = self._render(data, camera=record_camera)
+                    stacked_mid = self._stacked_view(img_mid)
+                    frames.append(stacked_mid)
                 try_labels.append(
-                    f"try {try_idx + 1}/{self.max_tries}")
+                    f"try {try_idx_inner + 1}/{self.max_tries}")
             data.qpos[7:13] = tgt
             _carry_cube_with(self.model, data, offset)
             return tgt
@@ -236,26 +258,48 @@ class PolicyRolloutRunner:
             chunk = None
             cursor = 0
             self._frame_buffer = []
+            self._action_queue = []
 
             for step in range(self.max_steps_per_try):
                 img = self._render(data)
                 stacked = self._stacked_view(img)
                 arm_proprio = data.qpos[7:15].astype(np.float32).copy()
-                frames.append(stacked)
+                if record_video_mode and record_camera != "default":
+                    frames.append(self._render(data, camera=record_camera))
+                else:
+                    frames.append(stacked)
                 try_labels.append(f"try {try_idx + 1}/{self.max_tries}")
 
-                if chunk is None or cursor >= chunk.shape[0]:
-                    batch = _build_batch(stacked, arm_proprio, self.text_ids,
-                                         _PICK_INSTRUCTION, domain_id=0,
-                                         device=self.device)
-                    chunk = policy.sample(batch)[0].detach().cpu().numpy()
-                    cursor = 0
-
-                a = chunk[cursor]
-                cursor += 1
-
-                if self._use_norm:
-                    a = denormalize_actions(a, self._action_lo, self._action_hi)
+                if self.ensembling:
+                    if not self._action_queue:
+                        batch = _build_batch(stacked, arm_proprio, self.text_ids,
+                                             _PICK_INSTRUCTION, domain_id=0,
+                                             device=self.device)
+                        new_chunk = policy.sample(batch)[0].detach().cpu().numpy()
+                        if self._use_norm:
+                            new_chunk = denormalize_actions(
+                                new_chunk, self._action_lo, self._action_hi)
+                        # overlap-fill: average with any existing planned actions
+                        q = list(self._action_queue)
+                        for i, new_a in enumerate(new_chunk):
+                            if i < len(q):
+                                q[i] = (self.ensembling_k * q[i]
+                                        + (1 - self.ensembling_k) * new_a)
+                            else:
+                                q.append(new_a)
+                        self._action_queue = q
+                    a = self._action_queue.pop(0)
+                else:
+                    if chunk is None or cursor >= chunk.shape[0]:
+                        batch = _build_batch(stacked, arm_proprio, self.text_ids,
+                                             _PICK_INSTRUCTION, domain_id=0,
+                                             device=self.device)
+                        chunk = policy.sample(batch)[0].detach().cpu().numpy()
+                        cursor = 0
+                    a = chunk[cursor]
+                    cursor += 1
+                    if self._use_norm:
+                        a = denormalize_actions(a, self._action_lo, self._action_hi)
 
                 if np.any(np.isnan(a)):
                     arm_target = HOME_QPOS[:6].copy()
@@ -265,7 +309,7 @@ class PolicyRolloutRunner:
                     gripper_ctrl = float(np.clip(a[6], -1.0, 1.0))
 
                 _carry_cube_with(self.model, data, offset)
-                _smooth_arm_to(arm_target)
+                _smooth_arm_to(arm_target, try_idx)
 
                 ee = _ee_xyz(self.model, data)
                 cube = _cube_xyz(self.model, data)
@@ -282,7 +326,10 @@ class PolicyRolloutRunner:
 
                 if _is_success(self.model, data):
                     success = True
-                    frames.append(self._stacked_view(self._render(data)))
+                    if record_video_mode and record_camera != "default":
+                        frames.append(self._render(data, camera=record_camera))
+                    else:
+                        frames.append(self._stacked_view(self._render(data)))
                     try_labels.append(
                         f"try {try_idx + 1}/{self.max_tries} SUCCESS")
                     break
