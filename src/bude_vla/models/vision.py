@@ -1,4 +1,8 @@
-"""From-scratch ViT-small vision tower for BUD-E."""
+"""Vision towers for BUD-E.
+
+ViTSmall       - from-scratch ViT-S (original, for backward compat).
+DINOv2Tower    - pretrained DINOv2-small backbone with 6-channel adapter.
+"""
 from __future__ import annotations
 
 import torch
@@ -74,5 +78,81 @@ class ViTSmall(nn.Module):
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
+        x = self.proj(x)
+        return x
+
+
+class DINOv2Tower(nn.Module):
+    """Pretrained DINOv2-small vision tower with 6-channel input adapter.
+
+    Copies the 3-channel patch-embed weights into a new 6-channel conv by
+    zero-initializing the extra input channels. This preserves pretrained
+    features for the first 3 channels (overhead cam) while letting the
+    additional 3 channels (wrist cam) be learned from scratch.
+
+    Early transformer blocks are frozen; the last `finetune_blocks` blocks
+    plus the output projection are trainable.
+
+    Output: (B, num_patches, out_dim) — patch tokens only, no CLS token.
+    """
+
+    def __init__(
+        self,
+        img_size: int = 224,
+        in_channels: int = 6,
+        out_dim: int = 256,
+        finetune_blocks: int = 4,
+        pretrained: str = "vit_small_patch14_dinov2.lvd142m",
+    ):
+        super().__init__()
+        import timm
+        self.backbone = timm.create_model(
+            pretrained, pretrained=True, img_size=img_size,
+        )
+        self.embed_dim = self.backbone.embed_dim
+        self.num_patches = self.backbone.patch_embed.num_patches
+        self.out_dim = out_dim
+
+        self._adapt_patch_embed(in_channels)
+        self._strip_cls_token()
+        self._freeze_blocks(finetune_blocks)
+
+        self.proj = nn.Linear(self.embed_dim, out_dim) if out_dim != self.embed_dim else nn.Identity()
+
+    def _adapt_patch_embed(self, in_channels: int) -> None:
+        old_proj = self.backbone.patch_embed.proj
+        if old_proj.in_channels == in_channels:
+            return
+        new_proj = nn.Conv2d(
+            in_channels, old_proj.out_channels,
+            kernel_size=old_proj.kernel_size,
+            stride=old_proj.stride,
+            bias=old_proj.bias is not None,
+        )
+        with torch.no_grad():
+            new_proj.weight[:, :old_proj.in_channels] = old_proj.weight
+            nn.init.zeros_((new_proj.weight[:, old_proj.in_channels:]))
+            if old_proj.bias is not None:
+                new_proj.bias.copy_(old_proj.bias)
+        self.backbone.patch_embed.proj = new_proj
+
+    def _strip_cls_token(self) -> None:
+        pass
+
+    def _freeze_blocks(self, finetune_blocks: int) -> None:
+        total = len(self.backbone.blocks)
+        for i, block in enumerate(self.backbone.blocks):
+            requires_grad = i >= (total - finetune_blocks)
+            for p in block.parameters():
+                p.requires_grad = requires_grad
+        if hasattr(self.backbone, "norm"):
+            for p in self.backbone.norm.parameters():
+                p.requires_grad = True
+        if hasattr(self.backbone, 'pos_embed') and self.backbone.pos_embed is not None:
+            self.backbone.pos_embed.requires_grad = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.backbone.forward_features(x)
+        x = x[:, 1:, :]
         x = self.proj(x)
         return x
