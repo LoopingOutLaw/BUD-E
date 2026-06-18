@@ -1,0 +1,9 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Failed to import warp: No module named 'warp'
+Failed to import mujoco_warp: No module named 'warp'
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 12235.91it/s]
+/home/aditya/bude_vla/src/bude_vla/models/action_head.py:80: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.temporal = nn.TransformerEncoder(
+  attempt 1: cube=(0.62,-0.09) -> success=True frames=556
+  picked cube=(0.62,-0.09) n_tries=1 frames=556
+wrote demos/videos/pick_success_v4_25k.mp4  (556 frames @ 15 fps = 37.1 s)

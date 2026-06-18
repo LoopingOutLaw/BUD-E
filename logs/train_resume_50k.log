@@ -1,0 +1,49 @@
+Training on cuda
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 10213.81it/s]
+/home/aditya/bude_vla/src/bude_vla/models/action_head.py:80: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.temporal = nn.TransformerEncoder(
+Model parameters: 57,317,918
+  vision: 22,404,736
+  text: 22,811,776
+  proprio: 2,320
+  soft_prompts: 49,152
+  backbone: 6,318,080
+  action_head: 5,731,854
+  total: 57,317,918
+  loaded 24921 frames from /home/aditya/bude_vla/data/pick_v3_224_6ch_v4
+  total frames: 24921, batches/epoch: 778, history_frames: 2
+  action_norm lo=[-0.5992828  -0.97112006 -0.49136448]  hi=[0.2727458  0.41297784 1.3588737 ]
+/home/aditya/bude_vla/scripts/train.py:144: UserWarning: Detected call of `lr_scheduler.step()` before `optimizer.step()`. In PyTorch 1.1.0 and later, you should call them in the opposite order: `optimizer.step()` before `lr_scheduler.step()`.  Failure to do this will result in PyTorch skipping the first value of the learning rate schedule. See more details at https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
+  scheduler.step()
+  resumed from step 25000, loss_hist entries=250
+step  25100 | loss 0.070571 | lr 3.00e-06 | 526.0 steps/s | epoch 0
+step  25200 | loss 0.072708 | lr 3.00e-06 | 262.3 steps/s | epoch 0
+step  25300 | loss 0.072662 | lr 3.00e-06 | 174.2 steps/s | epoch 0
+step  25400 | loss 0.074166 | lr 3.00e-06 | 130.3 steps/s | epoch 0
+step  25500 | loss 0.071164 | lr 3.00e-06 | 104.2 steps/s | epoch 0
+step  25600 | loss 0.069139 | lr 3.00e-06 | 87.0 steps/s | epoch 0
+step  25700 | loss 0.072614 | lr 3.00e-06 | 74.8 steps/s | epoch 0
+step  25800 | loss 0.071239 | lr 3.00e-06 | 65.6 steps/s | epoch 1
+step  25900 | loss 0.067777 | lr 3.00e-06 | 58.8 steps/s | epoch 1
+step  26000 | loss 0.069751 | lr 3.00e-06 | 53.2 steps/s | epoch 1
+  saved checkpoint: /home/aditya/bude_vla/checkpoints/pick_v4_25k/pick_v4_25k_step_026000.pt
+step  26100 | loss 0.071157 | lr 3.00e-06 | 48.6 steps/s | epoch 1
+step  26200 | loss 0.071414 | lr 3.00e-06 | 44.8 steps/s | epoch 1
+step  26300 | loss 0.075831 | lr 3.00e-06 | 41.6 steps/s | epoch 1
+step  26400 | loss 0.070356 | lr 3.00e-06 | 38.8 steps/s | epoch 1
+step  26500 | loss 0.069171 | lr 3.00e-06 | 36.3 steps/s | epoch 1
+step  26600 | loss 0.073070 | lr 3.00e-06 | 34.2 steps/s | epoch 2
+step  26700 | loss 0.068320 | lr 3.00e-06 | 32.4 steps/s | epoch 2
+step  26800 | loss 0.070890 | lr 3.00e-06 | 30.7 steps/s | epoch 2
+step  26900 | loss 0.069359 | lr 3.00e-06 | 29.2 steps/s | epoch 2
+step  27000 | loss 0.072276 | lr 3.00e-06 | 27.8 steps/s | epoch 2
+  saved checkpoint: /home/aditya/bude_vla/checkpoints/pick_v4_25k/pick_v4_25k_step_027000.pt
+step  27100 | loss 0.070607 | lr 3.00e-06 | 26.6 steps/s | epoch 2
+step  27200 | loss 0.069352 | lr 3.00e-06 | 25.5 steps/s | epoch 2
+step  27300 | loss 0.075217 | lr 3.00e-06 | 24.5 steps/s | epoch 2
+step  27400 | loss 0.072493 | lr 3.00e-06 | 23.6 steps/s | epoch 3
+step  27500 | loss 0.071024 | lr 3.00e-06 | 22.7 steps/s | epoch 3
+step  27600 | loss 0.075602 | lr 3.00e-06 | 21.9 steps/s | epoch 3
+step  27700 | loss 0.072861 | lr 3.00e-06 | 21.2 steps/s | epoch 3
+step  27800 | loss 0.067196 | lr 3.00e-06 | 20.5 steps/s | epoch 3

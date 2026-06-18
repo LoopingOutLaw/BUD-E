@@ -1,0 +1,51 @@
+{
+  "timestamp": "2026-06-18T13:50:33.839470",
+  "ckpt": "checkpoints/pick_v4_25k/pick_v4_25k_final.pt",
+  "seeds_inits": 3,
+  "seeds_rollouts": 10,
+  "total_rollouts_per_variant": 30,
+  "variants": {
+    "A. ensembling k=0.5 t=1": {
+      "successes": 11,
+      "rate": 0.36666666666666664,
+      "frames_mean": 97.43333333333334,
+      "k": 0.5,
+      "tries": 1
+    },
+    "B. ensembling k=0.6 t=1": {
+      "successes": 13,
+      "rate": 0.43333333333333335,
+      "frames_mean": 91.36666666666666,
+      "k": 0.6,
+      "tries": 1
+    },
+    "C. ensembling k=0.4 t=1": {
+      "successes": 10,
+      "rate": 0.3333333333333333,
+      "frames_mean": 87.8,
+      "k": 0.4,
+      "tries": 1
+    },
+    "E. ensembling k=0.5 t=3": {
+      "successes": 22,
+      "rate": 0.7333333333333333,
+      "frames_mean": 133.13333333333333,
+      "k": 0.5,
+      "tries": 3
+    },
+    "F. ensembling k=0.4 t=3": {
+      "successes": 23,
+      "rate": 0.7666666666666667,
+      "frames_mean": 129.03333333333333,
+      "k": 0.4,
+      "tries": 3
+    },
+    "G. ensembling k=0.6 t=2": {
+      "successes": 20,
+      "rate": 0.6666666666666666,
+      "frames_mean": 142.73333333333332,
+      "k": 0.6,
+      "tries": 2
+    }
+  }
+}
