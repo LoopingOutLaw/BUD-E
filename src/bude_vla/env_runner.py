@@ -79,14 +79,22 @@ def _attach_offset(model, data):
     return gripper_rot.T @ (cube_xyz - gripper_xyz)
 
 
-def _carry_cube_with(model, data, offset):
+def _carry_cube_with(model, data, offset, min_z: float = CUBE_REST_Z):
     if offset is None:
         return
     gripper_id = mujoco.mj_name2id(
         model, mujoco.mjtObj.mjOBJ_BODY, "gripper")
     gripper_xyz = data.xpos[gripper_id].copy()
     gripper_rot = data.xmat[gripper_id].reshape(3, 3).copy()
-    data.qpos[0:3] = gripper_xyz + gripper_rot @ offset
+    target = gripper_xyz + gripper_rot @ offset
+    # Visual fix: prevent the carried cube from sinking below the cube-rest
+    # height (table top + cube half-size). The gripper-cube distance gate
+    # can fire while the gripper is descending, which would otherwise
+    # drag the cube through the table once the carry helper starts
+    # snatching qpos. xy coupling is preserved exactly.
+    if target[2] < min_z:
+        target[2] = min_z
+    data.qpos[0:3] = target
 
 
 def _reset_arm_to_home(model, data):
