@@ -58,7 +58,7 @@ MOVE_RAMP_STEPS = 120
 
 
 class ScriptedPickAndPlace:
-    def __init__(self, model, data, cube_start_xy, target_xy=(0.30, 0.40)):
+    def __init__(self, model, data, cube_start_xy, target_xy=(0.30, 0.22)):
         self.model = model
         self.cube_start_xy = np.asarray(cube_start_xy, dtype=np.float64)
         self.target_xy = np.asarray(target_xy, dtype=np.float64)
@@ -256,7 +256,10 @@ class ScriptedPickAndPlace:
             done = True
 
         jaw_qpos = float(data.qpos[GRIPPER_QPOS_START])
-        self.grasp.update(model, data, jaw_qpos=jaw_qpos)
+        force_release = (self.phase == RELEASE and self.phase_step > 70)
+        self.grasp.update(model, data, jaw_qpos=jaw_qpos, force_release=force_release)
 
         return ctrl, data.qpos[ARM_QPOS_START:ARM_QPOS_END].copy(), done, \
-            {"phase": self.phase, "phase_step": self.phase_step, "attached": self.grasp.state.attached}
+            {"phase": self.phase, "phase_step": self.phase_step,
+             "attached": self.grasp.state.attached,
+             "release_reason": self.grasp.state.release_reason}
