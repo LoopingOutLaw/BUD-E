@@ -1,0 +1,10 @@
+Failed to import warp: No module named 'warp'
+Failed to import mujoco_warp: No module named 'warp'
+IK-target-z sweep, jaw CLOSED, gripperframe-target
+  tz=0.130 errmm=2.2 ee_z=0.1305 jaw_z=0.1952 jaw-ball=181.8mm ncon=1 jaw_ball=0
+  tz=0.090 errmm=1.7 ee_z=0.0911 jaw_z=0.1622 jaw-ball=147.6mm ncon=1 jaw_ball=0
+  tz=0.070 errmm=1.7 ee_z=0.0714 jaw_z=0.1449 jaw-ball=130.0mm ncon=1 jaw_ball=0
+  tz=0.060 errmm=1.7 ee_z=0.0616 jaw_z=0.1361 jaw-ball=121.0mm ncon=1 jaw_ball=0
+  tz=0.050 errmm=1.9 ee_z=0.0519 jaw_z=0.1273 jaw-ball=112.0mm ncon=1 jaw_ball=0
+  tz=0.042 errmm=2.1 ee_z=0.0441 jaw_z=0.1201 jaw-ball=104.7mm ncon=1 jaw_ball=0
+  tz=0.030 errmm=2.4 ee_z=0.0324 jaw_z=0.1092 jaw-ball=93.8mm ncon=3 jaw_ball=1

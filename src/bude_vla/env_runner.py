@@ -1,9 +1,8 @@
 """Policy-in-the-loop simulation runner with retry-on-failure.
 
 Core loop: render image -> policy.sample() -> kinematic arm override -> step sim.
-Cube attach/release mirrors ScriptedPickAndPlace._carry_cube_with (carry now
-purely kinematic; physics handles the actual contact once the gripper closes
-on the cube).
+Ball carry is now handled by GraspController (grasp.py) — no kinematic
+teleport. The _carry_cube_with stub is kept for compatibility but is a no-op.
 On failure, reset arm to home + cube to start position, retry up to max_tries.
 
 Exports
@@ -61,7 +60,9 @@ def _pick_token_ids() -> np.ndarray:
 
 
 def _ee_xyz(model, data) -> np.ndarray:
-    site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "ee_center")
+    # FIXED: was "ee_center" which does not exist in the MJCF; gripperframe
+    # is the actual end-effector site defined in so101_new_calib.xml
+    site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
     return data.site_xpos[site_id].copy()
 
 
@@ -77,8 +78,7 @@ def _target_xy(data) -> np.ndarray:
 
 
 def _carry_cube_with(model, data):
-    """No-op stub. Cube is carried by physics (condim=4 contact + gripper
-    SDF), not by forcibly setting qpos."""
+    """No-op: ball is carried by GraspController (grasp.py), not kinematic teleport."""
     return
 
 
