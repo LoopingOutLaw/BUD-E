@@ -17,9 +17,28 @@ qpos layout (MuJoCo joint order — arm-first DFS):
     qpos[6:13]  = cube freejoint (xyz + quat wxyz)
 
 Action order: 5 arm + 1 gripper = 6D continuous.
+
+COLLISION GROUPS
+----------------
+contype/conaffinity bitmasks used throughout this scene:
+    GROUP_DEFAULT (1) — robot, floor, table, pedestal (engine default,
+                         unspecified geoms get contype=conaffinity=1)
+    GROUP_BALL    (2) — the pick-and-place ball
+    GROUP_BOWL    (4) — both bowls (pick bowl + target bowl)
+
+The ball gets contype=conaffinity=GROUP_DEFAULT|GROUP_BALL (3), so it
+keeps colliding with the robot/floor/table as before. Both bowls get
+contype=GROUP_BOWL, conaffinity=GROUP_BALL — they collide with the ball
+ONLY, never the robot. This fixes two bugs in the previous version:
+  - the target bowl used contype=0/conaffinity=0 ("never collide with
+    anything"), which meant it was purely decorative and could not
+    physically catch/contain a dropped ball at all;
+  - the pick bowl used the engine default (collides with everything),
+    which meant it could physically obstruct the gripper reaching in.
 """
 from __future__ import annotations
 
+import math as _m
 import os
 from pathlib import Path
 from typing import Callable
@@ -33,6 +52,47 @@ from mujoco import mjx
 _ARM_SPEC_PATH = (
     Path(__file__).resolve().parents[3] / "urdf" / "so101_official" / "so101_new_calib.xml"
 )
+
+GROUP_DEFAULT = 1
+GROUP_BALL = 2
+GROUP_BOWL = 4
+
+BALL_CONTYPE = GROUP_DEFAULT | GROUP_BALL       # 3 — collides with robot/floor/table AND bowls
+BALL_CONAFFINITY = GROUP_DEFAULT | GROUP_BALL   # 3
+BOWL_CONTYPE = GROUP_BOWL                       # 4 — collides with...
+BOWL_CONAFFINITY = GROUP_BALL                   # ...the ball only, never the robot
+
+
+def _add_ring_wall(parent_body, radius: float, wall_height: float, z_center: float,
+                   n_segments: int, thickness: float, rgba, contype: int, conaffinity: int,
+                   name_prefix: str, overlap: float = 1.18) -> None:
+    """Build a circular wall out of `n_segments` thin boxes around `radius`.
+
+    `overlap` widens each segment's tangential extent past its even share
+    of the circumference (1.0 = exactly touching, no gaps; >1.0 = slight
+    overlap) so the wall reads as a smooth ring rather than a slatted
+    fence with visible gaps between segments. The previous bowls used 12
+    segments sized to barely cover ~70% of the circumference, leaving
+    ~3-4mm gaps — small enough that the 25mm ball couldn't squeeze
+    through, but visually choppy and an unnecessary source of debris
+    leak risk for anything smaller.
+    """
+    circumference = 2 * _m.pi * radius
+    seg_full_width = (circumference / n_segments) * overlap
+    half_width = seg_full_width / 2.0
+    for i in range(n_segments):
+        ang = 2 * _m.pi * i / n_segments
+        parent_body.add_geom(
+            name=f"{name_prefix}_{i}",
+            type=mujoco.mjtGeom.mjGEOM_BOX,
+            size=[thickness, half_width, wall_height / 2.0],
+            pos=[radius * _m.cos(ang), radius * _m.sin(ang), z_center],
+            euler=[0, 0, ang + _m.pi / 2],
+            rgba=rgba,
+            contype=contype,
+            conaffinity=conaffinity,
+            condim=3 if contype != 0 else 1,
+        )
 
 
 def _build_composite_spec() -> mujoco.MjSpec:
@@ -58,34 +118,34 @@ def _build_composite_spec() -> mujoco.MjSpec:
             rgba=[0.85, 0.78, 0.65, 1], condim=3,
         )
 
-        # Pick bowl: constrains ball laterally during grasp (condim=3 =
-        # friction contact, unlike target bowl's contype=0 visual-only).
-        # Inner dia ≈ 30mm, ball dia 25mm — can sit but can't escape sideways.
+        # Pick bowl: constrains ball laterally during grasp. Collides with
+        # the ball ONLY (GROUP_BOWL / GROUP_BALL) so it can't obstruct the
+        # gripper reaching in -- previously it used the engine default,
+        # which meant it physically collided with the robot too.
         pick_bowl = spec.worldbody.add_body(name="pick_bowl", pos=[0.30, 0.0, 0.016])
         pick_bowl.add_geom(
             name="pick_bowl_floor",
             type=mujoco.mjtGeom.mjGEOM_CYLINDER,
             size=[0.022, 0.001],
             rgba=[0.45, 0.45, 0.50, 1],
+            contype=BOWL_CONTYPE,
+            conaffinity=BOWL_CONAFFINITY,
             condim=3,
         )
-        import math as _m
-        for i in range(12):
-            ang = 2 * _m.pi * i / 12
-            pick_bowl.add_geom(
-                name=f"pick_bowl_rim_{i}",
-                type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=[0.0015, 0.0050, 0.008],
-                pos=[0.026 * _m.cos(ang), 0.026 * _m.sin(ang), 0.008],
-                euler=[0, 0, ang + _m.pi / 2],
-                rgba=[0.40, 0.40, 0.45, 1],
-                condim=3,
-            )
+        _add_ring_wall(
+            pick_bowl, radius=0.026, wall_height=0.016, z_center=0.008,
+            n_segments=20, thickness=0.0015, rgba=[0.40, 0.40, 0.45, 1],
+            contype=BOWL_CONTYPE, conaffinity=BOWL_CONAFFINITY,
+            name_prefix="pick_bowl_rim",
+        )
 
         # 25 mm-diameter ball (50 mm cube won't fit between the closed jaws).
         # Body remains named "cube" to avoid sweeping ik.py, recorder, and
         # recorded .npz schema; treat "cube" as the historical alias for the
         # pick payload.
+        # contype/conaffinity explicitly set (rather than relying on the
+        # engine default) so it's clear this is the one body that needs to
+        # collide with BOTH the robot/floor/table group AND the bowl group.
         ball = spec.worldbody.add_body(name="cube", pos=[0.30, 0.0, 0.030])
         ball.add_joint(name="cube_free", type=mujoco.mjtJoint.mjJNT_FREE)
         ball.add_geom(
@@ -97,6 +157,8 @@ def _build_composite_spec() -> mujoco.MjSpec:
             condim=4,
             solref=[0.02, 1.0],
             solimp=[0.9, 0.95, 0.001, 0.5, 2],
+            contype=BALL_CONTYPE,
+            conaffinity=BALL_CONAFFINITY,
         )
 
         tgt = spec.worldbody.add_body(name="target_zone", pos=[0.30, 0.40, 0.021])
@@ -111,28 +173,29 @@ def _build_composite_spec() -> mujoco.MjSpec:
             pos=[0, 0, 0.0005], contype=0, conaffinity=0,
         )
         # Bowl to keep the ball from rolling off after drop.
-        # 12 boxes around a solid inner disc — contype=0 / conaffinity=0
-        # so it never collides with the arm.
+        # FIXED: previously contype=0/conaffinity=0 ("never collide with
+        # anything"), which made this bowl purely decorative -- a dropped
+        # ball would roll straight through the "walls" with no physical
+        # containment at all. Now it uses the same bowl/ball-only group as
+        # the pick bowl: it collides with the ball, never the robot, so it
+        # actually catches and holds the dropped ball while staying out of
+        # the arm's way.
         bowl = spec.worldbody.add_body(name="bowl", pos=[0.30, 0.40, 0.016])
         bowl.add_geom(
             name="bowl_floor",
             type=mujoco.mjtGeom.mjGEOM_CYLINDER,
             size=[0.028, 0.001],
             rgba=[0.30, 0.30, 0.36, 1],
-            contype=0, conaffinity=0,
+            contype=BOWL_CONTYPE,
+            conaffinity=BOWL_CONAFFINITY,
+            condim=3,
         )
-        import math as _m
-        for i in range(12):
-            ang = 2 * _m.pi * i / 12
-            bowl.add_geom(
-                name=f"bowl_rim_{i}",
-                type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=[0.0015, 0.0050, 0.010],
-                pos=[0.033 * _m.cos(ang), 0.033 * _m.sin(ang), 0.010],
-                euler=[0, 0, ang + _m.pi / 2],
-                rgba=[0.25, 0.25, 0.30, 1],
-                contype=0, conaffinity=0,
-            )
+        _add_ring_wall(
+            bowl, radius=0.033, wall_height=0.020, z_center=0.010,
+            n_segments=20, thickness=0.0015, rgba=[0.25, 0.25, 0.30, 1],
+            contype=BOWL_CONTYPE, conaffinity=BOWL_CONAFFINITY,
+            name_prefix="bowl_rim",
+        )
 
         # xyaxes = [X_cam, Y_cam] in the *parent body* frame, computed as:
         #   fwd   = normalize(look_at - pos)
@@ -200,9 +263,22 @@ def _build_composite_spec() -> mujoco.MjSpec:
         ee_body.add_camera(
             name="wrist",
             pos=[0.0, -0.14, 0.11],
-            xyaxes=[0, 0.766, 0.643,  -1, 0, 0],  # body-Y as camera-right; rotate image 90° CCW so floor sits at bottom
+            xyaxes=[0, 0.766, 0.643,  -1, 0, 0],
             fovy=90,
         )
+
+        # Site on the moving-jaw body at the finger-tip contact surface.
+        jaw_body = next(
+            (b for b in spec.worldbody.find_all(mujoco.mjtObj.mjOBJ_BODY)
+             if b.name == "moving_jaw_so101_v1"), None,
+        )
+        if jaw_body is not None:
+            jaw_body.add_site(
+                name="jaw_contact",
+                pos=[-0.001, -0.025, 0.019],
+                size=0.005,
+                rgba=[1, 0.3, 0.3, 0.6],
+            )
 
         spec.worldbody.add_site(
             name="workspace_origin", pos=[0.30, 0.20, 0.04],

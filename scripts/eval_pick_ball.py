@@ -5,6 +5,20 @@ Usage:
     MUJOCO_GL=egl python scripts/eval_pick_ball.py \
         --ckpt checkpoints/pick_v4_ball/pick_v4_ball_final.pt \
         --num-episodes 20
+
+GRASP FIX (see src/bude_vla/grasp.py for full rationale):
+Grasp attach/carry/release used to be done with `attach_offset`/`carry_ball`
+helpers defined in this file, which captured the gripper-ball offset the
+instant gripper_ctrl crossed -0.1 -- regardless of whether the gripper was
+actually anywhere near the ball -- and replayed that exact (possibly large)
+offset every frame after. That's what produced a visible floating gap
+between the gripper and the ball in rollout videos. Both helpers are
+replaced by `bude_vla.grasp.GraspController`, which only attaches once the
+ball is geometrically enclosed by the jaw AND in real MuJoCo contact AND
+that holds for several consecutive steps, snapping flush (zero gap) at the
+moment of attach. The video overlay now also prints "GRASP" whenever the
+controller considers the ball genuinely held, so you can visually confirm
+the fix from the rendered output, not just trust the success metric.
 """
 from __future__ import annotations
 
@@ -22,6 +36,7 @@ from pathlib import Path
 
 from bude_vla.data.action_normalization import denormalize_actions
 from bude_vla.data.lerobot_v3 import _tokenize_instruction
+from bude_vla.grasp import GraspController
 from bude_vla.envs.so101_mjx import (
     ARM_QPOS_START, ARM_QPOS_END,
     GRIPPER_QPOS_START, GRIPPER_QPOS_END,
@@ -117,28 +132,6 @@ def is_failure(data, step) -> bool:
     return False
 
 
-def attach_offset(model, data) -> np.ndarray | None:
-    cube_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
-    ee_site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "ee_center")
-    ball_world = data.xpos[cube_body_id].copy()
-    ee_world = data.site_xpos[ee_site_id].copy()
-    diff = ball_world - ee_world
-    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "gripper")
-    rot = data.xmat[body_id].reshape(3, 3)
-    return rot.T @ diff
-
-
-def carry_ball(model, data, offset: np.ndarray):
-    cube_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
-    ee_site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "ee_center")
-    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "gripper")
-    rot = data.xmat[body_id].reshape(3, 3)
-    ee_world = data.site_xpos[ee_site_id].copy()
-    ball_world = ee_world + rot @ offset
-    data.qpos[CUBE_QPOS_START:CUBE_QPOS_START + 3] = ball_world
-    data.qvel[CUBE_QPOS_START:CUBE_QPOS_END] = 0.0
-
-
 def build_batch(image: np.ndarray, proprio: np.ndarray,
                 text_ids: np.ndarray, device: str) -> dict:
     img = torch.from_numpy(image.astype(np.float32)).permute(2, 0, 1) / 255.0
@@ -151,12 +144,16 @@ def build_batch(image: np.ndarray, proprio: np.ndarray,
     }
 
 
-def add_overlay(frame: np.ndarray, text: str, status: str = "") -> np.ndarray:
+def add_overlay(frame: np.ndarray, text: str, status: str = "",
+                grasped: bool = False) -> np.ndarray:
     out = frame.copy()
     if out.shape[-1] >= 3 and out.shape[-1] != 3:
         out = np.ascontiguousarray(out[..., :3])
     color = (0, 255, 0) if status == "SUCCESS" else (0, 0, 255) if status == "FAILED" else (255, 255, 255)
     cv2.putText(out, text, (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+    if grasped:
+        cv2.putText(out, "GRASP", (5, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (0, 220, 255), 1, cv2.LINE_AA)
     if status:
         cv2.putText(out, status, (5, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2, cv2.LINE_AA)
     return out
@@ -169,9 +166,12 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
     all_frames = []
     successes = []
     n_success = 0
+    n_grasped_at_all = 0
 
     front_top_cam = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "front_top")
     pov_cam = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "pov")
+
+    grasp_ctrl = GraspController(model)
 
     for ep in range(num_episodes):
         cx = float(rng.uniform(0.28, 0.32))
@@ -181,9 +181,9 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
         mujoco.mj_resetData(model, data)
         reset_arm(model, data)
         reset_ball(data, cx, cy)
+        grasp_ctrl.reset()
+        ever_grasped_this_ep = False
 
-        gripper_closed = False
-        _offset = None
         chunk = None
         cursor = 0
 
@@ -220,44 +220,51 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
             data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0.0
             data.ctrl[N_ARM_JOINTS] = gripper_ctrl
 
-            if gripper_ctrl < -0.1 and not gripper_closed:
-                _offset = attach_offset(model, data)
-                gripper_closed = True
-
-            if gripper_closed and _offset is not None:
-                carry_ball(model, data, _offset)
+            # Physically-gated grasp bookkeeping: attaches only on real
+            # enclosure + contact + debounce, carries flush, releases on
+            # real jaw reopening or excess drift. See grasp.py.
+            grasp_ctrl.update(model, data, jaw_qpos=float(data.qpos[GRIPPER_QPOS_START]))
+            if grasp_ctrl.state.attached:
+                ever_grasped_this_ep = True
 
             mujoco.mj_step(model, data)
 
-            frame = add_overlay(vid_frame, f"ep {ep} step {step}")
+            frame = add_overlay(vid_frame, f"ep {ep} step {step}",
+                               grasped=grasp_ctrl.state.attached)
             all_frames.append(frame)
 
             if is_success(data):
                 n_success += 1
                 successes.append(True)
                 for _ in range(30):
-                    if gripper_closed and _offset is not None:
-                        carry_ball(model, data, _offset)
+                    grasp_ctrl.update(model, data, jaw_qpos=float(data.qpos[GRIPPER_QPOS_START]))
                     mujoco.mj_step(model, data)
                     vid_renderer.update_scene(data, camera=pov_cam)
                     vf = np.asarray(vid_renderer.render()).copy()
-                    f = add_overlay(vf, f"ep {ep}", "SUCCESS")
+                    f = add_overlay(vf, f"ep {ep}", "SUCCESS",
+                                    grasped=grasp_ctrl.state.attached)
                     all_frames.append(f)
-                print(f"SUCCESS (step {step})")
+                print(f"SUCCESS (step {step})", end="  ")
                 break
 
             if is_failure(data, step):
                 successes.append(False)
                 f = add_overlay(vid_frame, f"ep {ep}", "FAILED")
                 all_frames.append(f)
-                print(f"FAILED (step {step})")
+                print(f"FAILED (step {step})", end="  ")
                 break
         else:
             successes.append(False)
-            print("FAILED (timeout)")
+            print("FAILED (timeout)", end="  ")
             f = add_overlay(vid_frame, f"ep {ep}", "FAILED")
             all_frames.append(f)
 
+        if ever_grasped_this_ep:
+            n_grasped_at_all += 1
+        print(f"[grasped_at_all={ever_grasped_this_ep}]")
+
+    print(f"\n  diagnostic: ball was physically grasped (real enclosure+contact) "
+          f"in {n_grasped_at_all}/{num_episodes} episodes")
     return n_success, num_episodes, all_frames
 
 

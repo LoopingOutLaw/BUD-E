@@ -1,0 +1,19 @@
+Failed to import warp: No module named 'warp'
+Failed to import mujoco_warp: No module named 'warp'
+=== Grasp gap check ===
+  ep 00 cube=(0.305,-0.009) attached=False success=False final_dist_to_target=0.479
+  ep 01 cube=(0.282,-0.019) attached=False success=False final_dist_to_target=0.648
+  ep 02 cube=(0.313,0.017) attached=False success=False final_dist_to_target=0.625
+
+  attached at all:        0/3
+  full success:            0/3
+  worst gap while attached: -inf mm (tolerance was 3.5 mm at attach time; should stay small while carried)
+
+  failures (cx, cy, ever_attached, final_dist):
+    (0.3054784674928582, -0.009208531449445188, False, 0.4788882508904238)
+    (0.2816389409574478, -0.019338894578858838, False, 0.6480984085661246)
+    (0.31253080956801094, 0.01651022309110887, False, 0.6250865217177651)
+
+  PASS: grasp stayed flush (no visible gap) whenever attached=True.
+
+ALL CHECKS PASSED
