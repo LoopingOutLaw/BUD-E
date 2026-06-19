@@ -12,7 +12,11 @@ from typing import List
 import mujoco
 import numpy as np
 
-from bude_vla.envs.so101_mjx import ARM_MODEL_PATH, ARM_QPOS_START, ARM_QPOS_END, CUBE_QPOS_END, GRIPPER_QPOS_START, GRIPPER_QPOS_END
+from bude_vla.envs.so101_mjx import (
+    ARM_QPOS_START, ARM_QPOS_END,
+    GRIPPER_QPOS_START, GRIPPER_QPOS_END,
+    CUBE_QPOS_START, CUBE_QPOS_END, load_arm_model,
+)
 from bude_vla.data.scripted_policies import scripted_push_step
 from bude_vla.data.lerobot_v3 import write_episode
 
@@ -25,11 +29,12 @@ INSTRUCTION_BY_TASK = {
 
 
 class CPURecorder:
-    """Record episodes using CPU-only MuJoCo (no JAX)."""
 
     def __init__(self, xml_path: str | Path | None = None):
-        path = Path(xml_path) if xml_path else ARM_MODEL_PATH
-        self.model = mujoco.MjModel.from_xml_string(path.read_text())
+        if xml_path is not None:
+            self.model = mujoco.MjModel.from_xml_path(str(xml_path))
+        else:
+            self.model = load_arm_model()
         self.data = mujoco.MjData(self.model)
         self.renderer = mujoco.Renderer(self.model, height=64, width=64)
         self.nu = self.model.nu
@@ -41,8 +46,8 @@ class CPURecorder:
         if qpos is not None:
             n = min(len(qpos), self.nq)
             self.data.qpos[:n] = qpos[:n]
-        self.data.qpos[0:3] = cube_xyz
-        self.data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+        self.data.qpos[CUBE_QPOS_START:CUBE_QPOS_START + 3] = cube_xyz
+        self.data.qpos[CUBE_QPOS_START + 3:CUBE_QPOS_START + 7] = [1.0, 0.0, 0.0, 0.0]
         mujoco.mj_forward(self.model, self.data)
 
     def _render(self) -> np.ndarray:
@@ -53,7 +58,7 @@ class CPURecorder:
                       seed: int = 0) -> dict:
         rng = np.random.default_rng(seed)
         home = np.zeros(self.nq, dtype=np.float64)
-        home[ARM_QPOS_START:ARM_QPOS_START + 6] = [0.0, -0.5, 0.5, 0.0, 0.0, 0.0]
+        home[ARM_QPOS_START:ARM_QPOS_END] = [0.0, -0.5, 0.95, -0.55, 0.0]
         self._reset(home)
 
         images: List[np.ndarray] = []
@@ -103,14 +108,15 @@ class CPURecorder:
         rng = np.random.default_rng(seed)
         cube_start_y = rng.uniform(-0.15, 0.15)
 
+        cube_x_init = 0.6
         qpos = np.zeros(self.nq, dtype=np.float64)
-        qpos[ARM_QPOS_START:ARM_QPOS_START + 6] = [0.0, -0.5, 0.5, 0.0, 0.0, 0.0]
-        qpos[2] = -0.5
-        qpos[CUBE_QPOS_END] = 0.6
-        qpos[CUBE_QPOS_END + 1] = cube_start_y
-        qpos[CUBE_QPOS_END + 2] = 0.445
-        qpos[CUBE_QPOS_END + 3:CUBE_QPOS_END + 7] = [1.0, 0.0, 0.0, 0.0]
-        self._reset(qpos, cube_xyz=(0.6, cube_start_y, 0.445))
+        qpos[ARM_QPOS_START:ARM_QPOS_END] = [0.0, -0.5, 0.95, -0.55, 0.0]
+        qpos[1] = -0.5
+        qpos[CUBE_QPOS_START] = cube_x_init
+        qpos[CUBE_QPOS_START + 1] = cube_start_y
+        qpos[CUBE_QPOS_START + 2] = 0.445
+        qpos[CUBE_QPOS_START + 3:CUBE_QPOS_START + 7] = [1.0, 0.0, 0.0, 0.0]
+        self._reset(qpos, cube_xyz=(cube_x_init, cube_start_y, 0.445))
 
         target_body_id = next(i for i in range(self.model.nbody)
                               if self.model.body(i).name == "target_zone")
