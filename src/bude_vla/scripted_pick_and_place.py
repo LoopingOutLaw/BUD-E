@@ -19,7 +19,7 @@ from __future__ import annotations
 import numpy as np
 import mujoco
 from bude_vla.ik import solve_ik_to_xyz_dls, _ik_core
-from bude_vla.grasp import GraspController
+from bude_vla.grasp import GraspController, JAW_CLOSED_QPOS_THRESHOLD, IK_SEED_JAW_QPOS
 from bude_vla.envs.so101_mjx import (
     ARM_QPOS_START, ARM_QPOS_END, GRIPPER_QPOS_START, CUBE_QPOS_START,
 )
@@ -109,21 +109,41 @@ class ScriptedPickAndPlace:
 
         elif self.phase == GRASP:
             live_ball_xy = ball[:2]
+            # Target ball CENTER (equator) rather than the static +BALL_RADIUS
+            # north-pole offset used previously -- newer grip pose aims at the
+            # equator so a half-closed jaw scoops around the ball's middle.
             jaw_target = np.array([
                 live_ball_xy[0],
                 live_ball_xy[1],
-                GROUND_Z + BALL_RADIUS,
+                GROUND_Z,
             ])
+            # Seed IK with the jaw already at the closed-pose value (0.30) so
+            # the arm is geometrically shaped for a NEAR-CLOSED jaw during
+            # the approach, preventing the 96deg arc from plowing sideways
+            # through the ball (see scripts/calibrate_grasp_v2.py).
+            # NOTE: deliberately NOT JAW_CLOSED_QPOS_THRESHOLD (1.40) — IK
+            # only needs the closed-shape geometry, while the attach
+            # detector gates on the enclosing window.
+            seed_qpos = data.qpos.copy()
+            seed_qpos[GRIPPER_QPOS_START] = IK_SEED_JAW_QPOS
             arm_target = _ik_core(
-                self.model, self.jaw_site_id, jaw_target, data.qpos.copy(),
+                self.model, self.jaw_site_id, jaw_target, seed_qpos,
                 step=0.5, damping=0.05, pos_tol=0.003, max_iters=150,
             ).astype(np.float64)
             cur = data.qpos[ARM_QPOS_START:ARM_QPOS_END].astype(np.float64).copy()
+            # Close the jaw concurrently with the GRASP arm-over-ball ramp so
+            # that by the time the jaw tip settles ~5mm from the ball surface,
+            # qpos is already in the enclosing window (~1.4 → 0.5). If we
+            # waited until after the ramp (the old behavior), the jaw would
+            # plow through the ball during arm travel and the ball would be
+            # 80mm away by the time ctrl handed the jaw a closing signal.
+            jaw_close_frac = min(1.0, self.phase_step / 50.0)
+            closing_jaw = JAW_OPEN - jaw_close_frac * (JAW_OPEN - JAW_CLOSED)
             if self.phase_step <= GRASP_RAMP_STEPS:
                 frac = min(1.0, self.phase_step / 50.0)
                 data.qpos[ARM_QPOS_START:ARM_QPOS_END] = self._interp_qpos(cur, arm_target, frac)
                 data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0
-                ctrl[GRIPPER_QPOS_START] = JAW_OPEN
+                ctrl[GRIPPER_QPOS_START] = closing_jaw
                 if self.phase_step == GRASP_RAMP_STEPS:
                     # Freeze the hold pose using THIS frame's IK solve, i.e.
                     # wherever the ball actually is right now.

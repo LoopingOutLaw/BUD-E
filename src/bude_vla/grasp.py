@@ -37,9 +37,17 @@ import numpy as np
 from bude_vla.envs.so101_mjx import CUBE_QPOS_START, CUBE_QPOS_END
 
 BALL_RADIUS = 0.0125
-ATTACH_GAP_TOLERANCE = 0.025
-ATTACH_DEBOUNCE_STEPS = 5
-JAW_CLOSED_QPOS_THRESHOLD = 0.30
+ATTACH_GAP_TOLERANCE = 0.005        # 5 mm — catches the near-contact window
+ATTACH_DEBOUNCE_STEPS = 3           # attach faster before the jaw pushes the ball away
+JAW_CLOSED_QPOS_THRESHOLD = 1.40    # attach detector: catches the enclosing window
+                                    #     ~1.4 → ~0.5; calibrated jaw qpos realistically
+                                    #     plateaus at ~0.475 against the 12.5mm ball
+IK_SEED_JAW_QPOS = 0.30             # seed used by GRASP-phase IK so the arm is shaped
+                                    #     for a CLOSED jaw while approaching (avoids the
+                                    #     96deg arc plowing the ball sideways). This is a
+                                    #     different role from JAW_CLOSED_QPOS_THRESHOLD —
+                                    #     the IK solver only cares about kinematic shape,
+                                    #     not enclosing detection.
 RELEASE_JAW_QPOS_THRESHOLD = 1.00
 RELEASE_DRIFT_TOLERANCE = 0.012
 
