@@ -16,20 +16,15 @@ At the moment of attach, the ball is snapped flush -- the stored offset
 corresponds to EXACTLY ball_radius from the jaw contact site, along
 whatever direction it was approached from.
 
-Release is symmetric: it happens when the jaw's real qpos opens back
-past `release_jaw_qpos_threshold` (1.45, well above the normal closed
-operating range), OR if the carried ball ever drifts further than
-`release_drift_tolerance` from where it was placed LAST update call.
-Comparing against the prior call's placement (not a fresh prediction
-from the current jaw pose) isolates "ball was knocked loose" from "the
-jaw moved this step" — the latter is expected and large during LIFT/MOVE.
-
-CAVEAT: This is still a kinematic carry while attached, not friction-only
-contact grasping. The SO-101's single-asymmetric-jaw geometry is not
-shaped to pinch-hold a free-rolling 25mm sphere by friction alone.
-What this module fixes is the VISIBLE bug: attaching at the wrong moment
-and preserving a gap. The attach is now gated by real proximity + real
-contact + debounce, and the carry point has zero residual gap.
+Release is **explicit**, not inferred: ScriptedPickAndPlace calls
+update() with `force_release=True` once it has entered the RELEASE phase
+and the jaw-open command has had time to act.  The jaw-angle and drift
+checks are demoted to catastrophe-only safety nets (8cm drift, jaw
+near-fully-open at 1.48) that should not fire in normal operation.
+The `release_reason` field in GraspState exposes which path actually
+triggered a release, so a debug trace can distinguish "script ran its
+intended RELEASE phase" from "jaw swung open too early" or "ball was
+physically knocked out of the jaw".
 """
 from __future__ import annotations
 
@@ -52,8 +47,8 @@ IK_SEED_JAW_QPOS = 0.30             # seed used by GRASP-phase IK so the arm is 
                                     #     different role from JAW_CLOSED_QPOS_THRESHOLD —
                                     #     the IK solver only cares about kinematic shape,
                                     #     not enclosing detection.
-RELEASE_JAW_QPOS_THRESHOLD = 1.45  # was 1.00 — collided with JAW_DEEMED_CLOSED (1.0)
-RELEASE_DRIFT_TOLERANCE = 0.015    # was 0.012 — see fixed comparison below
+RELEASE_JAW_QPOS_THRESHOLD = 1.48  # near-fully-open only; not the release path anymore
+RELEASE_DRIFT_TOLERANCE = 0.08     # 8cm -- catches a real physical disaster, not noise
 
 
 @dataclasses.dataclass
@@ -61,13 +56,15 @@ class GraspState:
     attached: bool = False
     offset_local: np.ndarray | None = None
     enclosure_streak: int = 0
-    last_world: np.ndarray | None = None  # ball position we teleported it to last call
+    last_world: np.ndarray | None = None
+    release_reason: str | None = None   # "forced" | "jaw_reopen" | "drift" | None
 
     def reset(self) -> None:
         self.attached = False
         self.offset_local = None
         self.enclosure_streak = 0
         self.last_world = None
+        self.release_reason = None
 
 
 class GraspController:
@@ -131,12 +128,19 @@ class GraspController:
         ball_xyz = data.xpos[self.cube_body_id]
         return float(np.linalg.norm(ball_xyz - jaw_xyz)) - self.ball_radius
 
-    def update(self, model: mujoco.MjModel, data: mujoco.MjData, jaw_qpos: float) -> GraspState:
+    def update(self, model: mujoco.MjModel, data: mujoco.MjData, jaw_qpos: float,
+               force_release: bool = False) -> GraspState:
         """Advance grasp bookkeeping by one step and carry the ball if held.
 
         Must be called AFTER this step's qpos/ctrl writes. Internally calls
         mj_forward first so that data.xpos/xmat/contact reflect whatever
         qpos the caller just wrote.
+
+        force_release: when True, releases the ball immediately regardless
+        of jaw angle or drift.  ScriptedPickAndPlace passes this during
+        the RELEASE phase (after the jaw-open command has been issued).
+        The jaw/drift checks are catastrophic-only fallbacks (8cm drift,
+        near-fully-open jaw) that should never fire during normal operation.
         """
         mujoco.mj_forward(model, data)
 
@@ -161,28 +165,30 @@ class GraspController:
                 state.offset_local = jaw_rot.T @ (flush_world - jaw_xyz)
                 state.attached = True
                 state.enclosure_streak = 0
-                state.last_world = flush_world.copy()   # seed the tracker
+                state.last_world = flush_world.copy()
+                state.release_reason = None
             return state
 
-        should_release = jaw_qpos >= self.release_jaw_qpos_threshold
-        if not should_release and state.last_world is not None:
-            # Compare against where we teleported the ball to LAST call, not a
-            # prediction built from this step's (just-moved) jaw pose.  This is
-            # what isolates "the ball was actually knocked off" from "the jaw
-            # moved this step" — the latter is expected and large during LIFT/MOVE.
+        release_reason = None
+        if force_release:
+            release_reason = "forced"
+        elif jaw_qpos >= self.release_jaw_qpos_threshold:
+            release_reason = "jaw_reopen"
+        elif state.last_world is not None:
             drift = float(np.linalg.norm(ball_xyz - state.last_world))
             if drift > self.release_drift_tolerance:
-                should_release = True
+                release_reason = "drift"
 
-        if should_release:
+        if release_reason is not None:
             state.attached = False
             state.offset_local = None
             state.enclosure_streak = 0
             state.last_world = None
+            state.release_reason = release_reason
             return state
 
         new_world = jaw_xyz + jaw_rot @ state.offset_local
         data.qpos[CUBE_QPOS_START:CUBE_QPOS_START + 3] = new_world
         data.qvel[CUBE_QPOS_START:CUBE_QPOS_END] = 0.0
-        state.last_world = new_world.copy()   # update the tracker for next call
+        state.last_world = new_world.copy()
         return state
