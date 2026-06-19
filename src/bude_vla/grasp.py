@@ -17,8 +17,12 @@ corresponds to EXACTLY ball_radius from the jaw contact site, along
 whatever direction it was approached from.
 
 Release is symmetric: it happens when the jaw's real qpos opens back
-past `release_jaw_qpos_threshold`, OR if the carried ball ever drifts
-further than `release_drift_tolerance` from where it should be.
+past `release_jaw_qpos_threshold` (1.45, well above the normal closed
+operating range), OR if the carried ball ever drifts further than
+`release_drift_tolerance` from where it was placed LAST update call.
+Comparing against the prior call's placement (not a fresh prediction
+from the current jaw pose) isolates "ball was knocked loose" from "the
+jaw moved this step" — the latter is expected and large during LIFT/MOVE.
 
 CAVEAT: This is still a kinematic carry while attached, not friction-only
 contact grasping. The SO-101's single-asymmetric-jaw geometry is not
@@ -48,8 +52,8 @@ IK_SEED_JAW_QPOS = 0.30             # seed used by GRASP-phase IK so the arm is 
                                     #     different role from JAW_CLOSED_QPOS_THRESHOLD —
                                     #     the IK solver only cares about kinematic shape,
                                     #     not enclosing detection.
-RELEASE_JAW_QPOS_THRESHOLD = 1.00
-RELEASE_DRIFT_TOLERANCE = 0.012
+RELEASE_JAW_QPOS_THRESHOLD = 1.45  # was 1.00 — collided with JAW_DEEMED_CLOSED (1.0)
+RELEASE_DRIFT_TOLERANCE = 0.015    # was 0.012 — see fixed comparison below
 
 
 @dataclasses.dataclass
@@ -57,11 +61,13 @@ class GraspState:
     attached: bool = False
     offset_local: np.ndarray | None = None
     enclosure_streak: int = 0
+    last_world: np.ndarray | None = None  # ball position we teleported it to last call
 
     def reset(self) -> None:
         self.attached = False
         self.offset_local = None
         self.enclosure_streak = 0
+        self.last_world = None
 
 
 class GraspController:
@@ -155,12 +161,16 @@ class GraspController:
                 state.offset_local = jaw_rot.T @ (flush_world - jaw_xyz)
                 state.attached = True
                 state.enclosure_streak = 0
+                state.last_world = flush_world.copy()   # seed the tracker
             return state
 
         should_release = jaw_qpos >= self.release_jaw_qpos_threshold
-        if not should_release:
-            predicted = jaw_xyz + jaw_rot @ state.offset_local
-            drift = float(np.linalg.norm(ball_xyz - predicted))
+        if not should_release and state.last_world is not None:
+            # Compare against where we teleported the ball to LAST call, not a
+            # prediction built from this step's (just-moved) jaw pose.  This is
+            # what isolates "the ball was actually knocked off" from "the jaw
+            # moved this step" — the latter is expected and large during LIFT/MOVE.
+            drift = float(np.linalg.norm(ball_xyz - state.last_world))
             if drift > self.release_drift_tolerance:
                 should_release = True
 
@@ -168,9 +178,11 @@ class GraspController:
             state.attached = False
             state.offset_local = None
             state.enclosure_streak = 0
+            state.last_world = None
             return state
 
         new_world = jaw_xyz + jaw_rot @ state.offset_local
         data.qpos[CUBE_QPOS_START:CUBE_QPOS_START + 3] = new_world
         data.qvel[CUBE_QPOS_START:CUBE_QPOS_END] = 0.0
+        state.last_world = new_world.copy()   # update the tracker for next call
         return state
