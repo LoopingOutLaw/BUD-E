@@ -1,6 +1,0 @@
-Failed to import warp: No module named 'warp'
-Failed to import mujoco_warp: No module named 'warp'
-loading ckpt=checkpoints/pick_v4_25k/pick_v4_25k_step_025000.pt
-ckpt step=25000 loss=0.0717
-Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
-Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 4362.58it/s]

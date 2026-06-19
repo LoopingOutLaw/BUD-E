@@ -1,24 +1,0 @@
-Failed to import warp: No module named 'warp'
-Failed to import mujoco_warp: No module named 'warp'
-loading checkpoints/pick_v4_25k/pick_v4_25k_final.pt
-Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
-Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 12462.52it/s]
-/home/aditya/bude_vla/src/bude_vla/models/action_head.py:80: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
-  self.temporal = nn.TransformerEncoder(
-ckpt step=25000 loss=0.0717
-protocol: ensembling=True k=0.4 t=3 max_steps=80
-  seed 0: 23/30 (76.7%) elapsed=30s eta=118s
-  seed 1: 19/30 (63.3%) elapsed=56s eta=84s
-  seed 2: 22/30 (73.3%) elapsed=77s eta=51s
-  seed 3: 25/30 (83.3%) elapsed=100s eta=25s
-  seed 4: 26/30 (86.7%) elapsed=118s eta=0s
-
-============================================================
-OVERALL: 115/150 = 76.7%
-wilson 95% CI: [69.3%, 82.7%]
-per-seed success: [23.0, 19.0, 22.0, 25.0, 26.0]
-per-seed mean=23.0/30 std=2.45
-trial count mean=56.20/90 min=54 max=59
-frames mean=151.8 max=480 min=11
-============================================================
-saved results/confirmation_FINAL_t3_k0.40_n150.json

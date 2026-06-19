@@ -1,9 +1,0 @@
-[Thu Jun 18 02:49:28 AM IST 2026] Found checkpoint: /home/aditya/bude_vla/checkpoints/pick_v4_25k/pick_v4_25k_step_000500.pt
-Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
-Failed to import warp: No module named 'warp'
-Failed to import mujoco_warp: No module named 'warp'
-Loading: checkpoints/pick_v4_25k/pick_v4_25k_step_000500.pt
-Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 5026.27it/s]
-/home/aditya/bude_vla/src/bude_vla/models/action_head.py:80: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
-  self.temporal = nn.TransformerEncoder(
----
