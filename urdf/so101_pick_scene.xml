@@ -75,7 +75,7 @@
 
     <!-- Push target zone: thin blue disc/box (MJX can't collide with cylinders).
          Solid saturated blue + a near-white inner ring so it pops visually. -->
-    <body name="target_zone" pos="0.30 0.40 0.021">
+    <body name="target_zone" pos="0.30 0.22 0.021">
       <geom name="target_zone_disc" type="box" size="0.06 0.06 0.002"
             rgba="0.1 0.3 0.95 1" contype="0" conaffinity="0"/>
       <geom name="target_zone_inner" type="box" size="0.025 0.025 0.003"
