@@ -1,0 +1,59 @@
+Failed to import warp: No module named 'warp'
+Failed to import mujoco_warp: No module named 'warp'
+=== Grasp gap check ===
+  ep 00 cube=(0.305,-0.009) attached=True success=False final_dist_to_target=0.404
+  ep 01 cube=(0.282,-0.019) attached=False success=False final_dist_to_target=1.056
+  ep 02 cube=(0.313,0.017) attached=True success=False final_dist_to_target=0.513
+  ep 03 cube=(0.304,0.009) attached=True success=False final_dist_to_target=0.506
+  ep 04 cube=(0.302,0.017) attached=True success=False final_dist_to_target=0.497
+  ep 05 cube=(0.313,-0.020) attached=False success=False final_dist_to_target=1.111
+  ep 06 cube=(0.314,-0.019) attached=False success=False final_dist_to_target=1.062
+  ep 07 cube=(0.309,-0.013) attached=True success=False final_dist_to_target=0.441
+  ep 08 cube=(0.315,0.002) attached=True success=False final_dist_to_target=0.464
+  ep 09 cube=(0.292,-0.003) attached=True success=False final_dist_to_target=0.400
+  ep 10 cube=(0.281,-0.015) attached=False success=False final_dist_to_target=0.935
+  ep 11 cube=(0.307,0.006) attached=True success=False final_dist_to_target=0.499
+  ep 12 cube=(0.305,-0.005) attached=True success=False final_dist_to_target=0.409
+  ep 13 cube=(0.320,0.019) attached=False success=False final_dist_to_target=0.851
+  ep 14 cube=(0.307,0.006) attached=True success=False final_dist_to_target=0.510
+  ep 15 cube=(0.308,-0.004) attached=True success=False final_dist_to_target=0.411
+  ep 16 cube=(0.285,0.009) attached=True success=False final_dist_to_target=0.432
+  ep 17 cube=(0.301,-0.008) attached=True success=False final_dist_to_target=0.410
+  ep 18 cube=(0.299,0.016) attached=True success=False final_dist_to_target=0.485
+  ep 19 cube=(0.317,-0.006) attached=True success=False final_dist_to_target=0.417
+
+  attached at all:        15/20
+  full success:            0/20
+  worst gap while attached: 3.76 mm (tolerance was 3.5 mm at attach time; should stay small while carried)
+
+  failures (cx, cy, ever_attached, final_dist):
+    (0.3054784674928582, -0.009208531449445188, True, 0.4038206256878319)
+    (0.2816389409574478, -0.019338894578858838, False, 1.0563271408828019)
+    (0.31253080956801094, 0.01651022309110887, True, 0.5134024525228488)
+    (0.3042654310306872, 0.009179862439359938, True, 0.5058374824108497)
+    (0.30174499965861695, 0.01740289695151073, True, 0.4971296613964922)
+    (0.3126341421648613, -0.01989045999319408, False, 1.1108094082341593)
+    (0.31429617106350277, -0.018656576987781427, False, 1.0617194691633547)
+    (0.3091862178571978, -0.01297377517589764, True, 0.44093615334397845)
+    (0.31452715689399546, 0.001658448809963669, True, 0.4635426731006313)
+    (0.29198847562149544, -0.0030925111520936632, True, 0.40046192421056476)
+    (0.28113278684581855, -0.015028668940017443, False, 0.9351893015630318)
+    (0.3068249765877452, 0.0058875804629700025, True, 0.49858053337032365)
+    (0.30461540445925017, -0.004652897829524662, True, 0.4092768438381479)
+    (0.31988839743156844, 0.0192334135510492, False, 0.8508016860442803)
+    (0.3074216793792278, 0.006018371050712651, True, 0.509974825043061)
+    (0.3075378692228376, -0.004443143040835849, True, 0.41068289214205805)
+    (0.2854038602008965, 0.00885953360776327, True, 0.43157384013612865)
+    (0.30101417289902904, -0.007590324977641774, True, 0.40977622423893506)
+    (0.2994334143532716, 0.015579513373960008, True, 0.48464914755765054)
+    (0.31736174063825, -0.005688192131637191, True, 0.4165828194986068)
+
+  PASS: grasp stayed flush (no visible gap) whenever attached=True.
+
+=== Bowl containment check ===
+  pick_bowl: dropped at (0.30,0.00), settled 0.0mm away, rim_radius=26mm, contained=True
+  target_bowl: dropped at (0.30,0.40), settled 0.0mm away, rim_radius=33mm, contained=True
+
+  PASS: both bowls physically contain the ball.
+
+ALL CHECKS PASSED
