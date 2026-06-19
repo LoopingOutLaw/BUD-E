@@ -31,6 +31,9 @@ LIFT = 2
 MOVE = 3
 RELEASE = 4
 
+WRIST_FLEX_LOCK = np.pi / 2
+WRIST_ROLL_LOCK = 0.0
+
 GROUND_Z = 0.0295
 BALL_RADIUS = 0.0125
 HOVER_ABOVE_BALL = 0.10
@@ -39,8 +42,19 @@ DROP_EE_Z = 0.07
 JAW_OPEN = 1.5
 JAW_CLOSED = -0.175
 
-GRASP_RAMP_STEPS = 60
-GRASP_TIMEOUT_STEPS = 170
+GRASP_DESCEND_STEPS = 60
+# Slow enough that the moving finger sweeps past the ball faster than the ball
+# can roll out of the cup under lateral pressure (empirically, ~60 was too fast).
+GRASP_GRIP_STEPS = 120
+GRASP_HOLD_STEPS = 50
+GRASP_TIMEOUT_STEPS = 350
+# Past this jaw position the actuator is mechanically seated on whatever the
+# moving finger is pressing against. Empirical: with the ball in cup, jaw
+# ctrl=-0.175 drives qpos down to ~1.0 (not 0) within ~30 substeps, then
+# plateaus because the cup stops the finger.
+JAW_DEEMED_CLOSED = 1.0
+LIFT_RAMP_STEPS = 80
+MOVE_RAMP_STEPS = 120
 
 
 class ScriptedPickAndPlace:
@@ -95,9 +109,13 @@ class ScriptedPickAndPlace:
                 GROUND_Z + HOVER_ABOVE_BALL,
             ])
             arm_target = self._ik_target(data, target)
+            arm_target[3] = WRIST_FLEX_LOCK
+            arm_target[4] = WRIST_ROLL_LOCK
             cur = data.qpos[ARM_QPOS_START:ARM_QPOS_END].astype(np.float64).copy()
             frac = min(1.0, self.phase_step / 50.0)
             tgt = self._interp_qpos(cur, arm_target.astype(np.float64), frac)
+            tgt[3] = WRIST_FLEX_LOCK
+            tgt[4] = WRIST_ROLL_LOCK
             data.qpos[ARM_QPOS_START:ARM_QPOS_END] = tgt
             data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0
             ctrl[GRIPPER_QPOS_START] = JAW_OPEN
@@ -109,57 +127,59 @@ class ScriptedPickAndPlace:
 
         elif self.phase == GRASP:
             live_ball_xy = ball[:2]
-            # Target ball CENTER (equator) rather than the static +BALL_RADIUS
-            # north-pole offset used previously -- newer grip pose aims at the
-            # equator so a half-closed jaw scoops around the ball's middle.
+            # Land the jaw tip 12mm above the ball top. Closer than 12mm pushes
+            # the gripper body near the bowl rim (adds stray `cube` contacts);
+            # further than 12mm leaves the finger too high for the 5mm attach
+            # gap tolerance, so closure never even gates ATTACHED.
             jaw_target = np.array([
                 live_ball_xy[0],
                 live_ball_xy[1],
-                GROUND_Z,
+                GROUND_Z + BALL_RADIUS + 0.012,
             ])
-            # Seed IK with the jaw already at the closed-pose value (0.30) so
-            # the arm is geometrically shaped for a NEAR-CLOSED jaw during
-            # the approach, preventing the 96deg arc from plowing sideways
-            # through the ball (see scripts/calibrate_grasp_v2.py).
-            # NOTE: deliberately NOT JAW_CLOSED_QPOS_THRESHOLD (1.40) — IK
-            # only needs the closed-shape geometry, while the attach
-            # detector gates on the enclosing window.
             seed_qpos = data.qpos.copy()
             seed_qpos[GRIPPER_QPOS_START] = IK_SEED_JAW_QPOS
             arm_target = _ik_core(
                 self.model, self.jaw_site_id, jaw_target, seed_qpos,
                 step=0.5, damping=0.05, pos_tol=0.003, max_iters=150,
             ).astype(np.float64)
+            arm_target[3] = WRIST_FLEX_LOCK
+            arm_target[4] = WRIST_ROLL_LOCK
+
             cur = data.qpos[ARM_QPOS_START:ARM_QPOS_END].astype(np.float64).copy()
-            # Close the jaw concurrently with the GRASP arm-over-ball ramp so
-            # that by the time the jaw tip settles ~5mm from the ball surface,
-            # qpos is already in the enclosing window (~1.4 → 0.5). If we
-            # waited until after the ramp (the old behavior), the jaw would
-            # plow through the ball during arm travel and the ball would be
-            # 80mm away by the time ctrl handed the jaw a closing signal.
-            jaw_close_frac = min(1.0, self.phase_step / 50.0)
-            closing_jaw = JAW_OPEN - jaw_close_frac * (JAW_OPEN - JAW_CLOSED)
-            if self.phase_step <= GRASP_RAMP_STEPS:
-                frac = min(1.0, self.phase_step / 50.0)
-                data.qpos[ARM_QPOS_START:ARM_QPOS_END] = self._interp_qpos(cur, arm_target, frac)
+
+            if self.phase_step <= GRASP_DESCEND_STEPS:
+                # DESCEND: arm ramps down to grasp pose, jaw stays FULLY OPEN.
+                # Closing the jaw here was causing the moving finger to sweep
+                # the ball out of the cup before the arm arrived at the pose.
+                frac = min(1.0, self.phase_step / GRASP_DESCEND_STEPS)
+                next_arm = self._interp_qpos(cur, arm_target, frac)
+                next_arm[3] = WRIST_FLEX_LOCK
+                next_arm[4] = WRIST_ROLL_LOCK
+                data.qpos[ARM_QPOS_START:ARM_QPOS_END] = next_arm
                 data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0
-                ctrl[GRIPPER_QPOS_START] = closing_jaw
-                if self.phase_step == GRASP_RAMP_STEPS:
-                    # Freeze the hold pose using THIS frame's IK solve, i.e.
-                    # wherever the ball actually is right now.
-                    self._grasp_arm_q = data.qpos[ARM_QPOS_START:ARM_QPOS_END].copy()
-            else:
+                ctrl[GRIPPER_QPOS_START] = JAW_OPEN
+                if self.phase_step == GRASP_DESCEND_STEPS:
+                    self._grasp_arm_q = arm_target.copy()
+            elif self.phase_step <= GRASP_DESCEND_STEPS + GRASP_GRIP_STEPS:
+                # GRIP: arm pinned at the descended pose, jaw drives closed.
                 data.qpos[ARM_QPOS_START:ARM_QPOS_END] = self._grasp_arm_q
                 data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0
-                close_step = self.phase_step - GRASP_RAMP_STEPS
-                jaw = JAW_OPEN - (close_step / 60.0) * (JAW_OPEN - JAW_CLOSED)
-                jaw = max(jaw, JAW_CLOSED)
-                ctrl[GRIPPER_QPOS_START] = jaw
+                grip_step = self.phase_step - GRASP_DESCEND_STEPS
+                frac = min(1.0, grip_step / float(GRASP_GRIP_STEPS))
+                ctrl[GRIPPER_QPOS_START] = JAW_OPEN - frac * (JAW_OPEN - JAW_CLOSED)
+            else:
+                # HOLD: arm + jaw fully commanded, wait for actuator to seat +
+                # GraspController's enclosure/contact gates to fire.
+                data.qpos[ARM_QPOS_START:ARM_QPOS_END] = self._grasp_arm_q
+                data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0
+                ctrl[GRIPPER_QPOS_START] = JAW_CLOSED
 
             jaw_qpos = float(data.qpos[GRIPPER_QPOS_START])
             self.grasp.update(model, data, jaw_qpos=jaw_qpos)
 
-            if self.grasp.state.attached:
+            hold_complete = self.phase_step >= GRASP_DESCEND_STEPS + GRASP_GRIP_STEPS + GRASP_HOLD_STEPS
+            jaw_closed_enough = jaw_qpos <= JAW_DEEMED_CLOSED
+            if self.grasp.state.attached and jaw_closed_enough and hold_complete:
                 self._grasp_succeeded = True
                 self.phase = LIFT
                 self.phase_step = 0
@@ -173,20 +193,26 @@ class ScriptedPickAndPlace:
                 {"phase": self.phase, "phase_step": self.phase_step, "attached": self.grasp.state.attached}
 
         elif self.phase == LIFT:
+            # Aim straight up from the CURRENT end-effector position so the
+            # arm travels vertically above the carried ball instead of
+            # swinging sideways back toward the original cube_start_xy.
+            current_ee = data.site_xpos[self.site_id].copy()
             target = np.array([
-                self.cube_start_xy[0],
-                self.cube_start_xy[1],
+                current_ee[0],
+                current_ee[1],
                 GROUND_Z + LIFT_ABOVE_TARGET,
             ])
             arm_target = self._ik_target(data, target).astype(np.float64)
+            arm_target[3] = WRIST_FLEX_LOCK
+            arm_target[4] = WRIST_ROLL_LOCK
             cur = data.qpos[ARM_QPOS_START:ARM_QPOS_END].astype(np.float64).copy()
             if self.phase_step == 1:
                 self._lift_arm_q = arm_target
-            frac = min(1.0, self.phase_step / 50.0)
+            frac = min(1.0, self.phase_step / float(LIFT_RAMP_STEPS))
             data.qpos[ARM_QPOS_START:ARM_QPOS_END] = self._interp_qpos(cur, arm_target, frac)
             data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0
             ctrl[GRIPPER_QPOS_START] = JAW_CLOSED
-            if self.phase_step > 60:
+            if self.phase_step > LIFT_RAMP_STEPS + 20:
                 self.phase = MOVE
                 self.phase_step = 0
 
@@ -197,12 +223,14 @@ class ScriptedPickAndPlace:
                 GROUND_Z + LIFT_ABOVE_TARGET,
             ])
             arm_target = self._ik_target(data, target).astype(np.float64)
+            arm_target[3] = WRIST_FLEX_LOCK
+            arm_target[4] = WRIST_ROLL_LOCK
             cur = data.qpos[ARM_QPOS_START:ARM_QPOS_END].astype(np.float64).copy()
-            frac = min(1.0, self.phase_step / 80.0)
+            frac = min(1.0, self.phase_step / float(MOVE_RAMP_STEPS))
             data.qpos[ARM_QPOS_START:ARM_QPOS_END] = self._interp_qpos(cur, arm_target, frac)
             data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0
             ctrl[GRIPPER_QPOS_START] = JAW_CLOSED
-            if self.phase_step > 90:
+            if self.phase_step > MOVE_RAMP_STEPS + 20:
                 self.phase = RELEASE
                 self.phase_step = 0
 
