@@ -1,77 +1,49 @@
-"""Scripted pick-and-place policy: approach -> descend -> grip -> lift -> move -> release.
+"""Scripted pick-and-place: approach -> descend -> close jaw -> carry -> move -> release.
 
-Uses kinematic arm control (direct qpos override from IK) and inverse-dynamics
-finger action. Cube is carried in scripted state: once GRIP phase closes the
-gripper and the EE is on the cube, the cube's qpos is set every step to match
-the gripper's pose (relative offset captured at grip moment). On RELEASE the
-cube goes free-fall again.
+Kinematic arm control (qpos override via IK) + dynamic jaw control + ball
+teleport during carry. The ball starts inside a constrained pick bowl so
+the gripper descent cannot push it out laterally. Once the jaw closes
+around the ball, its world-frame position is computed in gripper-local
+coordinates and maintained each step during LIFT/MOVE/RELEASE phases.
 """
 from __future__ import annotations
 import numpy as np
 import mujoco
 from bude_vla.ik import solve_ik_to_xyz_dls
+from bude_vla.envs.so101_mjx import (
+    ARM_QPOS_START, ARM_QPOS_END, GRIPPER_QPOS_START, CUBE_QPOS_START,
+)
+
 
 APPROACH = 0
-DESCEND = 1
-GRIP = 2
-LIFT = 3
-MOVE = 4
-RELEASE = 5
-TABLE_Z = 0.42
-CUBE_HALF = 0.025
+GRASP = 1
+LIFT = 2
+MOVE = 3
+RELEASE = 4
 
-
-def _mat_to_quat(mat_flat: np.ndarray) -> np.ndarray:
-    """Convert 9-flat rotation matrix (xmat) into a (w, x, y, z) quaternion."""
-    m = mat_flat.reshape(3, 3)
-    trace = m[0, 0] + m[1, 1] + m[2, 2]
-    if trace > 0.0:
-        s = 0.5 / np.sqrt(trace + 1.0)
-        w = 0.25 / s
-        x = (m[2, 1] - m[1, 2]) * s
-        y = (m[0, 2] - m[2, 0]) * s
-        z = (m[1, 0] - m[0, 1]) * s
-    else:
-        if m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
-            s = 2.0 * np.sqrt(max(1e-12, 1.0 + m[0, 0] - m[1, 1] - m[2, 2]))
-            w = (m[2, 1] - m[1, 2]) / s
-            x = 0.25 * s
-            y = (m[0, 1] + m[1, 0]) / s
-            z = (m[0, 2] + m[2, 0]) / s
-        elif m[1, 1] > m[2, 2]:
-            s = 2.0 * np.sqrt(max(1e-12, 1.0 + m[1, 1] - m[0, 0] - m[2, 2]))
-            w = (m[0, 2] - m[2, 0]) / s
-            x = (m[0, 1] + m[1, 0]) / s
-            y = 0.25 * s
-            z = (m[1, 2] + m[2, 1]) / s
-        else:
-            s = 2.0 * np.sqrt(max(1e-12, 1.0 + m[2, 2] - m[0, 0] - m[1, 1]))
-            w = (m[1, 0] - m[0, 1]) / s
-            x = (m[0, 2] + m[2, 0]) / s
-            y = (m[1, 2] + m[2, 1]) / s
-            z = 0.25 * s
-    q = np.array([w, x, y, z], dtype=np.float64)
-    n = np.linalg.norm(q)
-    if n > 0:
-        q = q / n
-    return q
+GROUND_Z = 0.0295
+BALL_RADIUS = 0.0125
+HOVER_ABOVE_BALL = 0.10
+GRASP_EE_Z_OFFSET = 0.000
+LIFT_ABOVE_TARGET = 0.18
+DROP_EE_Z = 0.07
+JAW_OPEN = 1.5
+JAW_CLOSED = -0.175
 
 
 class ScriptedPickAndPlace:
-    def __init__(self, model, data, cube_start_xy, target_xy=(0.85, 0.0)):
+    def __init__(self, model, data, cube_start_xy, target_xy=(0.30, 0.40)):
         self.model = model
         self.cube_start_xy = np.asarray(cube_start_xy, dtype=np.float64)
         self.target_xy = np.asarray(target_xy, dtype=np.float64)
         self.phase = APPROACH
         self.phase_step = 0
-        self.site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "ee_center")
+        self.site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
         self.gripper_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "gripper")
         self.cube_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
-        self.cube_joint_adr = 0
-        self._max_steps = 350
+        self._max_steps = 600
         self._total_steps = 0
         self._cube_attached_offset = None
-        self._target_release_xy = np.asarray(target_xy, dtype=np.float64)
 
     def _ee_xyz(self, data):
         return data.site_xpos[self.site_id].copy()
@@ -85,115 +57,137 @@ class ScriptedPickAndPlace:
             step=0.5, damping=0.05, pos_tol=0.005, max_iters=25,
         )
 
-    def _ctrl_from_target(self, data, target_qpos):
-        ctrl = np.zeros(7, dtype=np.float32)
-        for i in range(6):
-            err = target_qpos[i] - data.qpos[7 + i]
-            ctrl[i] = np.clip(err * 15.0, -1.0, 1.0)
-        return ctrl
+    def _interp_qpos(self, src, dst, frac):
+        return src + (dst - src) * frac
 
-    def _attach_cube_to_gripper(self, data):
-        """Capture cube center in gripper body's local frame so we can carry it."""
-        gripper_xyz = data.xpos[self.gripper_body_id].copy()
-        gripper_rot = data.xmat[self.gripper_body_id].reshape(3, 3).copy()
-        cube_xyz = self._cube_xyz(data)
-        local_xyz = gripper_rot.T @ (cube_xyz - gripper_xyz)
-        self._cube_attached_offset = local_xyz
-
-    def _carry_cube_with(self, data):
+    def _carry_ball(self, data):
         if self._cube_attached_offset is None:
             return
         gripper_xyz = data.xpos[self.gripper_body_id].copy()
         gripper_rot = data.xmat[self.gripper_body_id].reshape(3, 3).copy()
-        new_cube_xyz = gripper_xyz + gripper_rot @ self._cube_attached_offset
-        data.qpos[0:3] = new_cube_xyz
+        new_cube_world = gripper_xyz + gripper_rot @ self._cube_attached_offset
+        data.qpos[CUBE_QPOS_START:CUBE_QPOS_START + 3] = new_cube_world
+        data.qvel[CUBE_QPOS_START:CUBE_QPOS_START + 6] = 0
 
-        ee_quat = _mat_to_quat(data.xmat[self.gripper_body_id].copy())
-        data.qpos[3:7] = ee_quat
+    def _attach_offset(self, data):
+        gripper_xyz = data.xpos[self.gripper_body_id].copy()
+        gripper_rot = data.xmat[self.gripper_body_id].reshape(3, 3).copy()
+        cube_xyz = self._cube_xyz(data)
+        self._cube_attached_offset = gripper_rot.T @ (cube_xyz - gripper_xyz)
 
     def step(self, model, data):
         self._total_steps += 1
         self.phase_step += 1
-        ctrl = np.zeros(7, dtype=np.float32)
-        arm_target = data.qpos[7:13].copy()
+        ctrl = np.zeros(model.nu, dtype=np.float32)
         done = False
-        cube = self._cube_xyz(data)
-        ee = self._ee_xyz(data)
+
+        ball = self._cube_xyz(data)
 
         if self.phase == APPROACH:
-            goal = np.array([
+            target = np.array([
                 self.cube_start_xy[0],
                 self.cube_start_xy[1],
-                TABLE_Z + CUBE_HALF + 0.15,
+                GROUND_Z + HOVER_ABOVE_BALL,
             ])
-            arm_target = self._ik_target(data, goal)
-            ctrl = self._ctrl_from_target(data, arm_target)
-            dist = np.linalg.norm(ee - goal)
-            if dist < 0.04 or self.phase_step > 60:
-                self.phase = DESCEND
-                self.phase_step = 0
+            arm_target = self._ik_target(data, target)
+            cur = data.qpos[ARM_QPOS_START:ARM_QPOS_END].astype(np.float64).copy()
+            frac = min(1.0, self.phase_step / 50.0)
+            tgt = self._interp_qpos(cur, arm_target.astype(np.float64), frac)
+            data.qpos[ARM_QPOS_START:ARM_QPOS_END] = tgt
+            data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0
+            ctrl[GRIPPER_QPOS_START] = JAW_OPEN
+            if self.phase_step > 80 or self.phase_step > 0 and self.phase_step % 1 == 0 and self.phase_step >= 50:
+                ball_drift = np.linalg.norm(ball[:2] - self.cube_start_xy)
+                if ball_drift < 0.02:
+                    self.phase = GRASP
+                    self.phase_step = 0
+                elif self.phase_step > 90:
+                    self.phase = GRASP
+                    self.phase_step = 0
 
-        elif self.phase == DESCEND:
-            goal = np.array([
+        elif self.phase == GRASP:
+            target = np.array([
                 self.cube_start_xy[0],
                 self.cube_start_xy[1],
-                TABLE_Z + CUBE_HALF + 0.06,
+                GROUND_Z + BALL_RADIUS + 0.020,
             ])
-            arm_target = self._ik_target(data, goal)
-            ctrl = self._ctrl_from_target(data, arm_target)
-            dist = np.linalg.norm(ee - goal)
-            if dist < 0.04 or self.phase_step > 50:
-                self.phase = GRIP
-                self.phase_step = 0
-
-        elif self.phase == GRIP:
-            goal = np.array([cube[0], cube[1], cube[2] + 0.03])
-            arm_target = self._ik_target(data, goal)
-            ctrl = self._ctrl_from_target(data, arm_target)
-            ctrl[6] = 1.0
-            ee_to_cube = float(np.linalg.norm(ee - cube))
-            if (self._cube_attached_offset is None
-                    and self.phase_step >= 5
-                    and ee_to_cube < 0.04):
-                self._attach_cube_to_gripper(data)
-            if self.phase_step > 20:
+            arm_target = self._ik_target(data, target).astype(np.float64)
+            if self.phase_step == 1:
+                self._grasp_arm_q = arm_target
+            cur = data.qpos[ARM_QPOS_START:ARM_QPOS_END].astype(np.float64).copy()
+            if self.phase_step < 60:
+                frac = min(1.0, self.phase_step / 50.0)
+                data.qpos[ARM_QPOS_START:ARM_QPOS_END] = self._interp_qpos(cur, arm_target, frac)
+                data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0
+                ctrl[GRIPPER_QPOS_START] = JAW_OPEN
+            else:
+                data.qpos[ARM_QPOS_START:ARM_QPOS_END] = self._grasp_arm_q
+                data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0
+                jaw = JAW_OPEN - ((self.phase_step - 60) / 60.0) * (JAW_OPEN - JAW_CLOSED)
+                jaw = max(jaw, JAW_CLOSED)
+                ctrl[GRIPPER_QPOS_START] = jaw
+                if self.phase_step == 100:
+                    self._attach_offset(data)
+            if self.phase_step > 130:
                 self.phase = LIFT
                 self.phase_step = 0
 
         elif self.phase == LIFT:
-            goal = np.array([cube[0], cube[1], TABLE_Z + 0.25])
-            arm_target = self._ik_target(data, goal)
-            ctrl = self._ctrl_from_target(data, arm_target)
-            ctrl[6] = 1.0
-            dist = np.linalg.norm(ee - goal)
-            if dist < 0.05 or self.phase_step > 50:
+            target = np.array([
+                self.cube_start_xy[0],
+                self.cube_start_xy[1],
+                GROUND_Z + LIFT_ABOVE_TARGET,
+            ])
+            arm_target = self._ik_target(data, target).astype(np.float64)
+            cur = data.qpos[ARM_QPOS_START:ARM_QPOS_END].astype(np.float64).copy()
+            if self.phase_step == 1:
+                self._lift_arm_q = arm_target
+            frac = min(1.0, self.phase_step / 50.0)
+            data.qpos[ARM_QPOS_START:ARM_QPOS_END] = self._interp_qpos(cur, arm_target, frac)
+            data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0
+            ctrl[GRIPPER_QPOS_START] = JAW_CLOSED
+            self._carry_ball(data)
+            if self.phase_step > 60:
                 self.phase = MOVE
                 self.phase_step = 0
 
         elif self.phase == MOVE:
-            goal = np.array([self.target_xy[0], self.target_xy[1], TABLE_Z + 0.25])
-            arm_target = self._ik_target(data, goal)
-            ctrl = self._ctrl_from_target(data, arm_target)
-            ctrl[6] = 1.0
-            dist = np.linalg.norm(ee - goal)
-            if dist < 0.05 or self.phase_step > 60:
+            target = np.array([
+                self.target_xy[0],
+                self.target_xy[1],
+                GROUND_Z + LIFT_ABOVE_TARGET,
+            ])
+            arm_target = self._ik_target(data, target).astype(np.float64)
+            cur = data.qpos[ARM_QPOS_START:ARM_QPOS_END].astype(np.float64).copy()
+            frac = min(1.0, self.phase_step / 80.0)
+            data.qpos[ARM_QPOS_START:ARM_QPOS_END] = self._interp_qpos(cur, arm_target, frac)
+            data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0
+            ctrl[GRIPPER_QPOS_START] = JAW_CLOSED
+            self._carry_ball(data)
+            if self.phase_step > 90:
                 self.phase = RELEASE
                 self.phase_step = 0
 
         elif self.phase == RELEASE:
-            goal = np.array([
-                self.target_xy[0], self.target_xy[1],
-                TABLE_Z + CUBE_HALF + 0.04,
+            target = np.array([
+                self.target_xy[0],
+                self.target_xy[1],
+                DROP_EE_Z,
             ])
-            arm_target = self._ik_target(data, goal)
-            ctrl = self._ctrl_from_target(data, arm_target)
-            ctrl[6] = -1.0
-            if self.phase_step >= 5:
+            arm_target = self._ik_target(data, target).astype(np.float64)
+            cur = data.qpos[ARM_QPOS_START:ARM_QPOS_END].astype(np.float64).copy()
+            frac = min(1.0, self.phase_step / 60.0)
+            data.qpos[ARM_QPOS_START:ARM_QPOS_END] = self._interp_qpos(cur, arm_target, frac)
+            data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0
+            ctrl[GRIPPER_QPOS_START] = JAW_CLOSED
+            self._carry_ball(data)
+            if self.phase_step > 70:
                 self._cube_attached_offset = None
-            if self.phase_step > 20:
+                ctrl[GRIPPER_QPOS_START] = JAW_OPEN
+            if self.phase_step > 110:
                 done = True
 
         if self._total_steps >= self._max_steps:
             done = True
 
-        return ctrl, arm_target, done, {"phase": self.phase, "phase_step": self.phase_step}
+        return ctrl, data.qpos[ARM_QPOS_START:ARM_QPOS_END].copy(), done, {"phase": self.phase, "phase_step": self.phase_step}

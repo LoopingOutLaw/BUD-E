@@ -1,12 +1,14 @@
-"""Record pick-and-place episodes for BUD-E training.
-
-Uses kinematic arm control + scripted cube carry (lerobot-style sticky gripper).
-"""
 from __future__ import annotations
 import mujoco
 import numpy as np
 from pathlib import Path
 
+from bude_vla.envs.so101_mjx import (
+    ARM_QPOS_START, ARM_QPOS_END,
+    GRIPPER_QPOS_START, GRIPPER_QPOS_END,
+    CUBE_QPOS_START, CUBE_QPOS_END,
+    load_arm_model,
+)
 from bude_vla.scripted_pick_and_place import ScriptedPickAndPlace
 
 
@@ -17,21 +19,17 @@ def record_pick_episode(root: str | Path, episode_idx: int = 0,
                         cube_xy: tuple[float, float] = (0.6, 0.0),
                         img_size: int = 64,
                         max_steps: int = 350) -> dict:
-    from bude_vla.envs.so101_mjx import ARM_MODEL_PATH
-
-    model = mujoco.MjModel.from_xml_path(str(ARM_MODEL_PATH))
+    model = load_arm_model()
     data = mujoco.MjData(model)
     mujoco.mj_resetData(model, data)
 
-    data.qpos[0:3] = [float(cube_xy[0]), float(cube_xy[1]), 0.445]
-    data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+    data.qpos[CUBE_QPOS_START:CUBE_QPOS_START + 3] = [float(cube_xy[0]), float(cube_xy[1]), 0.445]
+    data.qpos[CUBE_QPOS_START + 3:CUBE_QPOS_START + 7] = [1.0, 0.0, 0.0, 0.0]
     mujoco.mj_forward(model, data)
 
     renderer = mujoco.Renderer(model, height=img_size, width=img_size)
     overhead_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA,
                                         "front_top")
-    gripper_cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA,
-                                       "gripper_cam")
 
     policy = ScriptedPickAndPlace(model, data, cube_start_xy=np.array(cube_xy))
 
@@ -42,23 +40,21 @@ def record_pick_episode(root: str | Path, episode_idx: int = 0,
     for _ in range(max_steps):
         renderer.update_scene(data, camera=overhead_cam_id)
         img_overhead = np.asarray(renderer.render()).copy()
-        renderer.update_scene(data, camera=gripper_cam_id)
-        img_wrist = np.asarray(renderer.render()).copy()
-        images.append(np.concatenate([img_overhead, img_wrist], axis=-1).copy())
-        arm_proprio = data.qpos[7:15].astype(np.float32).copy()
+        images.append(img_overhead)
+        arm_proprio = data.qpos[ARM_QPOS_START:GRIPPER_QPOS_END].astype(np.float32).copy()
         proprios.append(arm_proprio)
 
         ctrl, arm_target, done, info = policy.step(model, data)
-        kinematic_action = np.concatenate([arm_target, [ctrl[6]]]).astype(np.float32)
+        kinematic_action = np.concatenate([arm_target, [ctrl[GRIPPER_QPOS_START]]]).astype(np.float32)
         actions.append(kinematic_action)
 
         data.ctrl[:] = 0.0
-        data.ctrl[6] = ctrl[6]
-        data.qvel[6:12] = 0.0
-        data.qpos[7:13] = arm_target
+        data.ctrl[GRIPPER_QPOS_START] = ctrl[GRIPPER_QPOS_START]
+        data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0.0
+        data.qpos[ARM_QPOS_START:ARM_QPOS_END] = arm_target
         policy._carry_cube_with(data)
         mujoco.mj_step(model, data)
-        data.qpos[7:13] = arm_target
+        data.qpos[ARM_QPOS_START:ARM_QPOS_END] = arm_target
         policy._carry_cube_with(data)
 
         if done:

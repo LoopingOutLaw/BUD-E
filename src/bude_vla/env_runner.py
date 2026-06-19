@@ -1,7 +1,9 @@
 """Policy-in-the-loop simulation runner with retry-on-failure.
 
 Core loop: render image -> policy.sample() -> kinematic arm override -> step sim.
-Cube attach/release mirrors ScriptedPickAndPlace._carry_cube_with.
+Cube attach/release mirrors ScriptedPickAndPlace._carry_cube_with (carry now
+purely kinematic; physics handles the actual contact once the gripper closes
+on the cube).
 On failure, reset arm to home + cube to start position, retry up to max_tries.
 
 Exports
@@ -24,12 +26,17 @@ from bude_vla.data.action_normalization import (
     denormalize_actions,
     load_action_stats,
 )
+from bude_vla.envs.so101_mjx import (
+    ARM_QPOS_START, ARM_QPOS_END,
+    GRIPPER_QPOS_START, GRIPPER_QPOS_END,
+    CUBE_QPOS_START, CUBE_QPOS_END,
+    N_ARM_JOINTS,
+)
 
 
 TABLE_Z = 0.42
 CUBE_HALF = 0.025
-CARRY_ATTACH_DIST = 0.20
-HOME_QPOS = np.zeros(8, dtype=np.float64)
+HOME_QPOS = np.zeros(CUBE_QPOS_END, dtype=np.float64)
 CUBE_REST_Z = 0.445
 
 
@@ -69,37 +76,23 @@ def _target_xy(data) -> np.ndarray:
     return data.xpos[target_body_id, :2].copy()
 
 
-def _attach_offset(model, data):
-    gripper_id = mujoco.mj_name2id(
-        model, mujoco.mjtObj.mjOBJ_BODY, "gripper")
-    cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
-    gripper_xyz = data.xpos[gripper_id].copy()
-    gripper_rot = data.xmat[gripper_id].reshape(3, 3).copy()
-    cube_xyz = data.xpos[cube_id].copy()
-    return gripper_rot.T @ (cube_xyz - gripper_xyz)
-
-
-def _carry_cube_with(model, data, offset):
-    if offset is None:
-        return
-    gripper_id = mujoco.mj_name2id(
-        model, mujoco.mjtObj.mjOBJ_BODY, "gripper")
-    gripper_xyz = data.xpos[gripper_id].copy()
-    gripper_rot = data.xmat[gripper_id].reshape(3, 3).copy()
-    data.qpos[0:3] = gripper_xyz + gripper_rot @ offset
+def _carry_cube_with(model, data):
+    """No-op stub. Cube is carried by physics (condim=4 contact + gripper
+    SDF), not by forcibly setting qpos."""
+    return
 
 
 def _reset_arm_to_home(model, data):
-    data.qpos[7:15] = HOME_QPOS
-    data.qvel[6:15] = 0.0
+    data.qpos[ARM_QPOS_START:CUBE_QPOS_END] = HOME_QPOS
+    data.qvel[ARM_QPOS_START:CUBE_QPOS_END] = 0.0
     data.ctrl[:] = 0.0
     mujoco.mj_forward(model, data)
 
 
 def _reset_cube(data, cube_xy):
-    data.qpos[0:3] = [float(cube_xy[0]), float(cube_xy[1]), CUBE_REST_Z]
-    data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
-    data.qvel[0:6] = 0.0
+    data.qpos[CUBE_QPOS_START:CUBE_QPOS_START + 3] = [float(cube_xy[0]), float(cube_xy[1]), CUBE_REST_Z]
+    data.qpos[CUBE_QPOS_START + 3:CUBE_QPOS_START + 7] = [1.0, 0.0, 0.0, 0.0]
+    data.qvel[CUBE_QPOS_START:CUBE_QPOS_END] = 0.0
     mujoco.mj_forward(data.model, data)
 
 
@@ -113,7 +106,7 @@ def _is_failure(model, data, step, max_steps) -> bool:
         return True
     if cube[2] < TABLE_Z - 0.05 or cube[2] > 1.5:
         return True
-    if np.any(np.abs(data.qpos[7:13]) > 3.5):
+    if np.any(np.abs(data.qpos[ARM_QPOS_START:ARM_QPOS_END]) > 3.5):
         return True
     return False
 
@@ -223,16 +216,16 @@ class PolicyRolloutRunner:
         ARM_STEP_FRAC = (1.0 / ARM_SMOOTH_STEPS) if record_video_mode else self.arm_step_frac
 
         def _smooth_arm_to(target_qpos, try_idx_inner):
-            cur = data.qpos[7:13].astype(np.float64).copy()
+            cur = data.qpos[ARM_QPOS_START:ARM_QPOS_END].astype(np.float64).copy()
             tgt = np.clip(target_qpos, -3.5, 3.5).astype(np.float64)
             for k in range(ARM_SMOOTH_STEPS):
                 err = tgt - cur
                 cur = cur + err * ARM_STEP_FRAC
                 data.ctrl[:] = 0.0
-                data.ctrl[6] = gripper_ctrl
-                data.qvel[6:12] = 0.0
-                data.qpos[7:13] = cur
-                _carry_cube_with(self.model, data, offset)
+                data.ctrl[GRIPPER_QPOS_START] = gripper_ctrl
+                data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0.0
+                data.qpos[ARM_QPOS_START:ARM_QPOS_END] = cur
+                _carry_cube_with(self.model, data)
                 mujoco.mj_step(self.model, data)
                 if record_video_mode and record_camera != "default":
                     img_obs = self._render(data, camera="default")
@@ -245,15 +238,13 @@ class PolicyRolloutRunner:
                     frames.append(stacked_mid)
                 try_labels.append(
                     f"try {try_idx_inner + 1}/{self.max_tries}")
-            data.qpos[7:13] = tgt
-            _carry_cube_with(self.model, data, offset)
+            data.qpos[ARM_QPOS_START:ARM_QPOS_END] = tgt
+            _carry_cube_with(self.model, data)
             return tgt
 
         for try_idx in range(self.max_tries):
             _reset_arm_to_home(self.model, data)
             _reset_cube(data, cube_xy)
-            offset = None
-            grip_close_count = 0
             gripper_ctrl = 0.0
             chunk = None
             cursor = 0
@@ -263,7 +254,7 @@ class PolicyRolloutRunner:
             for step in range(self.max_steps_per_try):
                 img = self._render(data)
                 stacked = self._stacked_view(img)
-                arm_proprio = data.qpos[7:15].astype(np.float32).copy()
+                arm_proprio = data.qpos[ARM_QPOS_START:GRIPPER_QPOS_END].astype(np.float32).copy()
                 if record_video_mode and record_camera != "default":
                     frames.append(self._render(data, camera=record_camera))
                 else:
@@ -279,7 +270,6 @@ class PolicyRolloutRunner:
                         if self._use_norm:
                             new_chunk = denormalize_actions(
                                 new_chunk, self._action_lo, self._action_hi)
-                        # overlap-fill: average with any existing planned actions
                         q = list(self._action_queue)
                         for i, new_a in enumerate(new_chunk):
                             if i < len(q):
@@ -302,27 +292,14 @@ class PolicyRolloutRunner:
                         a = denormalize_actions(a, self._action_lo, self._action_hi)
 
                 if np.any(np.isnan(a)):
-                    arm_target = HOME_QPOS[:6].copy()
+                    arm_target = HOME_QPOS[ARM_QPOS_START:ARM_QPOS_END].copy()
                     gripper_ctrl = 0.0
                 else:
-                    arm_target = np.clip(a[:6], -3.5, 3.5).astype(np.float64)
-                    gripper_ctrl = float(np.clip(a[6], -1.0, 1.0))
+                    arm_target = np.clip(a[:N_ARM_JOINTS], -3.5, 3.5).astype(np.float64)
+                    gripper_ctrl = float(np.clip(a[N_ARM_JOINTS], -1.0, 1.0))
 
-                _carry_cube_with(self.model, data, offset)
+                _carry_cube_with(self.model, data)
                 _smooth_arm_to(arm_target, try_idx)
-
-                ee = _ee_xyz(self.model, data)
-                cube = _cube_xyz(self.model, data)
-                dist_to_cube = float(np.linalg.norm(ee - cube))
-
-                if gripper_ctrl > 0.0 and dist_to_cube < CARRY_ATTACH_DIST:
-                    grip_close_count += 1
-                    if grip_close_count >= 3 and offset is None:
-                        offset = _attach_offset(self.model, data)
-                else:
-                    grip_close_count = 0
-                    if gripper_ctrl < -0.5:
-                        offset = None
 
                 if _is_success(self.model, data):
                     success = True

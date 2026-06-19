@@ -1,4 +1,4 @@
-"""Inverse-kinematics solvers for UR5e-style 6-DOF arm via MuJoCo.
+"""Inverse-kinematics solvers for SO-101 5-DOF arm via MuJoCo.
 
 Two solvers provided:
 - solve_ik_to_xyz_dls: damped least-squares (Levenberg-Marquardt-like)
@@ -7,6 +7,8 @@ Two solvers provided:
 from __future__ import annotations
 import numpy as np
 import mujoco
+
+from bude_vla.envs.so101_mjx import ARM_QPOS_START, ARM_QPOS_END
 
 
 def _ik_core(model: mujoco.MjModel,
@@ -37,27 +39,29 @@ def _ik_core(model: mujoco.MjModel,
         jacr = np.zeros((3, model.nv), dtype=np.float64)
         mujoco.mj_jacSite(model, data_copy, jacp, jacr, site_id)
 
+        J = jacp[:, ARM_QPOS_START:ARM_QPOS_END]
         if method == "dls":
-            J = jacp[:, 6:12]
             JJt = J @ J.T
             dq_arm = step * J.T @ np.linalg.solve(JJt + (damping ** 2) * np.eye(3), err)
         elif method == "jt":
             dq = step * (jacp.T @ err)
-            dq_arm = dq[6:12]
+            dq_arm = dq[ARM_QPOS_START:ARM_QPOS_END]
         else:
             raise ValueError(f"Unknown method: {method}")
 
-        qpos[7:13] += dq_arm
-        qpos[7:13] = np.clip(qpos[7:13], -np.pi, np.pi)
+        qpos[ARM_QPOS_START:ARM_QPOS_END] += dq_arm
+        qpos[ARM_QPOS_START:ARM_QPOS_END] = np.clip(
+            qpos[ARM_QPOS_START:ARM_QPOS_END], -np.pi, np.pi
+        )
 
-    return qpos[7:13].copy()
+    return qpos[ARM_QPOS_START:ARM_QPOS_END].copy()
 
 
 def solve_ik_to_xyz(model: mujoco.MjModel,
                     data: mujoco.MjData,
                     target_xyz: np.ndarray,
                     current_qpos: np.ndarray,
-                    site_name: str = "ee_center",
+                    site_name: str = "gripperframe",
                     **kwargs) -> np.ndarray:
     """Backwards-compat: Jacobian-transpose IK."""
     site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, site_name)
@@ -72,7 +76,7 @@ def solve_ik_to_xyz_dls(model: mujoco.MjModel,
                         data: mujoco.MjData,
                         target_xyz: np.ndarray,
                         current_qpos: np.ndarray,
-                        site_name: str = "ee_center",
+                        site_name: str = "gripperframe",
                         **kwargs) -> np.ndarray:
     """Damped least-squares IK. Robust near singularities, faster convergence."""
     site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, site_name)

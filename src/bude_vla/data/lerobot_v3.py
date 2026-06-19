@@ -82,11 +82,12 @@ def _augment_image(img_chw: torch.Tensor, rng: np.random.Generator,
 META = {
     "fps": 30,
     "robot_type": "ur5e_so101_sim",
-    "codebase_version": "v3.0",
+    "codebase_version": "v3.1",
     "features": {
-        "observation.state": {"dtype": "float32", "shape": [8]},
-        "action": {"dtype": "float32", "shape": [7]},
+        "observation.state": {"dtype": "float32", "shape": [6]},
+        "action": {"dtype": "float32", "shape": [6]},
         "observation.images.top": {"dtype": "video", "shape": "auto"},
+        "observation.images.wrist": {"dtype": "video", "shape": "auto"},
         "language_instruction": {"dtype": "string", "shape": [1]},
     },
 }
@@ -97,7 +98,7 @@ def _frame_index_dir(root: Path) -> Path:
 
 
 def _proprio_dim(episode: dict) -> int:
-    """Return proprio dim from episode dict (default 8 for backward compat)."""
+    """Return proprio dim from episode dict (6 for arm+gripper)."""
     return int(episode["proprio"].shape[1])
 
 
@@ -113,14 +114,14 @@ def write_episode(root: str | Path, episode: dict) -> Path:
     root = Path(root)
     images = episode["images"]                        # (T, H, W, 3) uint8
     proprio = episode["proprio"].astype(np.float32)     # (T, state_dim)
-    actions = episode["actions"].astype(np.float32)   # (T, 7)
+    actions = episode["actions"].astype(np.float32)   # (T, 6)
     instruction = episode["instruction"]
 
     T = images.shape[0]
     assert proprio.shape[0] == T, f"proprio length {proprio.shape[0]} != T {T}"
     state_dim = int(proprio.shape[1])
-    assert state_dim == 8, (
-        f"proprio dim {state_dim} != 8 (expected arm-only)"
+    assert state_dim == 6, (
+        f"proprio dim {state_dim} != 6 (expected arm+gripper)"
     )
 
     # Find next episode_idx
@@ -353,7 +354,13 @@ class BUDETrainingDataset:
         if self.normalize:
             info_path = self.root / "meta" / "info.json"
             self._action_lo, self._action_hi = load_action_stats(info_path)
-            if (self._action_lo == DEFAULT_LO).all() and (self._action_hi == DEFAULT_HI).all():
+            try:
+                _is_default = (self._action_lo.shape == DEFAULT_LO.shape
+                               and (self._action_lo == DEFAULT_LO).all()
+                               and (self._action_hi == DEFAULT_HI).all())
+            except (ValueError, AttributeError):
+                _is_default = False
+            if _is_default:
                 import warnings
                 warnings.warn(
                     f"action_normalization missing in {info_path}; falling back "
@@ -445,7 +452,8 @@ class BUDETrainingDataset:
         a_slice = ep["actions"][frame_in_ep: frame_in_ep + self.chunk_size]
         n = a_slice.shape[0]
         if n < self.chunk_size:
-            pad = np.zeros((self.chunk_size - n, 7), dtype=np.float32)
+            action_dim = a_slice.shape[-1] if a_slice.ndim == 2 else 6
+            pad = np.zeros((self.chunk_size - n, action_dim), dtype=np.float32)
             a_slice = np.concatenate([a_slice, pad], axis=0)
         if self.normalize and self._action_lo is not None:
             a_slice = normalize_actions(a_slice, self._action_lo, self._action_hi)

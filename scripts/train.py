@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import time
 from pathlib import Path
@@ -34,6 +35,30 @@ def collate_fn(batch: list[dict]) -> dict:
         else:
             out[k] = torch.stack([b[k] for b in batch])
     return out
+
+
+def _detect_dim(roots, key):
+    """Read dataset shape for `key` from the first valid info.json."""
+    for root in roots:
+        info_path = Path(root) / "meta" / "info.json"
+        if info_path.exists():
+            try:
+                meta = json.loads(info_path.read_text())
+                feat = meta.get("features", {}).get(key, {})
+                shape = feat.get("shape", [])
+                if isinstance(shape, list) and shape:
+                    return int(shape[0])
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue
+    return None
+
+
+def _detect_action_dim(roots: list) -> int | None:
+    return _detect_dim(roots, "action")
+
+
+def _detect_state_dim(roots: list) -> int | None:
+    return _detect_dim(roots, "observation.state")
 
 
 def build_dataloader(roots: list[str | Path], chunk_size: int = 4,
@@ -102,6 +127,9 @@ def train(
     cfg.use_dinov2 = use_dinov2
     cfg.use_minilm = use_minilm
     cfg.n_history_frames = n_history_frames
+    # Auto-detect action/state dims from dataset if possible; fall back to 6 (SO-101 5-arm + 1-grip).
+    cfg.action_dim = action_dim_override if (action_dim_override := _detect_action_dim(data_roots)) else 6
+    cfg.state_dim  = state_dim_override  if (state_dim_override  := _detect_state_dim(data_roots))  else 6
 
     policy = BUDEPolicy(cfg).to(device)
     n_params = policy.n_params()
