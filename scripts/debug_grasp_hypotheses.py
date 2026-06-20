@@ -30,7 +30,7 @@ OUT.mkdir(parents=True, exist_ok=True)
 
 def ik_target_for_ball(m, d, ball_xy, z_offset):
     """Solve IK with jaw_contact at (ball_xy, GROUND_Z + z_offset). Returns qpos."""
-    target = np.array([ball_xy[0], ball_xy[1], 0.0295 + z_offset], dtype=np.float64)
+    target = np.array([ball_xy[0], ball_xy[1], 0.010 + z_offset], dtype=np.float64)
     seed = d.qpos.copy().astype(np.float64)
     seed[5] = 0.30  # IK_SEED_JAW_QPOS
     return _ik_core(m, 3, target, seed,
