@@ -1,10 +1,15 @@
 """Wrapper around MuJoCo/MJX for BUD-E's SO-101 5+1 DOF arm.
 
-The arm comes from the official LeRobot/SO-ARM100 hardware project
-(TheRobotStudio/SO-ARM100 on GitHub, Simulation/SO101). We load the
-upstream pre-converted MJCF (so101_official/so101_new_calib.xml) and
-programmatically compose it with our pick-scene elements (cube, table,
-cameras, lights) using MuJoCo's MjSpec API.
+Scene built from the ggand0/pick-101 proven working model (so101_new_calib.xml
+with finger pads, fingertip sites, gripperframe/graspframe sites). We load the
+upstream MJCF and programmatically compose it with our pick-scene elements
+(cube, target zone, cameras) using MuJoCo's MjSpec API.
+
+CRITICAL PHYSICS SETTINGS (matching ggand0/pick-101 exactly):
+  - Elliptic cone + noslip_iterations=3 + impratio=10
+  - solref="0.001 1" solimp="0.99 0.99 0.001" (very stiff contacts)
+  - znear=0.005 (prevents clipping through small finger meshes)
+  - 3cm cube, mass=0.03, wood friction
 
 The gripper has a single asymmetric moving jaw that rotates about its
 hinge from closed (-0.175 rad) to open (+1.745 rad).
@@ -20,28 +25,19 @@ Action order: 5 arm + 1 gripper = 6D continuous.
 
 COLLISION GROUPS
 ----------------
-contype/conaffinity bitmasks used throughout this scene:
-    GROUP_DEFAULT (1) — robot, floor, table, pedestal (engine default,
-                         unspecified geoms get contype=conaffinity=1)
-    GROUP_BALL    (2) — the pick-and-place ball
-    GROUP_BOWL    (4) — both bowls (pick bowl + target bowl)
+contype/conaffinity bitmasks:
+    GROUP_DEFAULT (1) — robot, floor, table
+    GROUP_BALL    (2) — cube
+    GROUP_BOWL    (4) — target bowl
 
-The ball gets contype=conaffinity=GROUP_DEFAULT|GROUP_BALL (3), so it
-keeps colliding with the robot/floor/table as before. Both bowls get
-contype=GROUP_BOWL, conaffinity=GROUP_BALL — they collide with the ball
-ONLY, never the robot. This fixes two bugs in the previous version:
-  - the target bowl used contype=0/conaffinity=0 ("never collide with
-    anything"), which meant it was purely decorative and could not
-    physically catch/contain a dropped ball at all;
-  - the pick bowl used the engine default (collides with everything),
-    which meant it could physically obstruct the gripper reaching in.
+Cube gets contype=conaffinity=3, collides with everything.
+Bowl gets contype=4, conaffinity=2 — collides with cube only, not robot.
 """
 from __future__ import annotations
 
 import math as _m
 import os
 from pathlib import Path
-from typing import Callable
 
 import mujoco
 import numpy as np
@@ -62,26 +58,16 @@ GROUP_DEFAULT = 1
 GROUP_BALL = 2
 GROUP_BOWL = 4
 
-BALL_CONTYPE = GROUP_DEFAULT | GROUP_BALL       # 3 — collides with robot/floor/table AND bowls
+BALL_CONTYPE = GROUP_DEFAULT | GROUP_BALL       # 3
 BALL_CONAFFINITY = GROUP_DEFAULT | GROUP_BALL   # 3
-BOWL_CONTYPE = GROUP_BOWL                       # 4 — collides with...
-BOWL_CONAFFINITY = GROUP_BALL                   # ...the ball only, never the robot
+BOWL_CONTYPE = GROUP_BOWL                       # 4
+BOWL_CONAFFINITY = GROUP_BALL                   # 2
 
 
 def _add_ring_wall(parent_body, radius: float, wall_height: float, z_center: float,
                    n_segments: int, thickness: float, rgba, contype: int, conaffinity: int,
                    name_prefix: str, overlap: float = 1.18) -> None:
-    """Build a circular wall out of `n_segments` thin boxes around `radius`.
-
-    `overlap` widens each segment's tangential extent past its even share
-    of the circumference (1.0 = exactly touching, no gaps; >1.0 = slight
-    overlap) so the wall reads as a smooth ring rather than a slatted
-    fence with visible gaps between segments. The previous bowls used 12
-    segments sized to barely cover ~70% of the circumference, leaving
-    ~3-4mm gaps — small enough that the 25mm ball couldn't squeeze
-    through, but visually choppy and an unnecessary source of debris
-    leak risk for anything smaller.
-    """
+    """Build a circular wall out of `n_segments` thin boxes around `radius`."""
     circumference = 2 * _m.pi * radius
     seg_full_width = (circumference / n_segments) * overlap
     half_width = seg_full_width / 2.0
@@ -103,9 +89,21 @@ def _add_ring_wall(parent_body, radius: float, wall_height: float, z_center: flo
 def _build_composite_spec() -> mujoco.MjSpec:
     """Build the composite pick-scene by extending the upstream arm spec.
 
-    chdir to the arm dir for the whole build so that mesh asset paths in the
-    upstream MJCF (`<compiler meshdir="assets"/>`) and the resulting MjSpec
-    both resolve to the actual STL folder.
+    The upstream so101_new_calib.xml (from ggand0/pick-101) already includes:
+      - finger pad collision geoms (static_finger_pad, moving_finger_pad)
+      - fingertip sites (static_fingertip, moving_fingertip)
+      - gripperframe site (TCP at fingertips, pos="0.0 0.0 -0.0981274")
+      - graspframe site (midpoint between fingers)
+      - wrist_cam camera
+      - sts3215 position actuators with correct gains (kp=998.22 kv=2.731)
+      - contype=1 conaffinity=1 on visual/collision geoms
+
+    We add:
+      - Physics options (elliptic cone, noslip, impratio, solref/solimp defaults)
+      - Floor, table, cube, target zone, bowl
+      - Additional fixed cameras
+      - Sensors
+      - znear visual setting
     """
     cwd = os.getcwd()
     arm_dir = _ARM_SPEC_PATH.parent
@@ -113,58 +111,58 @@ def _build_composite_spec() -> mujoco.MjSpec:
     try:
         spec = mujoco.MjSpec.from_file(_ARM_SPEC_PATH.name)
 
-        # Tighten solver settings for stable contact physics with the
-        # high-friction cube + dual-finger grasp. Smaller timestep and
-        # more Newton iterations prevent the cube from tunneling through
-        # contact surfaces during fast jaw closure.
+        # Physics settings matching ggand0/pick-101 exactly.
+        # CRITICAL for reliable grasping — prevents cube sliding through fingers.
         spec.option.timestep = 0.002
         spec.option.iterations = 100
         spec.option.ls_iterations = 50
+        spec.option.noslip_iterations = 3
+        spec.option.impratio = 10
         spec.option.solver = mujoco.mjtSolver.mjSOL_NEWTON
         spec.option.integrator = mujoco.mjtIntegrator.mjINT_EULER
-        spec.option.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
+        spec.option.cone = mujoco.mjtCone.mjCONE_ELLIPTIC
 
+        # Default geom contact parameters — very stiff (matching pick-101).
+        # solref=[0.001, 1]: extremely fast constraint stabilization
+        # solimp=[0.99, 0.99, 0.001, 0, 0]: near-rigid impedance
+        spec.default.geom.solref = np.array([0.001, 1.0])
+        spec.default.geom.solimp = np.array([0.99, 0.99, 0.001, 0.0, 0.0])
+
+        # Visual: znear=0.005 prevents clipping through small finger meshes
+        spec.visual.map.znear = 0.005
+
+        # Floor
         spec.worldbody.add_geom(
             name="floor", type=mujoco.mjtGeom.mjGEOM_PLANE,
             size=[1, 1, 0.05], rgba=[0.7, 0.7, 0.8, 1], condim=3,
             friction=[1.0, 0.005, 0.0001],
         )
+
+        # Table
         spec.worldbody.add_geom(
             name="table", type=mujoco.mjtGeom.mjGEOM_BOX,
             pos=[0.0, 0.25, 0.0], size=[0.35, 0.10, 0.02],
             rgba=[0.85, 0.78, 0.65, 1], condim=3,
         )
 
-        # Small pedestal to raise the cube off the floor.
-        # Without this, the SO-101 gripper cannot reach a cube on the floor
-        # without the gripper body penetrating the ground (the motor housing
-        # and gripper mesh extend ~30mm below the fingertips).
-        # The pedestal is 15mm tall, so the cube center is at z=0.025
-        # and the cube top is at z=0.035.
-        spec.worldbody.add_geom(
-            name="pick_pedestal", type=mujoco.mjtGeom.mjGEOM_CYLINDER,
-            pos=[0.30, 0.0, 0.0075], size=[0.025, 0.0075],
-            rgba=[0.6, 0.6, 0.6, 1], condim=3,
-        )
-
-        # 20 mm cube (half-extent 0.010) on the pedestal.
-        ball = spec.worldbody.add_body(name="cube", pos=[0.30, 0.0, 0.025])
-        ball.add_joint(name="cube_free", type=mujoco.mjtJoint.mjJNT_FREE)
+        # 3cm cube matching ggand0/pick-101 exactly:
+        #   half-extent 0.015, mass 0.03, wood friction
+        #   center at z=0.015 (floor + half_extent)
+        ball = spec.worldbody.add_body(name="cube", pos=[0.25, 0.0, 0.015])
+        ball.add_joint(name="cube_joint", type=mujoco.mjtJoint.mjJNT_FREE)
         ball.add_geom(
             name="cube_geom",
             type=mujoco.mjtGeom.mjGEOM_BOX,
-            size=[0.010, 0.010, 0.010],
-            rgba=[0.85, 0.05, 0.05, 1],
-            mass=0.30,
-            condim=6,
-            friction=[5.0, 0.5, 0.1],
-            solref=[0.01, 1.0],
-            solimp=[0.95, 0.99, 0.001, 0.5, 2],
+            size=[0.015, 0.015, 0.015],
+            rgba=[0.9, 0.1, 0.1, 1],
+            mass=0.03,
+            friction=[0.5, 0.05, 0.001],
             contype=BALL_CONTYPE,
             conaffinity=BALL_CONAFFINITY,
         )
 
-        tgt = spec.worldbody.add_body(name="target_zone", pos=[0.32, 0.16, 0.021])
+        # Target zone + bowl at (0.32, 0.16)
+        tgt = spec.worldbody.add_body(name="target_zone", pos=[0.32, 0.16, 0.017])
         tgt.add_geom(
             name="target_zone_disc", type=mujoco.mjtGeom.mjGEOM_BOX,
             size=[0.06, 0.06, 0.002], rgba=[0.1, 0.3, 0.95, 1],
@@ -175,15 +173,8 @@ def _build_composite_spec() -> mujoco.MjSpec:
             size=[0.025, 0.025, 0.003], rgba=[0.95, 0.95, 1.0, 1],
             pos=[0, 0, 0.0005], contype=0, conaffinity=0,
         )
-        # Bowl to keep the ball from rolling off after drop.
-        # FIXED: previously contype=0/conaffinity=0 ("never collide with
-        # anything"), which made this bowl purely decorative -- a dropped
-        # ball would roll straight through the "walls" with no physical
-        # containment at all. Now it uses the same bowl/ball-only group as
-        # the pick bowl: it collides with the ball, never the robot, so it
-        # actually catches and holds the dropped ball while staying out of
-        # the arm's way.
-        bowl = spec.worldbody.add_body(name="bowl", pos=[0.32, 0.16, 0.016])
+
+        bowl = spec.worldbody.add_body(name="bowl", pos=[0.32, 0.16, 0.017])
         bowl.add_geom(
             name="bowl_floor",
             type=mujoco.mjtGeom.mjGEOM_CYLINDER,
@@ -201,12 +192,7 @@ def _build_composite_spec() -> mujoco.MjSpec:
             name_prefix="bowl_rim",
         )
 
-        # xyaxes = [X_cam, Y_cam] in the *parent body* frame, computed as:
-        #   fwd   = normalize(look_at - pos)
-        #   X_cam = normalize(cross(fwd, world_up))   # right in image
-        #   Y_cam = normalize(cross(X_cam, fwd))      # up in image
-        #
-        # These four are fixed world-frame cameras (parent = worldbody).
+        # Fixed world-frame cameras
         for nm, p, xy, f in [
             ("over_shoulder", [-0.05,  0.55, 0.50], [-0.7071, -0.7071, 0,  0.4814, -0.4814,  0.7325], 48),
             ("pov",           [ 0.40, -0.30, 0.65], [ 0.9806,  0.1961, 0, -0.1505,  0.7524,  0.6413], 55),
@@ -215,110 +201,24 @@ def _build_composite_spec() -> mujoco.MjSpec:
         ]:
             spec.worldbody.add_camera(name=nm, pos=p, xyaxes=xy, fovy=f)
 
-        # ------------------------------------------------------------------
-        # Eye-in-hand (wrist) camera
-        # ------------------------------------------------------------------
-        # The camera MUST be a child of the end-effector body so it moves
-        # with the arm.  Parenting it to worldbody (as the other cameras
-        # above) produces a fixed world-frame view that never tracks the arm.
-        #
-        # SO-101 / SO-ARM100 body chain (DFS order from so101_new_calib.xml):
-        #   base → Shoulder_Pan → Shoulder_Lift → Upper_Arm
-        #        → Wrist_Pitch  → Wrist_Roll    → Fixed_Jaw  ← gripper base
-        #                                          └ Moving_Jaw (gripper hinge)
-        #
-        # "Fixed_Jaw" is the rigid gripper body that holds both fingers; the
-        # "gripper" actuated joint rotates Moving_Jaw relative to it.
-        # Attaching the camera here gives a view that follows every DOF.
-        #
-        # If the name has changed, run this once to discover all body names:
-        #   m = load_arm_model()
-        #   for i in range(m.nbody):
-        #       print(mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, i))
-        # Upstream SO-101 body chain (so101_new_calib.xml):
-        #   base → shoulder → upper_arm → lower_arm → wrist → gripper → moving_jaw
-        # "gripper" is the rigid body whose child (moving_jaw_so101_v1) hinges
-        # about the actuated `gripper` joint — i.e. the EE.  No body literally
-        # named "Fixed_Jaw" exists in this MJCF (that name is from the LeRobot
-        # URDF, not the MJCF).
-        _EE_BODY = "gripper"
-        ee_body = next((b for b in spec.worldbody.find_all(mujoco.mjtObj.mjOBJ_BODY)
-                        if b.name == _EE_BODY), None)
-        if ee_body is None:
-            raise RuntimeError(
-                f"End-effector body '{_EE_BODY}' not found in SO-101 spec. "
-                "Run load_arm_model() and enumerate m.nbody to find the correct name."
-            )
-
-        # Local-frame placement on the EE (gripper) body.
-        #   +Y_body  = toward fingertips / approach / workspace
-        #   -Y_body  = toward palm back / forearm (away from workspace)
-        #   +Z_body  = "up" lateral axis when the arm is in home pose
-        #
-        # VLA wrist-cam design goal:
-        #   workspace (ball + table) fills center frame; gripper fingertips
-        #   just visible at the top edge — matching eye-in-hand POV in VLA papers.
-        #
-        # pos:  14 cm behind palm (-Y), 11 cm above (+Z)  → well clear of geometry
-        # tilt: 50 degrees below +Y_body horizontal
-        #   X_cam = [1,  0,      0    ]
-        #   Y_cam = [0,  0.766,  0.643]  (camera up = sin50, cos50)
-        #   look  = [0,  0.643, -0.766]  (forward + steeply down)
-        ee_body.add_camera(
-            name="wrist",
-            pos=[0.0, -0.14, 0.11],
-            xyaxes=[0, 0.766, 0.643,  -1, 0, 0],
-            fovy=90,
+        # Sensors matching pick-101
+        spec.add_sensor(
+            name="cube_pos",
+            type=mujoco.mjtSensor.mjSENS_FRAMEPOS,
+            objtype=mujoco.mjtObj.mjOBJ_BODY,
+            objname="cube",
         )
-
-        # Fixed finger (static opposing surface on the gripper body).
-        # The moving jaw rotates about its hinge and pushes the cube against
-        # this fixed finger. Without it the cube has nothing to clamp
-        # against — the jaw just shoves it sideways.
-        # Position: mirror of the moving jaw's fingertip across the jaw
-        # hinge axis, in gripper-local frame. The moving jaw's collision
-        # box sits at jaw-local [-0.001, -0.025, 0.019]; the hinge is at
-        # the jaw body origin. The fixed finger goes on the opposite side
-        # of the hinge so the cube gets pinched between the two surfaces.
-        gripper_body = next(
-            (b for b in spec.worldbody.find_all(mujoco.mjtObj.mjOBJ_BODY)
-             if b.name == "gripper"), None,
+        spec.add_sensor(
+            name="gripper_pos",
+            type=mujoco.mjtSensor.mjSENS_FRAMEPOS,
+            objtype=mujoco.mjtObj.mjOBJ_SITE,
+            objname="gripperframe",
         )
-        if gripper_body is not None:
-            gripper_body.add_geom(
-                name="fixed_finger",
-                type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=[0.008, 0.012, 0.010],
-                pos=[-0.012, -0.0002, -0.048],
-                rgba=[0.2, 0.8, 0.2, 0.5],
-                friction=[5.0, 0.5, 0.1],
-                condim=6,
-            )
-
-        # Site on the moving-jaw body at the finger-tip contact surface.
-        jaw_body = next(
-            (b for b in spec.worldbody.find_all(mujoco.mjtObj.mjOBJ_BODY)
-             if b.name == "moving_jaw_so101_v1"), None,
-        )
-        if jaw_body is not None:
-            jaw_body.add_site(
-                name="jaw_contact",
-                pos=[-0.001, -0.025, 0.019],
-                size=0.005,
-                rgba=[1, 0.3, 0.3, 0.6],
-            )
-            # Second contact site on the fixed finger for dual-contact grasp.
-            if gripper_body is not None:
-                gripper_body.add_site(
-                    name="fixed_finger_contact",
-                    pos=[-0.012, -0.0002, -0.048],
-                    size=0.005,
-                    rgba=[0.3, 1, 0.3, 0.6],
-                )
-
-        spec.worldbody.add_site(
-            name="workspace_origin", pos=[0.30, 0.20, 0.04],
-            size=0.01, rgba=[0, 1, 0, 0.5],
+        spec.add_sensor(
+            name="grasp_pos",
+            type=mujoco.mjtSensor.mjSENS_FRAMEPOS,
+            objtype=mujoco.mjtObj.mjOBJ_SITE,
+            objname="graspframe",
         )
 
         return spec.compile()
@@ -327,11 +227,7 @@ def _build_composite_spec() -> mujoco.MjSpec:
 
 
 def load_arm_model(xml_path: str | Path | None = None) -> mujoco.MjModel:
-    """Load the composite SO-101 pick scene as an MjModel.
-
-    If xml_path is given, load that file instead (for testing/debug).
-    Otherwise build the composite programmatically via MjSpec.
-    """
+    """Load the composite SO-101 pick scene as an MjModel."""
     if xml_path is not None:
         path = Path(xml_path)
         if not path.exists():
@@ -341,20 +237,19 @@ def load_arm_model(xml_path: str | Path | None = None) -> mujoco.MjModel:
 
 
 def default_joint_angles(model: mujoco.MjModel) -> np.ndarray:
-    """Home config for the 5 arm joints (in joint-ID order)."""
+    """Home config for the 5 arm joints."""
     return np.asarray([0.0, -0.5, 0.95, -0.55, 0.0])
 
 
-# qpos layout — MuJoCo arm-first DFS order:
-#   qpos[0:5]   = 5 arm revolutes (shoulder_pan … wrist_roll)
-#   qpos[5:6]   = gripper (single revolute)
-#   qpos[6:13]  = cube freejoint (xyz + quat wxyz)
+# qpos layout:
 ARM_QPOS_START = 0
 ARM_QPOS_END = 5
 GRIPPER_QPOS_START = 5
 GRIPPER_QPOS_END = 6
 CUBE_QPOS_START = 6
 CUBE_QPOS_END = 13
+
+CUBE_REST_Z = 0.015    # 3cm cube center on floor (floor + half_extent=0.015)
 
 N_ARM_JOINTS = 5
 N_GRIPPER_JOINTS = 1
@@ -379,7 +274,7 @@ class SO101MJMJX:
         self.n_qvel = self.model_mj.nv
 
     def make_data(self, joint_angles: np.ndarray | None = None,
-                  cube_xyz: tuple[float, float, float] = (0.30, 0.0, 0.030)
+                  cube_xyz: tuple[float, float, float] = (0.25, 0.0, 0.015)
                   ) -> mjx.Data:
         d = mjx.make_data(self.model)
         if joint_angles is not None:
@@ -396,7 +291,7 @@ class SO101MJMJX:
         return d
 
     def reset(self, joint_angles: np.ndarray | None = None,
-              cube_xyz: tuple[float, float, float] = (0.30, 0.0, 0.030)
+              cube_xyz: tuple[float, float, float] = (0.25, 0.0, 0.015)
               ) -> mjx.Data:
         return self.make_data(joint_angles, cube_xyz)
 

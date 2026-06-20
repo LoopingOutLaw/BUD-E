@@ -40,7 +40,7 @@ def run_one(model, cx, cy):
     mujoco.mj_resetData(model, data)
     data.qpos[:5] = default_joint_angles(model)
     data.qpos[5] = 1.5
-        data.qpos[CUBE_QPOS_START:CUBE_QPOS_START + 3] = [cx, cy, 0.010]  # cube half-extent on world floor
+    data.qpos[CUBE_QPOS_START:CUBE_QPOS_START + 3] = [cx, cy, 0.025]  # cube half-extent on world floor
     data.qpos[CUBE_QPOS_START + 3:CUBE_QPOS_START + 7] = [1.0, 0.0, 0.0, 0.0]
     mujoco.mj_forward(model, data)
 

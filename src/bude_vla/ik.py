@@ -1,138 +1,157 @@
-from __future__ import annotations
-import numpy as np
+"""Inverse Kinematics controller for SO-101 arm using MuJoCo's Jacobian.
+
+Copied from ggand0/pick-101 src/controllers/ik_controller.py — the proven
+working IK implementation for SO-101 grasping. Uses damped least-squares
+with optional locked joints and orientation constraint.
+"""
 import mujoco
+import numpy as np
 
-from bude_vla.envs.so101_mjx import ARM_QPOS_START, ARM_QPOS_END
 
+class IKController:
+    """Damped least-squares IK controller.
 
-def _ik_core(model: mujoco.MjModel,
-             site_id: int,
-             target_xyz: np.ndarray,
-             current_qpos: np.ndarray,
-             *,
-             method: str = "dls",
-             step: float = 0.5,
-             damping: float = 0.05,
-             pos_tol: float = 0.005,
-             max_iters: int = 50,
-             # ---- orientation constraint (optional) ----
-             body_id: int | None = None,
-             target_axis: np.ndarray | None = None,
-             target_world_dir: np.ndarray | None = None,
-             ori_weight: float = 2.0,
-             pos_weight: float = 1.0,
-             ori_tol: float = 0.05,
-             ) -> np.ndarray:
-    """Damped least-squares IK with optional orientation constraint.
-
-    Position-only IK on a 5-DOF arm has a 2-D nullspace.  The solver
-    naturally drifts into whatever orientation is closest to the seed
-    pose -- which is often a side-on glancing pose that pushes the ball
-    sideways out of the bowl rather than pinching it.
-
-    With an orientation constraint we solve 3 position + 2 orientation
-    = 5 constraints, exactly matching the 5 arm DOF.  We constrain one
-    body axis (e.g. the jaw's +Z length axis) to point in a desired
-    world direction (e.g. horizontally toward the ball).
+    Uses MuJoCo's mj_jac to compute the Jacobian and solve for joint velocities
+    that move the end-effector toward a target position.
     """
-    target_xyz = np.asarray(target_xyz, dtype=np.float64)
-    qpos = current_qpos.copy()
-    data_copy = mujoco.MjData(model)
 
-    use_ori = (body_id is not None
-               and target_axis is not None
-               and target_world_dir is not None)
-    target_axis_body = None
-    target_world_dir_unit = None
-    if use_ori:
-        target_axis_body = np.asarray(target_axis, dtype=np.float64)
-        target_axis_body = target_axis_body / max(np.linalg.norm(target_axis_body), 1e-12)
-        target_world_dir_unit = np.asarray(target_world_dir, dtype=np.float64)
-        norm = np.linalg.norm(target_world_dir_unit)
-        if norm > 1e-12:
-            target_world_dir_unit = target_world_dir_unit / norm
-        else:
-            target_world_dir_unit = np.array([1.0, 0.0, 0.0])
+    def __init__(
+        self,
+        model: mujoco.MjModel,
+        data: mujoco.MjData,
+        end_effector_site: str = "gripperframe",
+        damping: float = 0.1,
+        max_dq: float = 0.5,
+    ):
+        self.model = model
+        self.data = data
+        self.damping = damping
+        self.max_dq = max_dq
 
-    for _ in range(max_iters):
-        data_copy.qpos[:] = qpos
-        mujoco.mj_forward(model, data_copy)
+        self.ee_site_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_SITE, end_effector_site
+        )
+        if self.ee_site_id == -1:
+            raise ValueError(f"Site '{end_effector_site}' not found in model")
 
-        ee_xyz = data_copy.site_xpos[site_id]
-        err_pos = target_xyz - ee_xyz
-        pos_err_norm = np.linalg.norm(err_pos)
+        self.n_arm_joints = 5
+        self.n_total_joints = model.nv
+        self.jacp = np.zeros((3, self.n_total_joints))
+        self.jacr = np.zeros((3, self.n_total_joints))
 
-        jacp = np.zeros((3, model.nv), dtype=np.float64)
-        jacr = np.zeros((3, model.nv), dtype=np.float64)
-        mujoco.mj_jacSite(model, data_copy, jacp, jacr, site_id)
+    def get_ee_position(self) -> np.ndarray:
+        return self.data.site_xpos[self.ee_site_id].copy()
 
-        J_pos = jacp[:, ARM_QPOS_START:ARM_QPOS_END]
+    def get_ee_orientation(self) -> np.ndarray:
+        return self.data.site_xmat[self.ee_site_id].reshape(3, 3).copy()
 
-        if use_ori:
-            R = data_copy.xmat[body_id].reshape(3, 3)
-            current_world_dir = R @ target_axis_body
-            # Error = sin(theta) * axis_perp, equivalent to -(target x current)
-            # for small angles. Use cross-product direction (target_world_dir x current).
-            err_ori = np.cross(target_world_dir_unit, current_world_dir)
-            ori_err_norm = np.linalg.norm(err_ori)
+    def _quat_to_mat(self, quat: np.ndarray) -> np.ndarray:
+        w, x, y, z = quat
+        return np.array([
+            [1 - 2*(y*y + z*z), 2*(x*y - w*z), 2*(x*z + w*y)],
+            [2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+            [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y)]
+        ])
 
-            J_ori = jacr[:, ARM_QPOS_START:ARM_QPOS_END]
+    def _orientation_error(self, target_mat: np.ndarray, current_mat: np.ndarray) -> np.ndarray:
+        R_error = target_mat @ current_mat.T
+        trace = np.trace(R_error)
+        cos_theta = np.clip((trace - 1) / 2, -1, 1)
+        theta = np.arccos(cos_theta)
 
-            err = np.concatenate([err_pos * pos_weight, err_ori * ori_weight])
-            J = np.vstack([J_pos * pos_weight, J_ori * ori_weight])
-        else:
-            ori_err_norm = 0.0
-            err = err_pos
-            J = J_pos
+        if theta < 1e-6:
+            return np.zeros(3)
 
-        if pos_err_norm < pos_tol and ori_err_norm < ori_tol:
-            break
+        axis = np.array([
+            R_error[2, 1] - R_error[1, 2],
+            R_error[0, 2] - R_error[2, 0],
+            R_error[1, 0] - R_error[0, 1]
+        ]) / (2 * np.sin(theta))
 
-        if method == "dls":
-            JJt = J @ J.T
-            dq_arm = step * J.T @ np.linalg.solve(
-                JJt + (damping ** 2) * np.eye(JJt.shape[0]), err
-            )
-        elif method == "jt":
-            dq = step * (jacp.T @ err_pos)
-            dq_arm = dq[ARM_QPOS_START:ARM_QPOS_END]
-        else:
-            raise ValueError(f"Unknown method: {method}")
+        return axis * theta
 
-        qpos[ARM_QPOS_START:ARM_QPOS_END] += dq_arm
-        qpos[ARM_QPOS_START:ARM_QPOS_END] = np.clip(
-            qpos[ARM_QPOS_START:ARM_QPOS_END], -np.pi, np.pi
+    def compute_joint_velocities(
+        self,
+        target_pos: np.ndarray,
+        target_quat: np.ndarray | None = None,
+        orientation_weight: float = 1.0,
+        locked_joints: list[int] | None = None,
+    ) -> np.ndarray:
+        current_pos = self.get_ee_position()
+        pos_error = target_pos - current_pos
+
+        mujoco.mj_jacSite(
+            self.model, self.data,
+            self.jacp, self.jacr,
+            self.ee_site_id
         )
 
-    return qpos[ARM_QPOS_START:ARM_QPOS_END].copy()
+        if locked_joints is None:
+            active_joints = list(range(self.n_arm_joints))
+        else:
+            active_joints = [i for i in range(self.n_arm_joints) if i not in locked_joints]
 
+        n_active = len(active_joints)
 
-def solve_ik_to_xyz(model: mujoco.MjModel,
-                    data: mujoco.MjData,
-                    target_xyz: np.ndarray,
-                    current_qpos: np.ndarray,
-                    site_name: str = "gripperframe",
-                    **kwargs) -> np.ndarray:
-    """Backwards-compat: Jacobian-transpose IK."""
-    site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, site_name)
-    kwargs.setdefault("method", "jt")
-    kwargs.setdefault("step", 0.05)
-    kwargs.setdefault("max_iters", 20)
-    kwargs.setdefault("pos_tol", 0.005)
-    return _ik_core(model, site_id, target_xyz, current_qpos, **kwargs)
+        Jp = self.jacp[:, active_joints]
+        Jr = self.jacr[:, active_joints]
 
+        if target_quat is not None:
+            target_mat = self._quat_to_mat(target_quat)
+            current_mat = self.get_ee_orientation()
+            ori_error = self._orientation_error(target_mat, current_mat) * orientation_weight
+            error = np.concatenate([pos_error, ori_error])
+            J = np.vstack([Jp, Jr])
+        else:
+            error = pos_error
+            J = Jp
 
-def solve_ik_to_xyz_dls(model: mujoco.MjModel,
-                        data: mujoco.MjData,
-                        target_xyz: np.ndarray,
-                        current_qpos: np.ndarray,
-                        site_name: str = "gripperframe",
-                        **kwargs) -> np.ndarray:
-    """Damped least-squares IK. Robust near singularities, faster convergence."""
-    site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, site_name)
-    kwargs.setdefault("method", "dls")
-    kwargs.setdefault("step", 0.5)
-    kwargs.setdefault("damping", 0.05)
-    kwargs.setdefault("max_iters", 30)
-    kwargs.setdefault("pos_tol", 0.005)
-    return _ik_core(model, site_id, target_xyz, current_qpos, **kwargs)
+        JTJ = J.T @ J
+        damping_matrix = self.damping**2 * np.eye(n_active)
+
+        try:
+            dq_active = np.linalg.solve(JTJ + damping_matrix, J.T @ error)
+        except np.linalg.LinAlgError:
+            dq_active = np.linalg.pinv(J) @ error
+
+        dq_active = np.clip(dq_active, -self.max_dq, self.max_dq)
+
+        dq = np.zeros(self.n_arm_joints)
+        for i, joint_idx in enumerate(active_joints):
+            dq[joint_idx] = dq_active[i]
+
+        return dq
+
+    def step_toward_target(
+        self,
+        target_pos: np.ndarray,
+        gripper_action: float = 0.0,
+        gain: float = 1.0,
+        target_quat: np.ndarray | None = None,
+        orientation_weight: float = 1.0,
+        locked_joints: list[int] | None = None,
+    ) -> np.ndarray:
+        """Compute control signal to move toward target position.
+
+        Returns full control vector (6,) for all actuators.
+        Gripper action maps -1..1 to actuator control range.
+        """
+        dq = self.compute_joint_velocities(target_pos, target_quat, orientation_weight, locked_joints)
+        dq *= gain
+
+        current_q = self.data.qpos[:self.n_arm_joints].copy()
+        target_q = current_q + dq
+
+        for i in range(self.n_arm_joints):
+            jnt_range = self.model.jnt_range[i]
+            if jnt_range[0] != jnt_range[1]:
+                target_q[i] = np.clip(target_q[i], jnt_range[0], jnt_range[1])
+
+        ctrl = np.zeros(self.model.nu)
+        ctrl[:self.n_arm_joints] = target_q
+
+        gripper_range = self.model.actuator_ctrlrange[5]
+        gripper_ctrl = (gripper_action + 1) / 2 * (gripper_range[1] - gripper_range[0]) + gripper_range[0]
+        ctrl[5] = gripper_ctrl
+
+        return ctrl

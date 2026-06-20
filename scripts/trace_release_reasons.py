@@ -46,7 +46,7 @@ def trace_one(model, cx, cy, camera="portfolio"):
     mujoco.mj_resetData(model, data)
     data.qpos[:5] = default_joint_angles(model)
     data.qpos[5] = 1.5
-    data.qpos[CUBE_QPOS_START : CUBE_QPOS_START + 3] = [cx, cy, 0.010]  # cube half-extent on world floor
+    data.qpos[CUBE_QPOS_START : CUBE_QPOS_START + 3] = [cx, cy, 0.025]  # cube half-extent on world floor
     data.qpos[CUBE_QPOS_START + 3 : CUBE_QPOS_START + 7] = [1.0, 0.0, 0.0, 0.0]
     mujoco.mj_forward(model, data)
 
@@ -90,7 +90,7 @@ def trace_one(model, cx, cy, camera="portfolio"):
         # Every 30 steps: where is the ball vs target?
         if step % 30 == 0:
             cube = data.xpos[policy.cube_body_id].copy()
-            tgt = np.array([policy.target_xy[0], policy.target_xy[1], 0.010])
+            tgt = np.array([policy.target_xy[0], policy.target_xy[1], 0.025])
             dist = float(np.linalg.norm(cube[:2] - tgt[:2]))
             trace_lines.append(
                 f"  step {step:3d} phase={phase_name:8s} phase_step={phase_step:3d} "
@@ -108,7 +108,7 @@ def trace_one(model, cx, cy, camera="portfolio"):
         if done:
             break
 
-    target_xyz = np.array([policy.target_xy[0], policy.target_xy[1], 0.010])
+    target_xyz = np.array([policy.target_xy[0], policy.target_xy[1], 0.025])
     ball_final = data.xpos[policy.cube_body_id].copy()
     success = float(np.linalg.norm(ball_final[:2] - target_xyz[:2])) < 0.033
     renderer.close()

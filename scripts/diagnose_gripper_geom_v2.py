@@ -76,10 +76,10 @@ def build_model(with_fixed_finger=True, fixed_finger_pos=None):
             pos=[0.0, 0.25, 0.0], size=[0.35, 0.10, 0.02],
             rgba=[0.85, 0.78, 0.65, 1], condim=3)
 
-        ball = spec.worldbody.add_body(name="cube", pos=[0.30, 0.0, 0.010])
+        ball = spec.worldbody.add_body(name="cube", pos=[0.30, 0.0, 0.025])
         ball.add_joint(name="cube_free", type=mujoco.mjtJoint.mjJNT_FREE)
         ball.add_geom(name="cube_geom", type=mujoco.mjtGeom.mjGEOM_BOX,
-            size=[0.010, 0.010, 0.010], rgba=[0.85, 0.05, 0.05, 1],
+            size=[0.010, 0.010, 0.025], rgba=[0.85, 0.05, 0.05, 1],
             mass=0.30, condim=6, friction=[5.0, 0.5, 0.1],
             solref=[0.01, 1.0], solimp=[0.95, 0.99, 0.001, 0.5, 2],
             contype=BALL_CONTYPE, conaffinity=BALL_CONAFFINITY)
@@ -115,7 +115,7 @@ def build_model(with_fixed_finger=True, fixed_finger_pos=None):
         # Add fixed finger geom and site at custom position
         if with_fixed_finger and gripper_body is not None and fixed_finger_pos is not None:
             gripper_body.add_geom(name="fixed_finger", type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=[0.008, 0.012, 0.010], pos=fixed_finger_pos,
+                size=[0.008, 0.012, 0.025], pos=fixed_finger_pos,
                 rgba=[0.2, 0.8, 0.2, 0.5], friction=[5.0, 0.5, 0.1], condim=6)
             gripper_body.add_site(name="fixed_finger_contact",
                 pos=fixed_finger_pos, size=0.005, rgba=[0.3, 1, 0.3, 0.6])
