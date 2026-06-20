@@ -38,7 +38,7 @@ def main():
     mujoco.mj_resetData(model, data)
     data.qpos[:5] = default_joint_angles(model)
     data.qpos[5] = 1.5
-    data.qpos[CUBE_QPOS_START:CUBE_QPOS_START + 3] = [cx, cy, 0.010]  # cube half-extent on world floor
+    data.qpos[CUBE_QPOS_START:CUBE_QPOS_START + 3] = [cx, cy, 0.025]  # cube half-extent on world floor
     data.qpos[CUBE_QPOS_START + 3:CUBE_QPOS_START + 7] = [1.0, 0.0, 0.0, 0.0]
     mujoco.mj_forward(model, data)
 
@@ -52,7 +52,7 @@ def main():
 
         jaw_q = float(data.qpos[5])
         gap = policy.grasp.gap(data)
-        contact = policy.grasp._has_jaw_ball_contact(model, data)
+        contact = policy.grasp._has_gripper_cube_contact(model, data)
         cube_xyz = data.xpos[policy.cube_body_id].copy()
 
         if 50 <= step <= 360 or info.get("phase") not in (0,):

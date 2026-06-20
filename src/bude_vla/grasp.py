@@ -31,12 +31,12 @@ import numpy as np
 from bude_vla.envs.so101_mjx import CUBE_QPOS_START, CUBE_QPOS_END
 
 CUBE_HALF_EXTENT = 0.010
-ATTACH_GAP_TOLERANCE = 0.025   # wider tolerance since we check midpoint distance
+ATTACH_GAP_TOLERANCE = 0.008   # snap distance < half cube, imperceptible teleport
 ATTACH_DEBOUNCE_STEPS = 3
-JAW_CLOSED_QPOS_THRESHOLD = 0.5
+JAW_CLOSED_QPOS_THRESHOLD = 0.30  # must be meaningfully closed, not just pre-closed
 IK_SEED_JAW_QPOS = 0.30
 RELEASE_JAW_QPOS_THRESHOLD = 1.48
-RELEASE_DRIFT_TOLERANCE = 0.08
+RELEASE_DRIFT_TOLERANCE = 0.015  # 1.5cm max drift before release (was 8cm)
 
 
 @dataclasses.dataclass
@@ -112,16 +112,21 @@ class GraspController:
         return False
 
     def _midpoint(self, data: mujoco.MjData) -> tuple[np.ndarray, int, np.ndarray]:
-        """Compute the midpoint between jaw_contact and fixed_finger_contact
-        sites, the body ID used for local-frame transform, and the body's
-        rotation matrix.
+        """Compute the grip center between jaw_contact and fixed_finger_contact.
 
-        Uses the gripper body for the local-frame transform since both
-        sites are on bodies that are children/descendants of the gripper.
+        The two sites are at different world Z heights due to the gripper
+        body orientation varying with arm config. For horizontal clamping,
+        we use the XY midpoint and set Z to the lower of the two sites
+        (the one closer to the cube).
         """
         jaw_xyz = data.site_xpos[self.jaw_site_id].copy()
         ff_xyz = data.site_xpos[self.ff_site_id].copy()
-        midpoint = (jaw_xyz + ff_xyz) / 2.0
+        # XY midpoint for horizontal centering; Z = lower site (closer to cube)
+        midpoint = np.array([
+            (jaw_xyz[0] + ff_xyz[0]) / 2.0,
+            (jaw_xyz[1] + ff_xyz[1]) / 2.0,
+            min(jaw_xyz[2], ff_xyz[2]),
+        ])
 
         # Use gripper body for local frame (it's the parent of both
         # the fixed finger site and the moving jaw body)

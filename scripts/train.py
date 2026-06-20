@@ -18,7 +18,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+import math
+from torch.optim.lr_scheduler import LambdaLR
 
 from bude_vla.data.lerobot_v3 import BUDETrainingDataset
 from bude_vla.models.policy import BUDEPolicy, BUDEConfig
@@ -153,7 +154,16 @@ def train(
     print(f"  action_norm lo={_action_lo[:3]}  hi={_action_hi[:3]}")
 
     optimizer = AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=n_steps, eta_min=lr * 0.01)
+
+    # Linear warmup then cosine decay — prevents the LR spike that caused
+    # divergence in the 50k run.
+    warmup_steps = 2000
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, n_steps - warmup_steps)
+        return 0.01 + 0.99 * 0.5 * (1.0 + math.cos(math.pi * progress))
+    scheduler = LambdaLR(optimizer, lr_lambda)
 
     step = 0
     epoch = 0
@@ -168,11 +178,13 @@ def train(
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         step = ckpt["step"]
         loss_history = ckpt.get("loss_history", [])
+        # Fast-forward scheduler to current step (LambdaLR stores last_epoch internally)
         for _ in range(step):
             scheduler.step()
         running_loss = 0.0
         dl_iter = iter(dl)
-        print(f"  resumed from step {step}, loss_hist entries={len(loss_history)}")
+        print(f"  resumed from step {step}, lr={scheduler.get_last_lr()[0]:.2e}, "
+              f"loss_hist entries={len(loss_history)}")
 
 
     while step < n_steps:
