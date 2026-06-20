@@ -37,6 +37,9 @@ SUBSTEPS_PER_FRAME = 4  # match video recorder
 def _main_loop(model, data, policy, renderer, cam_ids, max_steps=2000):
     cube_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
     target_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
+    spid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "static_finger_pad")
+    mpid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "moving_finger_pad")
+    cgid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "cube_geom")
 
     images, proprios, actions = [], [], []
     ever_grasped = False
@@ -49,8 +52,22 @@ def _main_loop(model, data, policy, renderer, cam_ids, max_steps=2000):
         wr = np.asarray(renderer.render()).copy()
         images.append(np.concatenate([oh, wr], axis=-1).copy())
 
-        # Proprio: arm joints + gripper
-        proprios.append(data.qpos[ARM_QPOS_START:GRIPPER_QPOS_START + 1].astype(np.float32).copy())
+        # Check if currently grasping (before step — this is the contact signal)
+        contacts = set()
+        for i in range(data.ncon):
+            g1, g2 = data.contact[i].geom1, data.contact[i].geom2
+            if g1 == cgid or g2 == cgid:
+                contacts.add(g2 if g1 == cgid else g1)
+        is_grasping = float(spid in contacts and mpid in contacts)
+        if is_grasping:
+            ever_grasped = True
+
+        # Proprio: arm joints + gripper + contact signal (7 dims)
+        proprio = np.concatenate([
+            data.qpos[ARM_QPOS_START:GRIPPER_QPOS_START + 1],
+            [is_grasping],
+        ]).astype(np.float32)
+        proprios.append(proprio)
 
         # Policy step — returns ctrl, recorder calls mj_step
         ctrl, arm_target, done, info = policy.step(model, data)
@@ -92,7 +109,7 @@ def _main_loop(model, data, policy, renderer, cam_ids, max_steps=2000):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-eps", type=int, default=100)
-    ap.add_argument("--out", default="/home/aditya/bude_vla/data/pick_v7")
+    ap.add_argument("--out", default="/home/aditya/bude_vla/data/pick_v8")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--img-size", type=int, default=64)
     ap.add_argument("--keep-failures", action="store_true")
