@@ -39,18 +39,30 @@ HEIGHT = 480
 FPS = 30
 SUBSTEPS_PER_FRAME = 3
 
+# Phase name mapping for debugging
+PHASE_NAMES = {
+    0: "APPROACH",
+    1: "PRE_CLOSE",
+    2: "DESCENT",
+    3: "GRIP",
+    4: "LIFT",
+    5: "MOVE",
+    6: "RELEASE",
+}
+
 
 def record_one(
     model: mujoco.MjModel,
     cx: float,
     cy: float,
     camera: str = "portfolio",
-) -> tuple[list[np.ndarray], bool, bool]:
+    verbose: bool = False,
+) -> tuple[list[np.ndarray], bool, bool, list[str]]:
     data = mujoco.MjData(model)
     mujoco.mj_resetData(model, data)
     data.qpos[:5] = default_joint_angles(model)
-    data.qpos[5] = 1.5
-    data.qpos[CUBE_QPOS_START : CUBE_QPOS_START + 3] = [cx, cy, 0.0295]
+    data.qpos[GRIPPER_QPOS_START] = 1.5  # jaw wide open
+    data.qpos[CUBE_QPOS_START : CUBE_QPOS_START + 3] = [cx, cy, 0.025]
     data.qpos[CUBE_QPOS_START + 3 : CUBE_QPOS_START + 7] = [1.0, 0.0, 0.0, 0.0]
     mujoco.mj_forward(model, data)
 
@@ -62,13 +74,38 @@ def record_one(
 
     frames: list[np.ndarray] = []
     attached_ever = False
+    phase_log = []
+    last_phase = -1
+    lowest_z_recorded = 999.0
 
-    for step in range(600):
+    for step in range(900):
         ctrl, arm_target, done, info = policy.step(model, data)
         data.ctrl[:] = ctrl
 
         for _ in range(SUBSTEPS_PER_FRAME):
             mujoco.mj_step(model, data)
+
+        # Track lowest gripper z
+        gripper_bid = policy.gripper_body_id
+        mjaw_bid = policy.mjaw_body_id
+        for i in range(model.ngeom):
+            bid = model.geom_bodyid[i]
+            if bid == gripper_bid or bid == mjaw_bid:
+                gz = float(data.geom_xpos[i][2])
+                gtype = model.geom_type[i]
+                if gtype == mujoco.mjtGeom.mjGEOM_BOX:
+                    half_z = float(model.geom_size[i][2])
+                    lowest_z_recorded = min(lowest_z_recorded, gz - half_z)
+                elif gtype == mujoco.mjtGeom.mjGEOM_MESH:
+                    rbound = float(model.geom_rbound[i])
+                    lowest_z_recorded = min(lowest_z_recorded, gz - rbound)
+
+        # Log phase transitions
+        cur_phase = info.get("phase", -1)
+        if cur_phase != last_phase:
+            pname = PHASE_NAMES.get(cur_phase, f"phase_{cur_phase}")
+            phase_log.append(f"step={step}: {pname}")
+            last_phase = cur_phase
 
         if cam_id >= 0:
             renderer.update_scene(data, camera=cam_id)
@@ -82,12 +119,21 @@ def record_one(
         if done:
             break
 
-    target_xyz = np.array([policy.target_xy[0], policy.target_xy[1], 0.0295])
+    if verbose:
+        for msg in phase_log:
+            print(f"    {msg}")
+        print(f"    lowest_gripper_z = {lowest_z_recorded:.4f}")
+        if lowest_z_recorded < 0:
+            print(f"    ⚠ GROUND PENETRATION: {lowest_z_recorded:.4f}")
+        else:
+            print(f"    ✓ No ground penetration")
+
+    target_xyz = np.array([policy.target_xy[0], policy.target_xy[1], 0.010])
     ball_final = data.xpos[policy.cube_body_id].copy()
     success = float(np.linalg.norm(ball_final[:2] - target_xyz[:2])) < 0.033
 
     renderer.close()
-    return frames, attached_ever, success
+    return frames, attached_ever, success, phase_log
 
 
 def main():
@@ -95,6 +141,7 @@ def main():
     ap.add_argument("--camera", default="portfolio")
     ap.add_argument("--attempts", type=int, default=12)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--verbose", action="store_true", help="print phase transitions")
     ap.add_argument(
         "--any-attach",
         action="store_true",
@@ -112,7 +159,9 @@ def main():
     for attempt in range(args.attempts):
         cx = float(rng.uniform(0.285, 0.315))
         cy = float(rng.uniform(-0.015, 0.015))
-        frames, attached, success = record_one(model, cx, cy, camera=args.camera)
+        frames, attached, success, _ = record_one(
+            model, cx, cy, camera=args.camera, verbose=args.verbose,
+        )
 
         if success:
             priority = 2
@@ -141,7 +190,7 @@ def main():
 
     out_dir = os.path.join(os.path.dirname(__file__), "..", "demos", "videos")
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, "grasp_fix_portfolio.mp4")
+    out_path = os.path.join(out_dir, "grasp_v2_portfolio.mp4")
 
     with imageio.get_writer(out_path, fps=FPS, macro_block_size=1) as w:
         for f in best_frames:

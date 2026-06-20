@@ -1,13 +1,3 @@
-"""Inverse-kinematics solvers for SO-101 5-DOF arm via MuJoCo.
-
-Two solvers provided:
-- solve_ik_to_xyz_dls: damped least-squares (Levenberg-Marquardt-like)
-- solve_ik_to_xyz: faster Jacobian-transpose (kept for backwards compat tests)
-
-Orientation-constrained IK added for GRASP phase: with 5 DOF we can control
-3 position + 2 orientation. This prevents the gripper from drifting into
-sideways orientations that push the ball out of the bowl.
-"""
 from __future__ import annotations
 import numpy as np
 import mujoco
