@@ -46,8 +46,8 @@ from bude_vla.envs.so101_mjx import (
 )
 from bude_vla.models.policy import BUDEPolicy, BUDEConfig
 
-BALL_RADIUS = 0.0125
-GROUND_Z = 0.0295
+BALL_RADIUS = 0.010  # must match grasp.py + so101_mjx.py (cube half-extent)
+GROUND_Z = 0.010  # must match so101_mjx.py
 SUCCESS_THRESHOLD = 0.05
 INSTRUCTION = "pick up the red ball and place it in the blue target zone"
 DOMAIN_ID = 0

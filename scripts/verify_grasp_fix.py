@@ -60,7 +60,7 @@ def check_grasp(n_episodes: int, seed: int, diagnose: bool) -> bool:
         mujoco.mj_resetData(model, data)
         data.qpos[:5] = default_joint_angles(model)
         data.qpos[5] = 1.5
-        data.qpos[CUBE_QPOS_START:CUBE_QPOS_START + 3] = [cx, cy, 0.0295]  # Fix B: ball on bowl floor + radius
+        data.qpos[CUBE_QPOS_START:CUBE_QPOS_START + 3] = [cx, cy, 0.010]  # cube half-extent on world floor
         data.qpos[CUBE_QPOS_START + 3:CUBE_QPOS_START + 7] = [1.0, 0.0, 0.0, 0.0]
         mujoco.mj_forward(model, data)
 

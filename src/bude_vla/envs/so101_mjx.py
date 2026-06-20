@@ -43,11 +43,16 @@ import os
 from pathlib import Path
 from typing import Callable
 
-import jax
-import jax.numpy as jnp
 import mujoco
 import numpy as np
-from mujoco import mjx
+
+try:
+    import jax
+    import jax.numpy as jnp
+    from mujoco import mjx
+    _MJX_AVAILABLE = True
+except ImportError:
+    _MJX_AVAILABLE = False
 
 _ARM_SPEC_PATH = (
     Path(__file__).resolve().parents[3] / "urdf" / "so101_official" / "so101_new_calib.xml"
@@ -108,9 +113,21 @@ def _build_composite_spec() -> mujoco.MjSpec:
     try:
         spec = mujoco.MjSpec.from_file(_ARM_SPEC_PATH.name)
 
+        # Tighten solver settings for stable contact physics with the
+        # high-friction cube + dual-finger grasp. Smaller timestep and
+        # more Newton iterations prevent the cube from tunneling through
+        # contact surfaces during fast jaw closure.
+        spec.option.timestep = 0.002
+        spec.option.iterations = 100
+        spec.option.ls_iterations = 50
+        spec.option.solver = mujoco.mjtSolver.mjSOL_NEWTON
+        spec.option.integrator = mujoco.mjtIntegrator.mjINT_EULER
+        spec.option.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
+
         spec.worldbody.add_geom(
             name="floor", type=mujoco.mjtGeom.mjGEOM_PLANE,
             size=[1, 1, 0.05], rgba=[0.7, 0.7, 0.8, 1], condim=3,
+            friction=[1.0, 0.005, 0.0001],
         )
         spec.worldbody.add_geom(
             name="table", type=mujoco.mjtGeom.mjGEOM_BOX,
@@ -118,50 +135,36 @@ def _build_composite_spec() -> mujoco.MjSpec:
             rgba=[0.85, 0.78, 0.65, 1], condim=3,
         )
 
-        # Pick bowl: constrains ball laterally during grasp. Collides with
-        # the ball ONLY (GROUP_BOWL / GROUP_BALL) so it can't obstruct the
-        # gripper reaching in -- previously it used the engine default,
-        # which meant it physically collided with the robot too.
-        pick_bowl = spec.worldbody.add_body(name="pick_bowl", pos=[0.30, 0.0, 0.016])
-        pick_bowl.add_geom(
-            name="pick_bowl_floor",
-            type=mujoco.mjtGeom.mjGEOM_CYLINDER,
-            size=[0.022, 0.001],
-            rgba=[0.45, 0.45, 0.50, 1],
-            contype=BOWL_CONTYPE,
-            conaffinity=BOWL_CONAFFINITY,
-            condim=3,
-        )
-        _add_ring_wall(
-            pick_bowl, radius=0.026, wall_height=0.016, z_center=0.008,
-            n_segments=20, thickness=0.0015, rgba=[0.40, 0.40, 0.45, 1],
-            contype=BOWL_CONTYPE, conaffinity=BOWL_CONAFFINITY,
-            name_prefix="pick_bowl_rim",
+        # Small pedestal to raise the cube off the floor.
+        # Without this, the SO-101 gripper cannot reach a cube on the floor
+        # without the gripper body penetrating the ground (the motor housing
+        # and gripper mesh extend ~30mm below the fingertips).
+        # The pedestal is 15mm tall, so the cube center is at z=0.025
+        # and the cube top is at z=0.035.
+        spec.worldbody.add_geom(
+            name="pick_pedestal", type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+            pos=[0.30, 0.0, 0.0075], size=[0.025, 0.0075],
+            rgba=[0.6, 0.6, 0.6, 1], condim=3,
         )
 
-        # 25 mm-diameter ball (50 mm cube won't fit between the closed jaws).
-        # Body remains named "cube" to avoid sweeping ik.py, recorder, and
-        # recorded .npz schema; treat "cube" as the historical alias for the
-        # pick payload.
-        # contype/conaffinity explicitly set (rather than relying on the
-        # engine default) so it's clear this is the one body that needs to
-        # collide with BOTH the robot/floor/table group AND the bowl group.
-        ball = spec.worldbody.add_body(name="cube", pos=[0.30, 0.0, 0.030])
+        # 20 mm cube (half-extent 0.010) on the pedestal.
+        ball = spec.worldbody.add_body(name="cube", pos=[0.30, 0.0, 0.025])
         ball.add_joint(name="cube_free", type=mujoco.mjtJoint.mjJNT_FREE)
         ball.add_geom(
             name="cube_geom",
-            type=mujoco.mjtGeom.mjGEOM_SPHERE,
-            size=[0.0125],
+            type=mujoco.mjtGeom.mjGEOM_BOX,
+            size=[0.010, 0.010, 0.010],
             rgba=[0.85, 0.05, 0.05, 1],
-            mass=0.05,
-            condim=4,
-            solref=[0.02, 1.0],
-            solimp=[0.9, 0.95, 0.001, 0.5, 2],
+            mass=0.30,
+            condim=6,
+            friction=[5.0, 0.5, 0.1],
+            solref=[0.01, 1.0],
+            solimp=[0.95, 0.99, 0.001, 0.5, 2],
             contype=BALL_CONTYPE,
             conaffinity=BALL_CONAFFINITY,
         )
 
-        tgt = spec.worldbody.add_body(name="target_zone", pos=[0.30, 0.40, 0.021])
+        tgt = spec.worldbody.add_body(name="target_zone", pos=[0.32, 0.16, 0.021])
         tgt.add_geom(
             name="target_zone_disc", type=mujoco.mjtGeom.mjGEOM_BOX,
             size=[0.06, 0.06, 0.002], rgba=[0.1, 0.3, 0.95, 1],
@@ -180,19 +183,20 @@ def _build_composite_spec() -> mujoco.MjSpec:
         # the pick bowl: it collides with the ball, never the robot, so it
         # actually catches and holds the dropped ball while staying out of
         # the arm's way.
-        bowl = spec.worldbody.add_body(name="bowl", pos=[0.30, 0.40, 0.016])
+        bowl = spec.worldbody.add_body(name="bowl", pos=[0.32, 0.16, 0.016])
         bowl.add_geom(
             name="bowl_floor",
             type=mujoco.mjtGeom.mjGEOM_CYLINDER,
-            size=[0.028, 0.001],
+            size=[0.032, 0.002],
             rgba=[0.30, 0.30, 0.36, 1],
             contype=BOWL_CONTYPE,
             conaffinity=BOWL_CONAFFINITY,
-            condim=3,
+            condim=6,
+            friction=[5.0, 0.5, 0.1],
         )
         _add_ring_wall(
-            bowl, radius=0.033, wall_height=0.020, z_center=0.010,
-            n_segments=20, thickness=0.0015, rgba=[0.25, 0.25, 0.30, 1],
+            bowl, radius=0.038, wall_height=0.040, z_center=0.020,
+            n_segments=24, thickness=0.003, rgba=[0.25, 0.25, 0.30, 1],
             contype=BOWL_CONTYPE, conaffinity=BOWL_CONAFFINITY,
             name_prefix="bowl_rim",
         )
@@ -267,6 +271,30 @@ def _build_composite_spec() -> mujoco.MjSpec:
             fovy=90,
         )
 
+        # Fixed finger (static opposing surface on the gripper body).
+        # The moving jaw rotates about its hinge and pushes the cube against
+        # this fixed finger. Without it the cube has nothing to clamp
+        # against — the jaw just shoves it sideways.
+        # Position: mirror of the moving jaw's fingertip across the jaw
+        # hinge axis, in gripper-local frame. The moving jaw's collision
+        # box sits at jaw-local [-0.001, -0.025, 0.019]; the hinge is at
+        # the jaw body origin. The fixed finger goes on the opposite side
+        # of the hinge so the cube gets pinched between the two surfaces.
+        gripper_body = next(
+            (b for b in spec.worldbody.find_all(mujoco.mjtObj.mjOBJ_BODY)
+             if b.name == "gripper"), None,
+        )
+        if gripper_body is not None:
+            gripper_body.add_geom(
+                name="fixed_finger",
+                type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=[0.008, 0.012, 0.010],
+                pos=[-0.012, -0.0002, -0.048],
+                rgba=[0.2, 0.8, 0.2, 0.5],
+                friction=[5.0, 0.5, 0.1],
+                condim=6,
+            )
+
         # Site on the moving-jaw body at the finger-tip contact surface.
         jaw_body = next(
             (b for b in spec.worldbody.find_all(mujoco.mjtObj.mjOBJ_BODY)
@@ -279,6 +307,14 @@ def _build_composite_spec() -> mujoco.MjSpec:
                 size=0.005,
                 rgba=[1, 0.3, 0.3, 0.6],
             )
+            # Second contact site on the fixed finger for dual-contact grasp.
+            if gripper_body is not None:
+                gripper_body.add_site(
+                    name="fixed_finger_contact",
+                    pos=[-0.012, -0.0002, -0.048],
+                    size=0.005,
+                    rgba=[0.3, 1, 0.3, 0.6],
+                )
 
         spec.worldbody.add_site(
             name="workspace_origin", pos=[0.30, 0.20, 0.04],
@@ -329,6 +365,11 @@ class SO101MJMJX:
     """JAX/jnp interface to the SO-101 pick scene."""
 
     def __init__(self, xml_path: str | Path | None = None):
+        if not _MJX_AVAILABLE:
+            raise ImportError(
+                "SO101MJMJX requires jax and mujoco.mjx. "
+                "Install with: pip install jax jaxlib mujoco-mjx"
+            )
         self.model_mj = load_arm_model(xml_path)
         self.model = mjx.put_model(self.model_mj)
         self.n_arm = N_ARM_JOINTS

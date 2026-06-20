@@ -5,9 +5,9 @@
   Layout strategy:
     - Arm base sits at world origin (per upstream URDF). The cube and table
       positions are tuned around there.
-    - Cube rest position: (0.30, 0.0, 0.04) — on the floor in front of the
-      base, within the gripper's reach envelope.
-    - Target zone: (0.30, 0.40, 0.02).
+    - Cube rest position: (0.30, 0.0, 0.01) — on the floor in front of the
+      base, within the gripper's reach envelope. 20mm cube, half-extent 0.010.
+    - Target zone: (0.32, 0.16, 0.021).
     - Cameras frame the cube/target area.
 
   This file is the single MJCF entry point; urdf/so101_official/so101_new_calib.xml
@@ -17,7 +17,8 @@
 <mujoco model="so101_pick_scene">
   <compiler angle="radian" meshdir="so101_official/assets" autolimits="true"/>
 
-  <option timestep="0.005" iterations="50" solver="Newton" integrator="Euler" cone="pyramidal"/>
+  <option timestep="0.002" iterations="100" ls_iterations="50"
+          solver="Newton" integrator="Euler" cone="pyramidal"/>
 
   <visual>
     <global offheight="1024" offwidth="1024"/>
@@ -28,7 +29,6 @@
 
   <default>
     <motor ctrlrange="-1 1" ctrllimited="true"/>
-    <!-- Override the upstream damping/friction for MJX-friendly numericals. -->
     <joint damping="1.5" armature="0.3" frictionloss="0.1"/>
   </default>
 
@@ -48,90 +48,56 @@
   <worldbody>
     <light directional="true" diffuse=".9 .9 .9" specular=".3 .3 .3" pos="0 0 5" dir="0 0 -1"/>
     <light directional="true" diffuse=".5 .5 .5" specular="0 0 0" pos="2 -2 3" dir="-0.5 0.5 -1"/>
+    <light directional="true" diffuse=".3 .3 .3" specular="0 0 0" pos="-1 1 2" dir="0.3 -0.3 -1"/>
 
-    <geom name="floor" pos="0 0 0" size="1 1 0.05" type="plane" material="matplane" condim="3"/>
+    <geom name="floor" pos="0 0 0" size="1 1 0.05" type="plane" material="matplane"
+          condim="3" friction="1.0 0.005 0.0001"/>
 
-    <!-- Table behind the cube so the workspace has visual depth without
-         interfering with the arm's reach envelope. -->
     <geom name="table" pos="0.0 0.25 0.0" size="0.35 0.10 0.02" type="box"
           material="mat_table" condim="3"/>
 
-    <!-- Low pedestal to raise ball into the arm's comfortable reach envelope. -->
-    <geom name="pedestal" pos="0.30 0.0 0.02" size="0.025 0.025 0.02" type="box"
-          rgba="0.6 0.6 0.65 1" condim="3"/>
-
-    <!-- 25 mm-diameter red ball (body named "cube" for backward compat).
-         friction="2 0.05 0.005" deliberately higher than MuJoCo's slippery
-         default to keep the ball wedged against the moving jaw as the gripper
-         ramps closed (verified empirically during V4-V8 tuning — see
-         docs/GRASP_FAILURE_INVESTIGATION.md notes). -->
-    <body name="cube" pos="0.30 0.0 0.065">
+    <!-- 20 mm cube (half-extent 0.010). Heavy, high-friction for stable grasp.
+         friction="5 0.5 0.1": very high sliding friction to prevent slip.
+         solref/solimp: stiff contact to prevent interpenetration.
+         condim=6: full contact (sliding + torsional friction). -->
+    <body name="cube" pos="0.30 0.0 0.010">
       <freejoint name="cube_free"/>
-      <geom name="cube_geom" type="sphere" size="0.0125"
-            rgba="0.85 0.05 0.05 1" mass="0.05" condim="4"
-            friction="2 0.05 0.005"
-            solref="0.02 1.0" solimp="0.9 0.95 0.001 0.5 2"/>
+      <geom name="cube_geom" type="box" size="0.010 0.010 0.010"
+            rgba="0.85 0.05 0.05 1" mass="0.30" condim="6"
+            friction="5.0 0.5 0.1"
+            solref="0.01 1.0" solimp="0.95 0.99 0.001 0.5 2"/>
     </body>
 
-    <!-- Push target zone: thin blue disc/box (MJX can't collide with cylinders).
-         Solid saturated blue + a near-white inner ring so it pops visually. -->
-    <body name="target_zone" pos="0.30 0.22 0.021">
+    <!-- Target zone: blue disc + white inner ring. -->
+    <body name="target_zone" pos="0.32 0.16 0.021">
       <geom name="target_zone_disc" type="box" size="0.06 0.06 0.002"
             rgba="0.1 0.3 0.95 1" contype="0" conaffinity="0"/>
       <geom name="target_zone_inner" type="box" size="0.025 0.025 0.003"
             rgba="0.95 0.95 1.0 1" pos="0 0 0.0005" contype="0" conaffinity="0"/>
     </body>
 
-    <!-- Cameras, positioned to frame the new workspace center (~0.30, 0.20, 0.04).
-         Same camera names as the old scene; xyaxes will need re-derivation later
-         if critical, but visually they're fine for boot-time smoke checks. -->
+    <!-- Bowl at target to catch the dropped cube. -->
+    <body name="bowl" pos="0.32 0.16 0.016">
+      <geom name="bowl_floor" type="cylinder" size="0.028 0.001"
+            rgba="0.30 0.30 0.36 1" contype="4" conaffinity="2" condim="3"/>
+    </body>
+
+    <!-- Cameras -->
     <camera name="over_shoulder" pos="-0.05 0.55 0.50" xyaxes="-0.74 -0.67 0 0.22 -0.24 0.95"
             mode="fixed" fovy="48"/>
     <camera name="pov" pos="0.40 -0.30 0.65" xyaxes="0.93 -0.37 0 0.21 0.51 0.84"
             mode="fixed" fovy="55"/>
     <camera name="front_top" pos="0.30 0.0 0.80" xyaxes="0 -1 0 0.94 0 0.34"
             mode="fixed" fovy="42"/>
-    <!--
-      WRIST (EYE-IN-HAND) CAMERA
-      ===========================
-      This camera CANNOT be declared here because it must be a child element
-      of the arm's end-effector body ("Fixed_Jaw" in so101_new_calib.xml) so
-      that MuJoCo parents its pose to the gripper rather than the world frame.
-
-      MJCF <include> tags do not allow the parent file to inject children into
-      a body defined inside the included file.  Two options:
-
-        Option A — preferred: use the MjSpec Python API (_build_composite_spec
-          in so101_mjx.py), which calls spec.find("body","Fixed_Jaw") and then
-          ee_body.add_camera(...).  The Python path already does this correctly.
-
-        Option B — embed directly: add the following block inside the
-          <body name="Fixed_Jaw"> element in so101_official/so101_new_calib.xml:
-
-            <camera name="wrist"
-                    pos="0 -0.02 0.04"
-                    xyaxes="1 0 0  0 0 1"
-                    fovy="60"/>
-
-      A static world-frame wrist camera (the old entry) is purposely omitted
-      here because it produced a view that never tracked the arm's pose.
-    -->
     <camera name="portfolio" pos="-0.2 -1.0 0.85" xyaxes="0.83 -0.56 0 0.18 0.28 0.94"
             mode="fixed" fovy="36"/>
 
-    <!-- Workspace origin marker on the floor. -->
     <site name="workspace_origin" pos="0.30 0.20 0.04" size="0.01" rgba="0 1 0 0.5"/>
 
-    <!-- Arm inclusion. The SO-101 URDF root body "base" sits at world origin,
-         so the arm physically occupies space around (0, 0, 0) and reaches
-         forward toward +x and +y. -->
+    <!-- Arm inclusion -->
     <include file="so101_official/so101_new_calib.xml"/>
   </worldbody>
 
-  <!-- Re-override the upstream position motors with smaller gains so the SO-101
-       PD-style position actuators (kp=50 default) don't saturate under a 0..1
-       ctrl signal. We map every arm revolute + the gripper into a single
-       ctrl vector of length 6, matching the new action dim. -->
   <actuator>
     <motor name="shoulder_pan_motor" joint="shoulder_pan" gear="60" ctrlrange="-1 1"/>
     <motor name="shoulder_lift_motor" joint="shoulder_lift" gear="60" ctrlrange="-1 1"/>

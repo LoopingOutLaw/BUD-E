@@ -36,7 +36,7 @@ mujoco.mj_resetData(model, data)
 
 data.qpos[ARM_QPOS_START:ARM_QPOS_END] = default_joint_angles(model)
 data.qpos[GRIPPER_QPOS_START] = 1.5
-GROUND_Z = 0.0295
+GROUND_Z = 0.010  # cube half-extent on world floor -- must match grasp.py + scripted_pick_and_place.py
 ball_xyz = np.array([0.30, 0.0, GROUND_Z])
 data.qpos[CUBE_QPOS_START:CUBE_QPOS_START + 3] = ball_xyz
 data.qpos[CUBE_QPOS_START + 3:CUBE_QPOS_START + 7] = [1, 0, 0, 0]
