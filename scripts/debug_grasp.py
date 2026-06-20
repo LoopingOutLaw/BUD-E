@@ -19,7 +19,7 @@ def main():
     mujoco.mj_resetData(model, data)
     data.qpos[:5] = default_joint_angles(model)
     data.qpos[GRIPPER_QPOS_START] = 1.5
-    data.qpos[CUBE_QPOS_START:CUBE_QPOS_START+3] = [0.30, 0.0, 0.010]
+    data.qpos[CUBE_QPOS_START:CUBE_QPOS_START+3] = [0.30, 0.0, 0.025]
     data.qpos[CUBE_QPOS_START+3:CUBE_QPOS_START+7] = [1.0, 0.0, 0.0, 0.0]
     mujoco.mj_forward(model, data)
 

@@ -17,3 +17,4 @@ data/
 *.mp4
 *.parquet
 .DS_Store
+__pycache__/
