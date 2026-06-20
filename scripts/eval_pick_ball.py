@@ -123,7 +123,10 @@ def is_failure(data, step) -> bool:
 
 
 def build_batch(image: np.ndarray, proprio: np.ndarray,
-                text_ids: np.ndarray, device: str) -> dict:
+                text_ids: np.ndarray, device: str,
+                n_history_frames: int = 1) -> dict:
+    # For n_history_frames > 1: image is already stacked (H, W, n_h*6)
+    # For n_history_frames == 1: image is just (H, W, 6)
     img = torch.from_numpy(image.astype(np.float32)).permute(2, 0, 1) / 255.0
     return {
         "images": img.unsqueeze(0).to(device),
@@ -166,6 +169,8 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
     gripperframe_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
 
     use_contact_signal = (cfg.state_dim == 7)
+    n_h = cfg.n_history_frames
+    C_single = 6  # single-frame dual-cam channels
 
     for ep in range(num_episodes):
         cx = float(rng.uniform(0.22, 0.28))
@@ -183,6 +188,7 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
         chunk = None
         cursor = 0
         ever_grasped = False
+        img_buffer = []  # reset per episode
 
         for step in range(MAX_STEPS):
             # Render from SAME cameras as training
@@ -191,6 +197,20 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
             obs_renderer.update_scene(data, camera=wrist_cam)
             img_wrist = np.asarray(obs_renderer.render()).copy()
             img = np.concatenate([img_top, img_wrist], axis=-1)
+
+            # Frame stacking for n_history_frames (matches training exactly)
+            img_buffer.append(img)
+            if len(img_buffer) > n_h:
+                img_buffer = img_buffer[-n_h:]
+            if n_h <= 1:
+                stacked_img = img
+            else:
+                # Pad early frames by repeating the first captured frame
+                while len(img_buffer) < n_h:
+                    img_buffer.insert(0, img_buffer[0])
+                window = np.stack(img_buffer, axis=0)  # (n_h, H, W, C_single)
+                stacked_img = window.reshape(window.shape[1], window.shape[2],
+                                            n_h * C_single)  # (H, W, n_h*6)
 
             vid_renderer.update_scene(data, camera=vid_cam)
             vid_frame = np.asarray(vid_renderer.render()).copy()
@@ -211,8 +231,9 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
             else:
                 arm_proprio = data.qpos[ARM_QPOS_START:GRIPPER_QPOS_END].astype(np.float32).copy()
 
-            batch = build_batch(img, arm_proprio, text_ids, device)
-            if chunk is None or cursor >= chunk.shape[0]:
+            batch = build_batch(stacked_img, arm_proprio, text_ids, device,
+                                n_history_frames=n_h)
+            if chunk is None or cursor >= cfg.chunk_size:
                 chunk = policy.sample(batch)[0].detach().cpu().numpy()
                 cursor = 0
             a = chunk[cursor]
