@@ -46,10 +46,12 @@ def _tokenize_instruction(text: str, max_len: int = _TEXT_MAX_LEN) -> np.ndarray
 
 
 def _domain_from_instruction(text: str) -> int:
-    """Heuristic: reach=0, push=1."""
+    """Heuristic: reach=0, push=1, pick=2."""
     t = text.lower()
     if "push" in t:
         return 1
+    if "pick" in t:
+        return 2
     return 0
 
 
@@ -120,8 +122,8 @@ def write_episode(root: str | Path, episode: dict) -> Path:
     T = images.shape[0]
     assert proprio.shape[0] == T, f"proprio length {proprio.shape[0]} != T {T}"
     state_dim = int(proprio.shape[1])
-    assert state_dim == 6, (
-        f"proprio dim {state_dim} != 6 (expected arm+gripper)"
+    assert state_dim in (6, 7), (
+        f"proprio dim {state_dim} not in (6, 7) (expected arm+gripper or arm+gripper+contact)"
     )
 
     # Find next episode_idx
