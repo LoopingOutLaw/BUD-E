@@ -91,6 +91,64 @@ def build_dataloader(roots: list[str | Path], chunk_size: int = 4,
     return dl
 
 
+def run_closed_loop_eval(policy, cfg, action_lo, action_hi, device,
+                          num_episodes: int = 5,
+                          max_steps_per_try: int = 300,
+                          max_tries: int = 1,
+                          seed: int = 123,
+                          eval_state: dict | None = None) -> tuple[float, int, int]:
+    """Run closed-loop pick rollouts with current policy weights.
+
+    Returns (success_rate, n_success, n_episodes). Caches MuJoCo model +
+    PolicyRolloutRunner in eval_state across calls to avoid repeated EGL
+    context creation.
+    """
+    os.environ.setdefault("MUJOCO_GL", "egl")
+    import mujoco
+    from bude_vla.env_runner import PolicyRolloutRunner
+    from bude_vla.envs.so101_mjx import load_arm_model
+
+    was_training = policy.training
+    policy.eval()
+
+    if eval_state is None:
+        eval_state = {}
+
+    if "model" not in eval_state:
+        eval_state["model"] = load_arm_model()
+        eval_state["data"] = mujoco.MjData(eval_state["model"])
+        eval_state["runner"] = PolicyRolloutRunner(
+            eval_state["model"],
+            img_size=cfg.img_size,
+            max_steps_per_try=max_steps_per_try,
+            max_tries=max_tries,
+            device=device,
+            action_lo=action_lo,
+            action_hi=action_hi,
+            n_history_frames=cfg.n_history_frames,
+            state_dim=cfg.state_dim,
+        )
+
+    runner = eval_state["runner"]
+    data = eval_state["data"]
+
+    rng = np.random.default_rng(seed)
+    n_success = 0
+    for _ in range(num_episodes):
+        cube_xy = np.array([
+            float(rng.uniform(0.15, 0.35)),
+            float(rng.uniform(-0.10, 0.10)),
+        ])
+        result = runner.run_one(data, policy, cube_xy)
+        n_success += int(result.success)
+
+    if was_training:
+        policy.train()
+
+    rate = n_success / num_episodes if num_episodes > 0 else 0.0
+    return rate, n_success, num_episodes
+
+
 def train(
     data_roots: list[str] | None = None,
     ckpt_dir: str = "/home/aditya/bude_vla/checkpoints",
@@ -112,6 +170,11 @@ def train(
     use_dinov2: bool = False,
     use_minilm: bool = False,
     n_history_frames: int = 1,
+    eval_every: int = 0,
+    eval_episodes: int = 5,
+    eval_max_steps: int = 300,
+    eval_max_tries: int = 1,
+    eval_seed: int = 123,
 ):
     if data_roots is None:
         data_roots = ["/home/aditya/bude_vla/data/reach_v3",
@@ -197,6 +260,8 @@ def train(
     t0 = time.time()
     dl_iter = iter(dl)
     loss_history = []
+    eval_history = []
+    eval_state: dict = {}
 
     if resume is not None:
         ckpt = torch.load(resume, map_location=device, weights_only=False)
@@ -204,6 +269,7 @@ def train(
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         step = ckpt["step"]
         loss_history = ckpt.get("loss_history", [])
+        eval_history = ckpt.get("eval_history", [])
         # Fast-forward scheduler using optimizer-update units (not microbatch)
         opt_steps_done = step // grad_accum_steps
         for _ in range(opt_steps_done):
@@ -257,6 +323,19 @@ def train(
                   f"{sps:.1f} steps/s | epoch {epoch}")
             running_loss = 0.0
 
+        if eval_every > 0 and step > 0 and step % eval_every == 0:
+            eval_rate, eval_n_success, eval_n_total = run_closed_loop_eval(
+                policy, cfg, _action_lo, _action_hi, device,
+                num_episodes=eval_episodes,
+                max_steps_per_try=eval_max_steps,
+                max_tries=eval_max_tries,
+                seed=eval_seed,
+                eval_state=eval_state,
+            )
+            eval_history.append((step, eval_rate))
+            print(f"  [eval] step {step:6d} | closed-loop success "
+                  f"{eval_n_success}/{eval_n_total} ({eval_rate*100:.0f}%)")
+
         if step % save_every == 0:
             ckpt_path = ckpt_dir / f"{task_name}_step_{step:06d}.pt"
             torch.save({
@@ -264,6 +343,7 @@ def train(
                 "model_state_dict": policy.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "loss_history": loss_history,
+                "eval_history": eval_history,
                 "action_norm_lo": _action_lo.tolist(),
                 "action_norm_hi": _action_hi.tolist(),
                 "config": {
@@ -291,6 +371,7 @@ def train(
         "model_state_dict": policy.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "loss_history": loss_history,
+        "eval_history": eval_history,
         "action_norm_lo": _action_lo.tolist(),
         "action_norm_hi": _action_hi.tolist(),
         "config": {
@@ -304,6 +385,9 @@ def train(
         },
     }, final_ckpt)
     print(f"Training done in {time.time()-t0:.0f}s. Final checkpoint: {final_ckpt}")
+
+    if "runner" in eval_state:
+        eval_state["runner"].close()
 
     return policy
 
@@ -350,6 +434,20 @@ if __name__ == "__main__":
     parser.add_argument("--n-history-frames", type=int, default=1,
                         help="Number of stacked history frames per observation. "
                              "1=Markovian (default), 2=allows velocity inference.")
+    parser.add_argument("--eval-every", type=int, default=0,
+                        help="Run closed-loop pick-and-place eval every N steps "
+                             "(0 = disabled). Recommended: same as --save-every.")
+    parser.add_argument("--eval-episodes", type=int, default=5,
+                        help="Cube positions per closed-loop eval pass.")
+    parser.add_argument("--eval-max-steps", type=int, default=300,
+                        help="Max env steps per eval episode (shorter than "
+                             "the 4000 used in eval_pick_ball.py — cheap "
+                             "progress signal, not a final benchmark).")
+    parser.add_argument("--eval-max-tries", type=int, default=1,
+                        help="Retries per eval episode. 1 = single-shot.")
+    parser.add_argument("--eval-seed", type=int, default=123,
+                        help="Fixed seed for eval cube positions so success "
+                             "curves are comparable across checkpoints.")
     args = parser.parse_args()
 
     roots = args.data_root
@@ -374,4 +472,9 @@ if __name__ == "__main__":
         use_dinov2=args.use_dinov2,
         use_minilm=args.use_minilm,
         n_history_frames=args.n_history_frames,
+        eval_every=args.eval_every,
+        eval_episodes=args.eval_episodes,
+        eval_max_steps=args.eval_max_steps,
+        eval_max_tries=args.eval_max_tries,
+        eval_seed=args.eval_seed,
     )
