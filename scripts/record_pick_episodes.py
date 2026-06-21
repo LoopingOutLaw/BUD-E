@@ -77,10 +77,10 @@ def _main_loop(model, data, policy, renderer, cam_ids, max_steps=2000):
         if info.get("attached"):
             ever_grasped = True
 
-        # Action = target arm qpos + gripper ctrl (what the policy intended)
+        # Action = target arm ctrl + gripper ctrl (what the policy commanded)
         action = np.concatenate([
-            data.qpos[ARM_QPOS_START:ARM_QPOS_END],
-            [data.ctrl[GRIPPER_QPOS_START]],
+            ctrl[ARM_QPOS_START:ARM_QPOS_END],
+            [ctrl[GRIPPER_QPOS_START]],
         ]).astype(np.float32)
         actions.append(action)
 

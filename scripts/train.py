@@ -178,8 +178,10 @@ def train(
     eval_seed: int = 123,
 ):
     if data_roots is None:
-        data_roots = ["/home/aditya/bude_vla/data/reach_v3",
-                      "/home/aditya/bude_vla/data/push_v3"]
+        raise ValueError(
+            "Must specify --data-root. Default reach+push data is not "
+            "appropriate for pick-and-place training."
+        )
     ckpt_dir = Path(ckpt_dir) / task_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     video_dir = Path(video_dir)
@@ -269,6 +271,8 @@ def train(
         ckpt = torch.load(resume, map_location=device, weights_only=False)
         policy.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scaler_state_dict" in ckpt:
+            scaler.load_state_dict(ckpt["scaler_state_dict"])
         step = ckpt["step"]
         loss_history = ckpt.get("loss_history", [])
         eval_history = ckpt.get("eval_history", [])
@@ -344,6 +348,7 @@ def train(
                 "step": step,
                 "model_state_dict": policy.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
                 "loss_history": loss_history,
                 "eval_history": eval_history,
                 "action_norm_lo": _action_lo.tolist(),
@@ -374,6 +379,7 @@ def train(
         "step": step,
         "model_state_dict": policy.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
         "loss_history": loss_history,
         "eval_history": eval_history,
         "action_norm_lo": _action_lo.tolist(),
