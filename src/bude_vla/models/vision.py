@@ -140,9 +140,11 @@ class DINOv2Tower(nn.Module):
         pass
 
     def _freeze_blocks(self, finetune_blocks: int) -> None:
-        for block in self.backbone.blocks:
+        total = len(self.backbone.blocks)
+        for i, block in enumerate(self.backbone.blocks):
+            requires_grad = i >= (total - finetune_blocks)
             for p in block.parameters():
-                p.requires_grad = True
+                p.requires_grad = requires_grad
         if hasattr(self.backbone, "norm"):
             for p in self.backbone.norm.parameters():
                 p.requires_grad = True
