@@ -33,7 +33,7 @@ import torch
 from pathlib import Path
 
 from bude_vla.data.action_normalization import denormalize_actions
-from bude_vla.data.lerobot_v3 import _tokenize_instruction
+from bude_vla.data.lerobot_v3 import _tokenize_instruction, _domain_from_instruction
 from bude_vla.envs.so101_mjx import (
     ARM_QPOS_START, ARM_QPOS_END,
     GRIPPER_QPOS_START, GRIPPER_QPOS_END,
@@ -100,7 +100,8 @@ def reset_arm(model, data):
     ])
     data.qpos[GRIPPER_QPOS_START:GRIPPER_QPOS_END] = 0.3  # partially open
     data.qvel[ARM_QPOS_START:GRIPPER_QPOS_END] = 0.0
-    data.ctrl[:] = 0.0
+    data.ctrl[ARM_QPOS_START:ARM_QPOS_END] = data.qpos[ARM_QPOS_START:ARM_QPOS_END]  # hold pose during settle
+    data.ctrl[GRIPPER_QPOS_START] = 0.3
     mujoco.mj_forward(model, data)
 
 
@@ -136,7 +137,7 @@ def build_batch(image: np.ndarray, proprio: np.ndarray,
         "text_ids": torch.from_numpy(text_ids).unsqueeze(0).to(device),
         "instruction": [INSTRUCTION],
         "proprio": torch.from_numpy(proprio.astype(np.float32)).unsqueeze(0).to(device),
-        "domain_id": torch.tensor([0], dtype=torch.long).to(device),
+        "domain_id": torch.tensor([_domain_from_instruction(INSTRUCTION)], dtype=torch.long).to(device),
     }
 
 
@@ -214,8 +215,9 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
                 while len(img_buffer) < n_h:
                     img_buffer.insert(0, img_buffer[0])
                 window = np.stack(img_buffer, axis=0)  # (n_h, H, W, C_single)
-                stacked_img = window.reshape(window.shape[1], window.shape[2],
-                                            n_h * C_single)  # (H, W, n_h*6)
+                window = np.ascontiguousarray(window)
+                stacked_img = np.transpose(window, (1, 2, 0, 3)).reshape(
+                    window.shape[1], window.shape[2], n_h * C_single)
 
             vid_renderer.update_scene(data, camera=vid_cam)
             vid_frame = np.asarray(vid_renderer.render()).copy()
@@ -261,13 +263,11 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
                 arm_target = np.array([0.0, -0.5, 0.95, np.pi/2, np.pi/2])
                 gripper_ctrl = 0.3
 
-            # Execute: kinematic arm + physics gripper (matches training EXACTLY)
-            # Training sets data.ctrl[:] from policy, where ctrl[0:5] are always 0.0
-            # and ctrl[5] is the gripper actuator value.
-            data.qpos[ARM_QPOS_START:ARM_QPOS_END] = arm_target
-            data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0.0
-            data.ctrl[:N_ARM_JOINTS] = 0.0          # arm actuators OFF (kinematic)
-            data.ctrl[N_ARM_JOINTS] = gripper_ctrl  # only gripper actuator
+            # Execute: position actuators drive arm smoothly (matches training)
+            # Training uses ctrl[:5] = arm_target (sts3215 position actuator, kp=998.22)
+            # and ctrl[5] = gripper_ctrl. No kinematic teleport.
+            data.ctrl[:N_ARM_JOINTS] = arm_target
+            data.ctrl[N_ARM_JOINTS] = gripper_ctrl
 
             for _ in range(SUBSTEPS_PER_FRAME):
                 mujoco.mj_step(model, data)
