@@ -86,7 +86,8 @@ def _carry_cube_with(model, data):
 
 def _reset_arm_to_home(model, data):
     data.qpos[ARM_QPOS_START:ARM_QPOS_END] = HOME_QPOS[:ARM_QPOS_END]
-    data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0.0
+    data.qpos[GRIPPER_QPOS_START:GRIPPER_QPOS_END] = 0.3
+    data.qvel[ARM_QPOS_START:GRIPPER_QPOS_END] = 0.0
     data.ctrl[:] = 0.0
     mujoco.mj_forward(model, data)
 
