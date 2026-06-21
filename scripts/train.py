@@ -156,34 +156,38 @@ def train(
             break
     print(f"  action_norm lo={_action_lo[:3]}  hi={_action_hi[:3]}")
 
-    # Differential LR: pretrained backbone gets backbone_lr, new modules get lr
-    backbone_params = []
-    head_params = []
+    # Differential LR: pretrained DINOv2 backbone gets backbone_lr,
+    # new modules (proj, text, proprio, backbone transformer, action head) get lr.
+    pretrained_params = []
+    new_params = []
     for name, p in policy.named_parameters():
         if not p.requires_grad:
             continue
-        if "vision" in name and use_dinov2:
-            backbone_params.append(p)
+        if use_dinov2 and "vision.backbone" in name:
+            pretrained_params.append(p)
         else:
-            head_params.append(p)
+            new_params.append(p)
     param_groups = [
-        {"params": backbone_params, "lr": backbone_lr},
-        {"params": head_params, "lr": lr},
+        {"params": pretrained_params, "lr": backbone_lr},
+        {"params": new_params, "lr": lr},
     ]
     optimizer = AdamW(param_groups, weight_decay=weight_decay)
-    print(f"  backbone params: {sum(p.numel() for p in backbone_params):,} (lr={backbone_lr})")
-    print(f"  head params: {sum(p.numel() for p in head_params):,} (lr={lr})")
+    print(f"  pretrained backbone params: {sum(p.numel() for p in pretrained_params):,} (lr={backbone_lr})")
+    print(f"  new module params: {sum(p.numel() for p in new_params):,} (lr={lr})")
     print(f"  effective batch size: {batch_size * grad_accum_steps}")
 
     scaler = GradScaler()
 
-    # Linear warmup then cosine decay — prevents the LR spike that caused
-    # divergence in the 50k run.
-    warmup_steps = 2000
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return step / max(1, warmup_steps)
-        progress = (step - warmup_steps) / max(1, n_steps - warmup_steps)
+    # Scheduler in optimizer-update units (not microbatch units).
+    # With grad_accum_steps > 1, scheduler.step() fires once per accumulation
+    # cycle, so the schedule horizon must match optimizer updates, not microbatches.
+    total_opt_steps = max(1, n_steps // grad_accum_steps)
+    warmup_opt_steps = max(1, 2000 // grad_accum_steps)
+    def lr_lambda(opt_step):
+        if opt_step < warmup_opt_steps:
+            return opt_step / warmup_opt_steps
+        progress = (opt_step - warmup_opt_steps) / max(1, total_opt_steps - warmup_opt_steps)
+        progress = min(progress, 1.0)
         return 0.01 + 0.99 * 0.5 * (1.0 + math.cos(math.pi * progress))
     scheduler = LambdaLR(optimizer, lr_lambda)
 
@@ -200,8 +204,9 @@ def train(
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         step = ckpt["step"]
         loss_history = ckpt.get("loss_history", [])
-        # Fast-forward scheduler to current step (LambdaLR stores last_epoch internally)
-        for _ in range(step):
+        # Fast-forward scheduler using optimizer-update units (not microbatch)
+        opt_steps_done = step // grad_accum_steps
+        for _ in range(opt_steps_done):
             scheduler.step()
         running_loss = 0.0
         dl_iter = iter(dl)
@@ -272,6 +277,13 @@ def train(
                 },
             }, ckpt_path)
             print(f"  saved checkpoint: {ckpt_path}")
+
+    # Flush any remaining accumulated gradients
+    if step % grad_accum_steps != 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
 
     final_ckpt = ckpt_dir / f"{task_name}_final.pt"
     torch.save({
