@@ -169,6 +169,7 @@ def train(
     num_workers: int = 0,
     use_dinov2: bool = False,
     use_minilm: bool = False,
+    dinov2_finetune_blocks: int = 4,
     n_history_frames: int = 1,
     eval_every: int = 0,
     eval_episodes: int = 5,
@@ -193,6 +194,7 @@ def train(
     cfg.chunk_size = chunk_size
     cfg.use_dinov2 = use_dinov2
     cfg.use_minilm = use_minilm
+    cfg.dinov2_finetune_blocks = dinov2_finetune_blocks
     cfg.n_history_frames = n_history_frames
     # Auto-detect action/state dims from dataset if possible; fall back to 6 (SO-101 5-arm + 1-grip).
     cfg.action_dim = action_dim_override if (action_dim_override := _detect_action_dim(data_roots)) else 6
@@ -348,6 +350,7 @@ def train(
                 "action_norm_hi": _action_hi.tolist(),
                 "config": {
                     "use_dinov2": cfg.use_dinov2,
+                    "dinov2_finetune_blocks": cfg.dinov2_finetune_blocks,
                     "use_minilm": cfg.use_minilm,
                     "n_history_frames": cfg.n_history_frames,
                     "img_size": cfg.img_size,
@@ -377,6 +380,7 @@ def train(
         "action_norm_hi": _action_hi.tolist(),
         "config": {
             "use_dinov2": cfg.use_dinov2,
+            "dinov2_finetune_blocks": cfg.dinov2_finetune_blocks,
             "use_minilm": cfg.use_minilm,
             "n_history_frames": cfg.n_history_frames,
             "img_size": cfg.img_size,
@@ -429,6 +433,10 @@ if __name__ == "__main__":
     parser.add_argument("--use-dinov2", action="store_true",
                         help="Replace from-scratch ViT with frozen pretrained "
                              "DINOv2-small backbone (P0 architecture review fix).")
+    parser.add_argument("--finetune-blocks", type=int, default=4,
+                        help="Number of last DINOv2 blocks to fine-tune (rest "
+                             "frozen). 4 = default, 12 = full fine-tune, "
+                             "0 = freeze entire backbone.")
     parser.add_argument("--use-minilm", action="store_true",
                         help="Replace TinyTextEncoder with frozen pretrained "
                              "MiniLM (sentence-transformers/all-MiniLM-L6-v2).")
@@ -471,6 +479,7 @@ if __name__ == "__main__":
         task_name=args.task,
         num_workers=args.num_workers,
         use_dinov2=args.use_dinov2,
+        dinov2_finetune_blocks=args.finetune_blocks,
         use_minilm=args.use_minilm,
         n_history_frames=args.n_history_frames,
         eval_every=args.eval_every,

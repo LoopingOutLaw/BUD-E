@@ -56,6 +56,7 @@ def load_policy(ckpt_path: str, img_size: int, device: str):
 
     saved_cfg = ckpt.get("config", {})
     cfg.use_dinov2 = saved_cfg.get("use_dinov2", False)
+    cfg.dinov2_finetune_blocks = saved_cfg.get("dinov2_finetune_blocks", 4)
     cfg.use_minilm = saved_cfg.get("use_minilm", False)
     cfg.n_history_frames = saved_cfg.get("n_history_frames", 1)
     cfg.chunk_size = saved_cfg.get("chunk_size", 4)
