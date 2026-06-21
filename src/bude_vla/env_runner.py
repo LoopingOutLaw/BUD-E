@@ -38,7 +38,7 @@ from bude_vla.envs.so101_mjx import (
 
 # Table top is at z=0.02 in so101_mjx.py (box pos=[0,0.25,0] size=[0.35,0.10,0.02])
 TABLE_Z = 0.02
-HOME_QPOS = np.zeros(ARM_QPOS_END, dtype=np.float64)  # arm(5) + gripper(1) = 6
+HOME_QPOS = np.array([0.0, -0.5, 0.95, np.pi/2, np.pi/2, 0.3], dtype=np.float64)  # matches training initial pose
 
 
 @dataclasses.dataclass
