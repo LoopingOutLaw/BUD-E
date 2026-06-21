@@ -37,6 +37,7 @@ SUBSTEPS_PER_FRAME = 4  # match video recorder
 def _main_loop(model, data, policy, renderer, cam_ids, max_steps=2000):
     cube_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
     target_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
+    gripperframe_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
     spid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "static_finger_pad")
     mpid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "moving_finger_pad")
     cgid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "cube_geom")
@@ -62,10 +63,15 @@ def _main_loop(model, data, policy, renderer, cam_ids, max_steps=2000):
         if is_grasping:
             ever_grasped = True
 
-        # Proprio: arm joints + gripper + contact signal (7 dims)
+        # 9D proprio: arm(5) + gripper(1) + target_rel(2) + is_grasping(1)
+        gripper_pos = data.site_xpos[gripperframe_id]
+        target_pos = data.xpos[target_body_id]
+        target_rel = target_pos[:2] - gripper_pos[:2]
+
         proprio = np.concatenate([
-            data.qpos[ARM_QPOS_START:GRIPPER_QPOS_START + 1],
-            [is_grasping],
+            data.qpos[ARM_QPOS_START:GRIPPER_QPOS_START + 1],  # 6D
+            target_rel,                                          # 2D
+            [is_grasping],                                       # 1D = 9D total
         ]).astype(np.float32)
         proprios.append(proprio)
 
@@ -108,8 +114,8 @@ def _main_loop(model, data, policy, renderer, cam_ids, max_steps=2000):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--max-eps", type=int, default=100)
-    ap.add_argument("--out", default="/home/aditya/bude_vla/data/pick_v8")
+    ap.add_argument("--max-eps", type=int, default=500)
+    ap.add_argument("--out", default="/home/aditya/bude_vla/data/pick_v10")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--img-size", type=int, default=64)
     ap.add_argument("--keep-failures", action="store_true")
@@ -131,9 +137,9 @@ def main():
     t0 = time.time()
 
     for i in range(args.max_eps):
-        # Cube position: slight randomization around (0.25, 0.0)
-        cx = float(rng.uniform(0.22, 0.28))
-        cy = float(rng.uniform(-0.02, 0.02))
+        # Cube position: wide randomization to force visual grounding
+        cx = float(rng.uniform(0.15, 0.35))
+        cy = float(rng.uniform(-0.10, 0.10))
 
         data = mujoco.MjData(model)
         mujoco.mj_resetData(model, data)
