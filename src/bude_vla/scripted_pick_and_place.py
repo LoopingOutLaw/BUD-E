@@ -37,21 +37,21 @@ GRIPPER_TIGHTEN = 0.4
 WRIST_FLEX_LOCK = np.pi / 2
 WRIST_ROLL_LOCK = np.pi / 2
 
-# 3cm cube (matching pick-101)
+# 3cm cube
 CUBE_HALF_WIDTH = 0.015
-FINGER_WIDTH_OFFSET = -0.015   # Y offset to center grip (pick-101 uses -0.015 for 3cm cube)
-GRASP_Z_OFFSET = 0.005        # grip slightly above cube center
-HEIGHT_OFFSET = 0.03          # 30mm above cube for approach
+FINGER_WIDTH_OFFSET = -0.015
+GRASP_Z_OFFSET = 0.01
+HEIGHT_OFFSET = 0.03
 
-# Step counts (matching pick-101)
-APPROACH_STEPS = 300
-DESCENT_STEPS = 200
+# Step counts
+APPROACH_STEPS = 100
+DESCENT_STEPS = 100
 CLOSE_STEPS = 300
 TIGHTEN_STEPS = 100
-LIFT_STEPS = 300
-HOLD_STEPS = 200
+LIFT_STEPS = 100
+HOLD_STEPS = 50
 MOVE_STEPS = 300
-RELEASE_STEPS = 200
+RELEASE_STEPS = 100
 
 PHASE_NAMES = {
     0: "APPROACH", 1: "DESCENT", 2: "CLOSE", 3: "LIFT",
@@ -126,13 +126,14 @@ class ScriptedPickAndPlace:
         cube = self._cube_xyz(data)
 
         if self.phase == APPROACH:
-            above_pos = self._cube_start_xyz.copy()
+            cube_live = self._cube_xyz(data)
+            above_pos = cube_live.copy()
             above_pos[2] += GRASP_Z_OFFSET + HEIGHT_OFFSET
             above_pos[1] += FINGER_WIDTH_OFFSET
 
             ctrl = self.ik.step_toward_target(
                 above_pos, gripper_action=GRIPPER_OPEN,
-                gain=0.5, locked_joints=locked_joints,
+                gain=0.8, locked_joints=locked_joints,
             )
 
             if self.phase_step >= APPROACH_STEPS:
@@ -140,13 +141,14 @@ class ScriptedPickAndPlace:
                 self.phase_step = 0
 
         elif self.phase == DESCENT:
-            grasp_target = self._cube_start_xyz.copy()
+            cube_live = self._cube_xyz(data)
+            grasp_target = cube_live.copy()
             grasp_target[2] += GRASP_Z_OFFSET
             grasp_target[1] += FINGER_WIDTH_OFFSET
 
             ctrl = self.ik.step_toward_target(
                 grasp_target, gripper_action=GRIPPER_OPEN,
-                gain=0.5, locked_joints=locked_joints,
+                gain=0.8, locked_joints=locked_joints,
             )
 
             if self.phase_step >= DESCENT_STEPS:

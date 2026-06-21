@@ -122,8 +122,8 @@ def write_episode(root: str | Path, episode: dict) -> Path:
     T = images.shape[0]
     assert proprio.shape[0] == T, f"proprio length {proprio.shape[0]} != T {T}"
     state_dim = int(proprio.shape[1])
-    assert state_dim in (6, 7), (
-        f"proprio dim {state_dim} not in (6, 7) (expected arm+gripper or arm+gripper+contact)"
+    assert state_dim in (6, 7, 9), (
+        f"proprio dim {state_dim} not in (6, 7, 9)"
     )
 
     # Find next episode_idx
