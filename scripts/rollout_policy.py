@@ -59,6 +59,8 @@ def _load_policy(ckpt_path: str, img_size: int, device: str,
         cfg.n_history_frames = ckpt["config"].get("n_history_frames",
                                                   n_history_frames)
         cfg.chunk_size = ckpt["config"].get("chunk_size", cfg.chunk_size)
+        cfg.action_dim = ckpt["config"].get("action_dim", cfg.action_dim)
+        cfg.state_dim = ckpt["config"].get("state_dim", cfg.state_dim)
     else:
         cfg.use_dinov2 = use_dinov2
         cfg.use_minilm = use_minilm

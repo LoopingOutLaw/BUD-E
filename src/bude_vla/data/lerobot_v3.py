@@ -458,10 +458,12 @@ class BUDETrainingDataset:
 
         a_slice = ep["actions"][frame_in_ep: frame_in_ep + self.chunk_size]
         n = a_slice.shape[0]
+        mask = torch.ones(self.chunk_size, dtype=torch.float32)
         if n < self.chunk_size:
             action_dim = a_slice.shape[-1] if a_slice.ndim == 2 else 6
             pad = np.zeros((self.chunk_size - n, action_dim), dtype=np.float32)
             a_slice = np.concatenate([a_slice, pad], axis=0)
+            mask[n:] = 0.0
         if self.normalize and self._action_lo is not None:
             a_slice = normalize_actions(a_slice, self._action_lo, self._action_hi)
         act = torch.from_numpy(a_slice.astype(np.float32))
@@ -478,4 +480,5 @@ class BUDETrainingDataset:
             "actions": act,
             "tau": tau,
             "noise": noise,
+            "mask": mask,
         }
