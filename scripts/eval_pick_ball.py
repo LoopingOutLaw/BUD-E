@@ -137,7 +137,7 @@ def build_batch(image: np.ndarray, proprio: np.ndarray,
         "text_ids": torch.from_numpy(text_ids).unsqueeze(0).to(device),
         "instruction": [INSTRUCTION],
         "proprio": torch.from_numpy(proprio.astype(np.float32)).unsqueeze(0).to(device),
-        "domain_id": torch.tensor([0], dtype=torch.long).to(device),
+        "domain_id": torch.tensor([_domain_from_instruction(INSTRUCTION)], dtype=torch.long).to(device),
     }
 
 
