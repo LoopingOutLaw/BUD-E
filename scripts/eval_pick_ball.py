@@ -45,6 +45,7 @@ from bude_vla.models.policy import BUDEPolicy, BUDEConfig
 SUCCESS_THRESHOLD = 0.05
 INSTRUCTION = "pick up the red cube and place it in the blue target zone"
 MAX_STEPS = 2000
+SUBSTEPS_PER_FRAME = 4  # must match training (record_pick_episodes.py)
 
 
 def load_policy(ckpt_path: str, img_size: int, device: str):
@@ -257,7 +258,8 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
             data.ctrl[:N_ARM_JOINTS] = 0.0          # arm actuators OFF (kinematic)
             data.ctrl[N_ARM_JOINTS] = gripper_ctrl  # only gripper actuator
 
-            mujoco.mj_step(model, data)
+            for _ in range(SUBSTEPS_PER_FRAME):
+                mujoco.mj_step(model, data)
 
             frame = add_overlay(vid_frame, f"ep {ep} step {step}",
                                 grasped=(use_contact_signal and is_grasping > 0.5))
