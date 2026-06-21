@@ -25,6 +25,7 @@ from bude_vla.data.action_normalization import (
     denormalize_actions,
     load_action_stats,
 )
+from bude_vla.data.lerobot_v3 import _domain_from_instruction
 from bude_vla.envs.so101_mjx import (
     ARM_QPOS_START, ARM_QPOS_END,
     GRIPPER_QPOS_START, GRIPPER_QPOS_END,
@@ -291,7 +292,8 @@ class PolicyRolloutRunner:
                 if self.ensembling:
                     if not self._action_queue:
                         batch = _build_batch(stacked, arm_proprio, self.text_ids,
-                                             _PICK_INSTRUCTION, domain_id=0,
+                                             _PICK_INSTRUCTION,
+                                             domain_id=_domain_from_instruction(_PICK_INSTRUCTION),
                                              device=self.device)
                         new_chunk = policy.sample(batch)[0].detach().cpu().numpy()
                         if self._use_norm:
@@ -309,7 +311,8 @@ class PolicyRolloutRunner:
                 else:
                     if chunk is None or cursor >= chunk.shape[0]:
                         batch = _build_batch(stacked, arm_proprio, self.text_ids,
-                                             _PICK_INSTRUCTION, domain_id=0,
+                                             _PICK_INSTRUCTION,
+                                             domain_id=_domain_from_instruction(_PICK_INSTRUCTION),
                                              device=self.device)
                         chunk = policy.sample(batch)[0].detach().cpu().numpy()
                         cursor = 0
@@ -323,7 +326,7 @@ class PolicyRolloutRunner:
                     gripper_ctrl = 0.0
                 else:
                     arm_target = np.clip(a[:N_ARM_JOINTS], -3.5, 3.5).astype(np.float64)
-                    gripper_ctrl = float(np.clip(a[N_ARM_JOINTS], -1.0, 1.0))
+                    gripper_ctrl = float(np.clip(a[N_ARM_JOINTS], -1.5, 1.5))
 
                 _carry_cube_with(self.model, data)
                 _smooth_arm_to(arm_target, try_idx)

@@ -441,9 +441,9 @@ class BUDETrainingDataset:
                 pad_n = n_h - window.shape[0]
                 pad = np.repeat(window[:1], pad_n, axis=0)
                 window = np.concatenate([pad, window], axis=0)
-            stacked = window.reshape(window.shape[0] * window.shape[-1],
-                                     window.shape[1], window.shape[2])
-            stacked = np.transpose(stacked, (1, 2, 0))  # (H, W, n_h*6)
+            window = np.ascontiguousarray(window)
+            stacked = np.transpose(window, (1, 2, 0, 3)).reshape(
+                window.shape[1], window.shape[2], window.shape[0] * window.shape[-1])
 
         img = torch.from_numpy(
             stacked.astype(np.float32)

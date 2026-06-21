@@ -214,8 +214,9 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
                 while len(img_buffer) < n_h:
                     img_buffer.insert(0, img_buffer[0])
                 window = np.stack(img_buffer, axis=0)  # (n_h, H, W, C_single)
-                stacked_img = window.reshape(window.shape[1], window.shape[2],
-                                            n_h * C_single)  # (H, W, n_h*6)
+                window = np.ascontiguousarray(window)
+                stacked_img = np.transpose(window, (1, 2, 0, 3)).reshape(
+                    window.shape[1], window.shape[2], n_h * C_single)
 
             vid_renderer.update_scene(data, camera=vid_cam)
             vid_frame = np.asarray(vid_renderer.render()).copy()

@@ -78,7 +78,8 @@ def _load_policy(ckpt_path: str, img_size: int, device: str,
     action_lo = ckpt.get("action_norm_lo", None)
     action_hi = ckpt.get("action_norm_hi", None)
     return (policy, action_lo, action_hi,
-            cfg.use_dinov2, cfg.use_minilm, cfg.n_history_frames)
+            cfg.use_dinov2, cfg.use_minilm, cfg.n_history_frames,
+            cfg.state_dim, cfg.action_dim)
 
 
 def _random_cube_positions(n: int, seed: int = 42):
@@ -145,14 +146,17 @@ def main():
         device = args.device
     print(f"loading policy from {args.ckpt} (device={device})")
     (policy, action_lo, action_hi,
-     resolved_dinov2, resolved_minilm, resolved_history
+     resolved_dinov2, resolved_minilm, resolved_history,
+     resolved_state_dim, resolved_action_dim
      ) = _load_policy(
         args.ckpt, args.img_size, device,
         use_dinov2=args.use_dinov2,
         use_minilm=args.use_minilm,
         n_history_frames=args.n_history_frames,
     )
-    print(f"  resolved flags: dinov2={resolved_dinov2} minilm={resolved_minilm} history={resolved_history}")
+    print(f"  resolved flags: dinov2={resolved_dinov2} minilm={resolved_minilm} "
+          f"history={resolved_history} state_dim={resolved_state_dim} "
+          f"action_dim={resolved_action_dim}")
 
     model = load_arm_model()
     data = mujoco.MjData(model)
@@ -167,7 +171,7 @@ def main():
         action_lo=action_lo,
         action_hi=action_hi,
         n_history_frames=resolved_history,
-        state_dim=cfg.state_dim,
+        state_dim=resolved_state_dim,
     )
 
     if args.viewer and os.environ.get("MUJOCO_GL") != "glfw":
