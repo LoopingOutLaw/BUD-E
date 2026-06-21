@@ -33,12 +33,12 @@ class BUDEConfig:
     text_max_len: int = 64
     text_depth: int = 4
     text_heads: int = 4
-    state_dim: int = 8   # arm (6) + gripper (2 freejoint vals flattened)
+    state_dim: int = 6
     d: int = 256
     backbone_depth: int = 8
     backbone_heads: int = 8
     ffn_dim: int = 1024
-    action_dim: int = 7
+    action_dim: int = 6
     chunk_size: int = 32
     n_domains: int = 6
     n_prompts: int = 32
