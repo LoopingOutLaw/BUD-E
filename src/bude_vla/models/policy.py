@@ -22,6 +22,7 @@ from bude_vla.models.vision import DINOv2Tower, ViTSmall
 class BUDEConfig:
     use_dinov2: bool = False
     use_minilm: bool = False
+    dinov2_finetune_blocks: int = 4
     n_history_frames: int = 1  # 1 = single frame (Markovian)
     img_size: int = 224
     patch_size: int = 16
@@ -82,7 +83,9 @@ class BUDEPolicy(nn.Module):
                 img_size=cfg.img_size,
                 in_channels=in_channels,
                 out_dim=cfg.d,
+                finetune_blocks=cfg.dinov2_finetune_blocks,
             )
+
         else:
             self.vision = ViTSmall(
                 img_size=cfg.img_size,
