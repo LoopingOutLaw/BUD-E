@@ -201,7 +201,8 @@ def train(
         out = policy(batch)
         v_pred = out["velocity"]
         v_target = batch["actions"] - batch["noise"]
-        loss = ((v_pred - v_target) ** 2).mean()
+        mask = batch["mask"].unsqueeze(-1)  # (B, chunk_size, 1)
+        loss = (((v_pred - v_target) ** 2) * mask).sum() / mask.sum()
 
         optimizer.zero_grad()
         loss.backward()

@@ -127,4 +127,4 @@ class FlowMatchingActionHead(nn.Module):
             tau = torch.full((b,), step / self.n_steps, device=device)
             v = self.forward(x, tau, cond)
             x = x + v / self.n_steps
-        return x
+        return torch.clamp(x, -1.0, 1.0)
