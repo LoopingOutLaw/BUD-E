@@ -349,11 +349,9 @@ class SO101MJMJX:
     def render(self, state: mjx.Data, height: int = 224, width: int = 224) -> np.ndarray:
         d = mjx.get_data(self.model_mj, state)
         try:
-            if not hasattr(self, "_renderer") or self._renderer is None:
+            if not hasattr(self, "_renderer") or self._renderer is None or \
+               self._renderer._height != height or self._renderer._width != width:
                 self._renderer = mujoco.Renderer(self.model_mj, height=height, width=width)
-            else:
-                self._renderer._height = height
-                self._renderer._width = width
             self._renderer.update_scene(d)
             return self._renderer.render()
         except Exception:
