@@ -100,7 +100,8 @@ def reset_arm(model, data):
     ])
     data.qpos[GRIPPER_QPOS_START:GRIPPER_QPOS_END] = 0.3  # partially open
     data.qvel[ARM_QPOS_START:GRIPPER_QPOS_END] = 0.0
-    data.ctrl[:] = 0.0
+    data.ctrl[ARM_QPOS_START:ARM_QPOS_END] = data.qpos[ARM_QPOS_START:ARM_QPOS_END]  # hold pose during settle
+    data.ctrl[GRIPPER_QPOS_START] = 0.3
     mujoco.mj_forward(model, data)
 
 
