@@ -168,6 +168,7 @@ def train(
     resume: str | None = None,
     num_workers: int = 0,
     use_dinov2: bool = False,
+    dinov2_finetune_blocks: int = 4,
     use_minilm: bool = False,
     n_history_frames: int = 1,
     eval_every: int = 0,
@@ -192,6 +193,7 @@ def train(
     cfg.patch_size = 16
     cfg.chunk_size = chunk_size
     cfg.use_dinov2 = use_dinov2
+    cfg.dinov2_finetune_blocks = dinov2_finetune_blocks
     cfg.use_minilm = use_minilm
     cfg.n_history_frames = n_history_frames
     # Auto-detect action/state dims from dataset if possible; fall back to 6 (SO-101 5-arm + 1-grip).
@@ -348,6 +350,7 @@ def train(
                 "action_norm_hi": _action_hi.tolist(),
                 "config": {
                     "use_dinov2": cfg.use_dinov2,
+                    "dinov2_finetune_blocks": cfg.dinov2_finetune_blocks,
                     "use_minilm": cfg.use_minilm,
                     "n_history_frames": cfg.n_history_frames,
                     "img_size": cfg.img_size,
@@ -377,6 +380,7 @@ def train(
         "action_norm_hi": _action_hi.tolist(),
         "config": {
             "use_dinov2": cfg.use_dinov2,
+            "dinov2_finetune_blocks": cfg.dinov2_finetune_blocks,
             "use_minilm": cfg.use_minilm,
             "n_history_frames": cfg.n_history_frames,
             "img_size": cfg.img_size,
@@ -426,8 +430,11 @@ if __name__ == "__main__":
                         help="Path to a checkpoint to resume training from. "
                              "Restores model, optimizer, step counter, and "
                              "loss history; continues until --n-steps.")
-    parser.add_argument("--use-dinov2", action="store_true",
-                        help="Replace from-scratch ViT with frozen pretrained "
+    parser.add_argument("--finetune-blocks", type=int, default=4,
+                        help="Number of DINOv2 blocks to fine-tune (1 = 12 total; "
+                             "4 default, means only last 4 blocks trainable. "
+                             "Full fine-tuning at backbone_lr. Use 0 to unfreeze all.")
+    parser.add_argument("--use-dinov2", action="store_true",                        help="Replace from-scratch ViT with frozen pretrained "
                              "DINOv2-small backbone (P0 architecture review fix).")
     parser.add_argument("--use-minilm", action="store_true",
                         help="Replace TinyTextEncoder with frozen pretrained "
@@ -471,6 +478,7 @@ if __name__ == "__main__":
         task_name=args.task,
         num_workers=args.num_workers,
         use_dinov2=args.use_dinov2,
+        dinov2_finetune_blocks=args.finetune_blocks,
         use_minilm=args.use_minilm,
         n_history_frames=args.n_history_frames,
         eval_every=args.eval_every,
