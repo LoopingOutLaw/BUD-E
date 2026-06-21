@@ -48,7 +48,7 @@ class BUDEConfig:
     action_head_temporal_depth: int = 2  # P1: causal transformer layers
     action_head_temporal_heads: int = 4
     use_temporal_head: bool = True
-    flow_n_steps: int = 10
+    flow_n_steps: int = 50
 
 
 class BUDEPolicy(nn.Module):

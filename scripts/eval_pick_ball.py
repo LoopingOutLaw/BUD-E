@@ -312,7 +312,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--num-episodes", type=int, default=20)
-    ap.add_argument("--img-size", type=int, default=64)
+    ap.add_argument("--img-size", type=int, default=224)
     ap.add_argument("--video-size", type=int, default=224)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", default="demos/videos/eval_pick_v8.mp4")
