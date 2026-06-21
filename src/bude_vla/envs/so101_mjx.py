@@ -236,6 +236,25 @@ def load_arm_model(xml_path: str | Path | None = None) -> mujoco.MjModel:
     return _build_composite_spec()
 
 
+def is_grasping_from_contacts(model: mujoco.MjModel, data: mujoco.MjData) -> float:
+    """Contact-based grasp detection — both finger pads touching cube.
+
+    Returns 1.0 if both static_finger_pad and moving_finger_pad are in
+    contact with cube_geom, 0.0 otherwise. This is the SAME function used
+    in both recording and eval — no heuristic approximation.
+    """
+    cube_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "cube_geom")
+    static_pad_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "static_finger_pad")
+    moving_pad_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "moving_finger_pad")
+
+    contacts = set()
+    for i in range(data.ncon):
+        g1, g2 = data.contact[i].geom1, data.contact[i].geom2
+        if g1 == cube_geom_id or g2 == cube_geom_id:
+            contacts.add(g2 if g1 == cube_geom_id else g1)
+    return float(static_pad_id in contacts and moving_pad_id in contacts)
+
+
 def default_joint_angles(model: mujoco.MjModel) -> np.ndarray:
     """Home config for the 5 arm joints."""
     return np.asarray([0.0, -0.5, 0.95, -0.55, 0.0])

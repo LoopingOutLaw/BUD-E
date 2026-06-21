@@ -5,16 +5,17 @@ Matches training conditions:
  - physics-only grasping (NO GraspController teleport)
  - cube at z=CUBE_REST_Z (0.015)
  - wrist_cam (not pov)
- - cube spawn range (0.22-0.28, -0.02-0.02) matching training
- - 7D proprio [arm(5) + gripper(1) + is_grasping(1)] for pick_v8 checkpoints
- - 6D proprio [arm(5) + gripper(1)] for older pick_v7 checkpoints
+ - cube spawn range (0.15-0.35, -0.10-0.10) matching training
+ - 9D proprio [arm(5)+gripper(1)+target_rel(2)+is_grasping(1)] for pick_v10 checkpoints
+ - 7D proprio [arm(5)+gripper(1)+is_grasping(1)] for pick_v8/v9 checkpoints
+ - 6D proprio [arm(5)+gripper(1)] for older pick_v7 checkpoints
  - kinematic arm execution + physics gripper (matches training action format)
- - MAX_STEPS = 2000 for full pick-and-place sequence
+ - MAX_STEPS = 4000 for full pick-and-place sequence
 
 Usage:
     unset PYTHONPATH
     MUJOCO_GL=egl PYTHONPATH=src python scripts/eval_pick_ball.py \
-        --ckpt checkpoints/pick_v8/pick_v8_step_030000.pt \
+        --ckpt checkpoints/pick_v10/pick_v10_step_050000.pt \
         --num-episodes 10
 """
 from __future__ import annotations
@@ -39,6 +40,7 @@ from bude_vla.envs.so101_mjx import (
     CUBE_QPOS_START, CUBE_QPOS_END,
     N_ARM_JOINTS,
     load_arm_model, CUBE_REST_Z,
+    is_grasping_from_contacts,
 )
 from bude_vla.models.policy import BUDEPolicy, BUDEConfig
 
@@ -219,27 +221,25 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
             vid_frame = np.asarray(vid_renderer.render()).copy()
 
             # Proprio: 9D [arm(5)+gripper(1)+target_rel(2)+is_grasping(1)] or 7D or 6D
+            # is_grasping uses SAME contact helper as recording — no heuristic mismatch
             gripper_pos = data.site_xpos[gripperframe_id]
-            if use_contact_signal:
-                gripper_qpos = float(data.qpos[GRIPPER_QPOS_START])
-                cube_pos = data.xpos[cube_body_id]
-                cube_near_gripper = np.linalg.norm(cube_pos - gripper_pos) < 0.08
-                is_grasping = 1.0 if (gripper_qpos < 0.5 and cube_near_gripper) else 0.0
-                if is_grasping > 0.5:
-                    ever_grasped = True
-                if use_9d:
-                    target_pos = data.xpos[target_body_id]
-                    target_rel = target_pos[:2] - gripper_pos[:2]
-                    arm_proprio = np.concatenate([
-                        data.qpos[ARM_QPOS_START:GRIPPER_QPOS_START + 1],  # 6D
-                        target_rel,                                         # 2D
-                        [is_grasping],                                      # 1D = 9D
-                    ]).astype(np.float32)
-                else:
-                    arm_proprio = np.concatenate([
-                        data.qpos[ARM_QPOS_START:GRIPPER_QPOS_START + 1],  # 6D
-                        [is_grasping],                                      # 1D = 7D
-                    ]).astype(np.float32)
+            is_grasping = is_grasping_from_contacts(model, data)
+            if is_grasping > 0.5:
+                ever_grasped = True
+
+            if use_9d:
+                target_pos = data.xpos[target_body_id]
+                target_rel = target_pos[:2] - gripper_pos[:2]
+                arm_proprio = np.concatenate([
+                    data.qpos[ARM_QPOS_START:GRIPPER_QPOS_START + 1],  # 6D
+                    target_rel,                                         # 2D
+                    [is_grasping],                                      # 1D = 9D
+                ]).astype(np.float32)
+            elif use_contact_signal:
+                arm_proprio = np.concatenate([
+                    data.qpos[ARM_QPOS_START:GRIPPER_QPOS_START + 1],  # 6D
+                    [is_grasping],                                      # 1D = 7D
+                ]).astype(np.float32)
             else:
                 arm_proprio = data.qpos[ARM_QPOS_START:GRIPPER_QPOS_END].astype(np.float32).copy()
 

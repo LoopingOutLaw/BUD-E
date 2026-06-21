@@ -24,16 +24,16 @@ from typing import Iterable
 import numpy as np
 
 
-# Default lo/hi used when no empirical stats are available. These match the
-# IK solver's internal clip (arm) and the gripper semantics.
-DEFAULT_LO = np.array([-np.pi, -np.pi, -np.pi, -np.pi, -np.pi, -np.pi, -1.0],
+# Default lo/hi used when no empirical stats are available.
+# SO-101: 5 arm joints + 1 gripper = 6D action space.
+DEFAULT_LO = np.array([-np.pi, -np.pi, -np.pi, -np.pi, -np.pi, -1.5],
                       dtype=np.float32)
-DEFAULT_HI = np.array([np.pi, np.pi, np.pi, np.pi, np.pi, np.pi, 1.0],
+DEFAULT_HI = np.array([np.pi, np.pi, np.pi, np.pi, np.pi, 1.5],
                       dtype=np.float32)
 
 
 def compute_action_stats(actions_iter: Iterable[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    """Iterate over per-episode action arrays (T, 7) and return dim-wise (lo, hi).
+    """Iterate over per-episode action arrays (T, action_dim) and return dim-wise (lo, hi).
 
     Uses the empirical min/max across all frames. For real gripper values this
     collapses to {-1, 0, 1} if the scripted policy always emits integer commands.
