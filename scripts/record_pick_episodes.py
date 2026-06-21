@@ -27,6 +27,7 @@ from bude_vla.envs.so101_mjx import (
     GRIPPER_QPOS_START,
     CUBE_QPOS_START,
     CUBE_REST_Z,
+    is_grasping_from_contacts,
 )
 
 INSTRUCTION = "pick up the red cube and place it in the blue target zone"
@@ -38,9 +39,6 @@ def _main_loop(model, data, policy, renderer, cam_ids, max_steps=2000):
     cube_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
     target_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
     gripperframe_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
-    spid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "static_finger_pad")
-    mpid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "moving_finger_pad")
-    cgid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "cube_geom")
 
     images, proprios, actions = [], [], []
     ever_grasped = False
@@ -53,13 +51,8 @@ def _main_loop(model, data, policy, renderer, cam_ids, max_steps=2000):
         wr = np.asarray(renderer.render()).copy()
         images.append(np.concatenate([oh, wr], axis=-1).copy())
 
-        # Check if currently grasping (before step — this is the contact signal)
-        contacts = set()
-        for i in range(data.ncon):
-            g1, g2 = data.contact[i].geom1, data.contact[i].geom2
-            if g1 == cgid or g2 == cgid:
-                contacts.add(g2 if g1 == cgid else g1)
-        is_grasping = float(spid in contacts and mpid in contacts)
+        # Check if currently grasping (shared contact helper — matches eval exactly)
+        is_grasping = is_grasping_from_contacts(model, data)
         if is_grasping:
             ever_grasped = True
 

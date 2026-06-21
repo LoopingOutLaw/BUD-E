@@ -116,12 +116,13 @@ def write_episode(root: str | Path, episode: dict) -> Path:
     root = Path(root)
     images = episode["images"]                        # (T, H, W, 3) uint8
     proprio = episode["proprio"].astype(np.float32)     # (T, state_dim)
-    actions = episode["actions"].astype(np.float32)   # (T, 6)
+    actions = episode["actions"].astype(np.float32)   # (T, action_dim)
     instruction = episode["instruction"]
 
     T = images.shape[0]
     assert proprio.shape[0] == T, f"proprio length {proprio.shape[0]} != T {T}"
     state_dim = int(proprio.shape[1])
+    action_dim = int(actions.shape[1])
     assert state_dim in (6, 7, 9), (
         f"proprio dim {state_dim} not in (6, 7, 9)"
     )
@@ -186,6 +187,10 @@ def write_episode(root: str | Path, episode: dict) -> Path:
                                    "observation.state": {
                                        "dtype": "float32",
                                        "shape": [state_dim],
+                                   },
+                                   "action": {
+                                       "dtype": "float32",
+                                       "shape": [action_dim],
                                    }}}
         info_path.write_text(json.dumps(local_meta, indent=2))
 

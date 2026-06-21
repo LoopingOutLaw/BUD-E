@@ -256,6 +256,8 @@ def train(
             "n_history_frames": cfg.n_history_frames,
             "img_size": cfg.img_size,
             "chunk_size": cfg.chunk_size,
+            "action_dim": cfg.action_dim,
+            "state_dim": cfg.state_dim,
         },
     }, final_ckpt)
     print(f"Training done in {time.time()-t0:.0f}s. Final checkpoint: {final_ckpt}")
