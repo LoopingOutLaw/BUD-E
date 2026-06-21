@@ -364,6 +364,7 @@ def train(
         torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
         scaler.step(optimizer)
         scaler.update()
+        scheduler.step()
 
     final_ckpt = ckpt_dir / f"{task_name}_final.pt"
     torch.save({
