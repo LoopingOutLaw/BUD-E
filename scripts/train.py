@@ -422,7 +422,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-every", type=int, default=5000)
     parser.add_argument("--data-root", action="append", default=None,
                         help="Dataset root(s) to train on. May be passed "
-                             "multiple times. Defaults to reach_v3 + push_v3.")
+                             "multiple times. Required — no default.")
     parser.add_argument("--task", default="policy",
                         help="Subdirectory under checkpoints/ for this run, "
                              "and filename prefix (e.g. 'pick', 'reach').")
@@ -466,8 +466,10 @@ if __name__ == "__main__":
 
     roots = args.data_root
     if roots is None:
-        roots = ["/home/aditya/bude_vla/data/reach_v3",
-                 "/home/aditya/bude_vla/data/push_v3"]
+        raise ValueError(
+            "Must specify --data-root. Old default (reach_v3 + push_v3) "
+            "has been removed — those datasets are obsolete for pick training."
+        )
 
     train(
         data_roots=roots,
