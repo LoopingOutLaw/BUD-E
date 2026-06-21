@@ -250,10 +250,8 @@ class PolicyRolloutRunner:
             for k in range(ARM_SMOOTH_STEPS):
                 err = tgt - cur
                 cur = cur + err * ARM_STEP_FRAC
-                data.ctrl[:] = 0.0
+                data.ctrl[ARM_QPOS_START:ARM_QPOS_END] = cur
                 data.ctrl[GRIPPER_QPOS_START] = gripper_ctrl
-                data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0.0
-                data.qpos[ARM_QPOS_START:ARM_QPOS_END] = cur
                 _carry_cube_with(self.model, data)
                 mujoco.mj_step(self.model, data)
                 if record_video_mode and record_camera != "default":

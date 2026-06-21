@@ -263,13 +263,11 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
                 arm_target = np.array([0.0, -0.5, 0.95, np.pi/2, np.pi/2])
                 gripper_ctrl = 0.3
 
-            # Execute: kinematic arm + physics gripper (matches training EXACTLY)
-            # Training sets data.ctrl[:] from policy, where ctrl[0:5] are always 0.0
-            # and ctrl[5] is the gripper actuator value.
-            data.qpos[ARM_QPOS_START:ARM_QPOS_END] = arm_target
-            data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0.0
-            data.ctrl[:N_ARM_JOINTS] = 0.0          # arm actuators OFF (kinematic)
-            data.ctrl[N_ARM_JOINTS] = gripper_ctrl  # only gripper actuator
+            # Execute: position actuators drive arm smoothly (matches training)
+            # Training uses ctrl[:5] = arm_target (sts3215 position actuator, kp=998.22)
+            # and ctrl[5] = gripper_ctrl. No kinematic teleport.
+            data.ctrl[:N_ARM_JOINTS] = arm_target
+            data.ctrl[N_ARM_JOINTS] = gripper_ctrl
 
             for _ in range(SUBSTEPS_PER_FRAME):
                 mujoco.mj_step(model, data)
