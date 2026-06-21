@@ -265,8 +265,10 @@ class PolicyRolloutRunner:
                     frames.append(stacked_mid)
                 try_labels.append(
                     f"try {try_idx_inner + 1}/{self.max_tries}")
-            data.qpos[ARM_QPOS_START:ARM_QPOS_END] = tgt
+            data.ctrl[ARM_QPOS_START:ARM_QPOS_END] = tgt
+            data.ctrl[GRIPPER_QPOS_START] = gripper_ctrl
             _carry_cube_with(self.model, data)
+            mujoco.mj_step(self.model, data)
             return tgt
 
         for try_idx in range(self.max_tries):
