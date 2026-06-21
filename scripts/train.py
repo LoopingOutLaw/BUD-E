@@ -20,6 +20,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 import math
 from torch.optim.lr_scheduler import LambdaLR
+from torch.cuda.amp import autocast, GradScaler
 
 from bude_vla.data.lerobot_v3 import BUDETrainingDataset
 from bude_vla.models.policy import BUDEPolicy, BUDEConfig
@@ -96,9 +97,11 @@ def train(
     video_dir: str = "/home/aditya/bude_vla/demos/videos",
     n_steps: int = 50000,
     batch_size: int = 32,
+    grad_accum_steps: int = 1,
     chunk_size: int = 4,
     img_size: int = 64,
     lr: float = 3e-4,
+    backbone_lr: float = 1e-5,
     weight_decay: float = 1e-4,
     save_every: int = 5000,
     device: str = "cuda",
@@ -153,7 +156,26 @@ def train(
             break
     print(f"  action_norm lo={_action_lo[:3]}  hi={_action_hi[:3]}")
 
-    optimizer = AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
+    # Differential LR: pretrained backbone gets backbone_lr, new modules get lr
+    backbone_params = []
+    head_params = []
+    for name, p in policy.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "vision" in name and use_dinov2:
+            backbone_params.append(p)
+        else:
+            head_params.append(p)
+    param_groups = [
+        {"params": backbone_params, "lr": backbone_lr},
+        {"params": head_params, "lr": lr},
+    ]
+    optimizer = AdamW(param_groups, weight_decay=weight_decay)
+    print(f"  backbone params: {sum(p.numel() for p in backbone_params):,} (lr={backbone_lr})")
+    print(f"  head params: {sum(p.numel() for p in head_params):,} (lr={lr})")
+    print(f"  effective batch size: {batch_size * grad_accum_steps}")
+
+    scaler = GradScaler()
 
     # Linear warmup then cosine decay — prevents the LR spike that caused
     # divergence in the 50k run.
@@ -188,6 +210,9 @@ def train(
 
 
     while step < n_steps:
+        if step % grad_accum_steps == 0:
+            optimizer.zero_grad(set_to_none=True)
+
         try:
             batch = next(dl_iter)
         except StopIteration:
@@ -198,17 +223,22 @@ def train(
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                  for k, v in batch.items()}
 
-        out = policy(batch)
-        v_pred = out["velocity"]
-        v_target = batch["actions"] - batch["noise"]
-        mask = batch["mask"].unsqueeze(-1)  # (B, chunk_size, 1)
-        loss = (((v_pred - v_target) ** 2) * mask).sum() / (mask.sum() * v_pred.shape[-1])
+        with autocast():
+            out = policy(batch)
+            v_pred = out["velocity"]
+            v_target = batch["actions"] - batch["noise"]
+            mask = batch["mask"].unsqueeze(-1)  # (B, chunk_size, 1)
+            loss = (((v_pred - v_target) ** 2) * mask).sum() / (mask.sum() * v_pred.shape[-1])
+            loss_scaled = loss / grad_accum_steps
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-        optimizer.step()
-        scheduler.step()
+        scaler.scale(loss_scaled).backward()
+
+        if (step + 1) % grad_accum_steps == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
 
         running_loss += loss.item()
         step += 1
@@ -270,10 +300,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-steps", type=int, default=50000)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--grad-accum-steps", type=int, default=1,
+                        help="Gradient accumulation steps. Effective batch = "
+                             "batch_size * grad_accum_steps. Use 4 with "
+                             "--batch-size 8 to simulate batch 32 on 8GB GPU.")
     parser.add_argument("--chunk-size", type=int, default=4)
     parser.add_argument("--img-size", type=int, default=64,
                         help="Image resolution for ViT input (default 64, use 224 for hi-res)")
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=3e-4,
+                        help="Learning rate for new modules (backbone, action head, etc.)")
+    parser.add_argument("--backbone-lr", type=float, default=1e-5,
+                        help="Learning rate for pretrained DINOv2 backbone. "
+                             "Lower than --lr to preserve pretrained features.")
     parser.add_argument("--save-every", type=int, default=5000)
     parser.add_argument("--data-root", action="append", default=None,
                         help="Dataset root(s) to train on. May be passed "
@@ -311,9 +349,11 @@ if __name__ == "__main__":
         data_roots=roots,
         n_steps=args.n_steps,
         batch_size=args.batch_size,
+        grad_accum_steps=args.grad_accum_steps,
         chunk_size=args.chunk_size,
         img_size=args.img_size,
         lr=args.lr,
+        backbone_lr=args.backbone_lr,
         save_every=args.save_every,
         augment=args.augment,
         resume=args.resume,
