@@ -33,7 +33,7 @@ import torch
 from pathlib import Path
 
 from bude_vla.data.action_normalization import denormalize_actions
-from bude_vla.data.lerobot_v3 import _tokenize_instruction
+from bude_vla.data.lerobot_v3 import _tokenize_instruction, _domain_from_instruction
 from bude_vla.envs.so101_mjx import (
     ARM_QPOS_START, ARM_QPOS_END,
     GRIPPER_QPOS_START, GRIPPER_QPOS_END,
