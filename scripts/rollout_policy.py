@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Optional
 
 from bude_vla.env_runner import PolicyRolloutRunner
-from bude_vla.envs.so101_mjx import ARM_MODEL_PATH
+from bude_vla.envs.so101_mjx import load_arm_model, CUBE_QPOS_START, CUBE_REST_Z
 from bude_vla.models.policy import BUDEPolicy, BUDEConfig
 
 
@@ -83,8 +83,8 @@ def _load_policy(ckpt_path: str, img_size: int, device: str,
 
 def _random_cube_positions(n: int, seed: int = 42):
     rng = np.random.default_rng(seed)
-    return [np.array([float(rng.uniform(0.50, 0.75)),
-                      float(rng.uniform(-0.15, 0.15))])
+    return [np.array([float(rng.uniform(0.15, 0.35)),
+                      float(rng.uniform(-0.10, 0.10))])
             for _ in range(n)]
 
 
@@ -154,7 +154,7 @@ def main():
     )
     print(f"  resolved flags: dinov2={resolved_dinov2} minilm={resolved_minilm} history={resolved_history}")
 
-    model = mujoco.MjModel.from_xml_path(str(ARM_MODEL_PATH))
+    model = load_arm_model()
     data = mujoco.MjData(model)
 
     positions = _random_cube_positions(args.num_rollouts, seed=args.seed)
@@ -167,6 +167,7 @@ def main():
         action_lo=action_lo,
         action_hi=action_hi,
         n_history_frames=resolved_history,
+        state_dim=cfg.state_dim,
     )
 
     if args.viewer and os.environ.get("MUJOCO_GL") != "glfw":
@@ -180,8 +181,8 @@ def main():
               f"cube=({cube_xy[0]:.2f}, {cube_xy[1]:.2f})")
         mujoco.mj_resetData(model, data)
         mujoco.mj_forward(model, data)
-        data.qpos[0:3] = [cube_xy[0], cube_xy[1], 0.445]
-        data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+        data.qpos[CUBE_QPOS_START:CUBE_QPOS_START + 3] = [cube_xy[0], cube_xy[1], CUBE_REST_Z]
+        data.qpos[CUBE_QPOS_START + 3:CUBE_QPOS_START + 7] = [1.0, 0.0, 0.0, 0.0]
         mujoco.mj_forward(model, data)
 
         viewer = None

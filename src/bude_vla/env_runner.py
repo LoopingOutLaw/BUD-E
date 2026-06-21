@@ -29,14 +29,15 @@ from bude_vla.envs.so101_mjx import (
     ARM_QPOS_START, ARM_QPOS_END,
     GRIPPER_QPOS_START, GRIPPER_QPOS_END,
     CUBE_QPOS_START, CUBE_QPOS_END,
+    CUBE_REST_Z,
     N_ARM_JOINTS,
+    is_grasping_from_contacts,
 )
 
 
-TABLE_Z = 0.42
-CUBE_HALF = 0.025
-HOME_QPOS = np.zeros(CUBE_QPOS_END, dtype=np.float64)
-CUBE_REST_Z = 0.445
+# Table top is at z=0.02 in so101_mjx.py (box pos=[0,0.25,0] size=[0.35,0.10,0.02])
+TABLE_Z = 0.02
+HOME_QPOS = np.zeros(ARM_QPOS_END, dtype=np.float64)  # arm(5) + gripper(1) = 6
 
 
 @dataclasses.dataclass
@@ -83,8 +84,8 @@ def _carry_cube_with(model, data):
 
 
 def _reset_arm_to_home(model, data):
-    data.qpos[ARM_QPOS_START:CUBE_QPOS_END] = HOME_QPOS
-    data.qvel[ARM_QPOS_START:CUBE_QPOS_END] = 0.0
+    data.qpos[ARM_QPOS_START:ARM_QPOS_END] = HOME_QPOS[:ARM_QPOS_END]
+    data.qvel[ARM_QPOS_START:ARM_QPOS_END] = 0.0
     data.ctrl[:] = 0.0
     mujoco.mj_forward(model, data)
 
@@ -111,7 +112,7 @@ def _is_failure(model, data, step, max_steps) -> bool:
     return False
 
 
-def _is_success(model, data, threshold: float = 0.10) -> bool:
+def _is_success(model, data, threshold: float = 0.05) -> bool:
     cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
     target_id = mujoco.mj_name2id(
         model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
@@ -119,6 +120,30 @@ def _is_success(model, data, threshold: float = 0.10) -> bool:
         np.linalg.norm(data.xpos[cube_id, :2] - data.xpos[target_id, :2])
         < threshold
     )
+
+
+def _build_proprio(model, data, state_dim: int) -> np.ndarray:
+    """Build proprio vector matching training dimension."""
+    gripperframe_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
+    target_body_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
+
+    base = data.qpos[ARM_QPOS_START:GRIPPER_QPOS_END].astype(np.float32).copy()
+
+    if state_dim == 6:
+        return base
+    elif state_dim == 7:
+        is_g = is_grasping_from_contacts(model, data)
+        return np.concatenate([base, [is_g]]).astype(np.float32)
+    elif state_dim == 9:
+        gripper_pos = data.site_xpos[gripperframe_id]
+        target_pos = data.xpos[target_body_id]
+        target_rel = target_pos[:2] - gripper_pos[:2]
+        is_g = is_grasping_from_contacts(model, data)
+        return np.concatenate([base, target_rel, [is_g]]).astype(np.float32)
+    else:
+        raise ValueError(f"Unsupported state_dim: {state_dim}")
 
 
 def _build_batch(image: np.ndarray, proprio: np.ndarray,
@@ -143,6 +168,7 @@ class PolicyRolloutRunner:
                  action_lo: np.ndarray | list | None = None,
                  action_hi: np.ndarray | list | None = None,
                  n_history_frames: int = 1,
+                 state_dim: int = 6,
                  ensembling: bool = False,
                  ensembling_k: float = 0.5,
                  arm_smooth_steps: int = 1,
@@ -153,12 +179,13 @@ class PolicyRolloutRunner:
         self.max_tries = max_tries
         self.device = device
         self.n_history_frames = max(1, int(n_history_frames))
+        self.state_dim = state_dim
         self._frame_buffer: list = []
         self.renderer = mujoco.Renderer(model, height=img_size, width=img_size)
         self.overhead_cam_id = mujoco.mj_name2id(
             model, mujoco.mjtObj.mjOBJ_CAMERA, "front_top")
         self.wrist_cam_id = mujoco.mj_name2id(
-            model, mujoco.mjtObj.mjOBJ_CAMERA, "gripper_cam")
+            model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_cam")
         self.portfolio_cam_id = mujoco.mj_name2id(
             model, mujoco.mjtObj.mjOBJ_CAMERA, "portfolio")
         self.text_ids = _pick_token_ids()
@@ -254,7 +281,7 @@ class PolicyRolloutRunner:
             for step in range(self.max_steps_per_try):
                 img = self._render(data)
                 stacked = self._stacked_view(img)
-                arm_proprio = data.qpos[ARM_QPOS_START:GRIPPER_QPOS_END].astype(np.float32).copy()
+                arm_proprio = _build_proprio(self.model, data, self.state_dim)
                 if record_video_mode and record_camera != "default":
                     frames.append(self._render(data, camera=record_camera))
                 else:
