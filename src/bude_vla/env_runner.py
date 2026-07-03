@@ -291,23 +291,28 @@ class PolicyRolloutRunner:
                 try_labels.append(f"try {try_idx + 1}/{self.max_tries}")
 
                 if self.ensembling:
-                    if not self._action_queue:
-                        batch = _build_batch(stacked, arm_proprio, self.text_ids,
-                                             _PICK_INSTRUCTION,
-                                             domain_id=_domain_from_instruction(_PICK_INSTRUCTION),
-                                             device=self.device)
-                        new_chunk = policy.sample(batch)[0].detach().cpu().numpy()
-                        if self._use_norm:
-                            new_chunk = denormalize_actions(
-                                new_chunk, self._action_lo, self._action_hi)
-                        q = list(self._action_queue)
-                        for i, new_a in enumerate(new_chunk):
-                            if i < len(q):
-                                q[i] = (self.ensembling_k * q[i]
-                                        + (1 - self.ensembling_k) * new_a)
-                            else:
-                                q.append(new_a)
-                        self._action_queue = q
+                    # Replan EVERY step (not just when the queue empties) and
+                    # blend the new chunk's predictions into whatever is left
+                    # of the previous chunk's queue. This is standard ACT-style
+                    # temporal ensembling: it lets the policy correct drift
+                    # mid-chunk instead of blindly committing to a full
+                    # chunk_size-step open-loop sequence before looking again.
+                    batch = _build_batch(stacked, arm_proprio, self.text_ids,
+                                         _PICK_INSTRUCTION,
+                                         domain_id=_domain_from_instruction(_PICK_INSTRUCTION),
+                                         device=self.device)
+                    new_chunk = policy.sample(batch)[0].detach().cpu().numpy()
+                    if self._use_norm:
+                        new_chunk = denormalize_actions(
+                            new_chunk, self._action_lo, self._action_hi)
+                    q = list(self._action_queue)
+                    for i, new_a in enumerate(new_chunk):
+                        if i < len(q):
+                            q[i] = (self.ensembling_k * q[i]
+                                    + (1 - self.ensembling_k) * new_a)
+                        else:
+                            q.append(new_a)
+                    self._action_queue = q
                     a = self._action_queue.pop(0)
                 else:
                     if chunk is None or cursor >= chunk.shape[0]:
