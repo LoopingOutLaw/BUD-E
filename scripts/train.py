@@ -238,12 +238,14 @@ def train(
 
     # Differential LR: pretrained DINOv2 backbone gets backbone_lr,
     # new modules (proj, text, proprio, backbone transformer, action head) get lr.
+    # NOTE: patch_embed is excluded from pretrained group — with n_history_frames>1,
+    # most input channels are zero-initialized and need the full lr, not backbone_lr.
     pretrained_params = []
     new_params = []
     for name, p in policy.named_parameters():
         if not p.requires_grad:
             continue
-        if use_dinov2 and "vision.backbone" in name:
+        if use_dinov2 and "vision.backbone" in name and "patch_embed" not in name:
             pretrained_params.append(p)
         else:
             new_params.append(p)
