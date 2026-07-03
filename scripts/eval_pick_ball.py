@@ -71,13 +71,19 @@ def load_policy(ckpt_path: str, img_size: int, device: str):
 
     cfg.patch_size = 16
     policy = BUDEPolicy(cfg).to(device)
-    policy.load_state_dict(ckpt["model_state_dict"])
+    ema_sd = ckpt.get("ema_state_dict")
+    if ema_sd is not None:
+        policy.load_state_dict(ema_sd)
+        weight_src = "EMA"
+    else:
+        policy.load_state_dict(ckpt["model_state_dict"])
+        weight_src = "raw"
     policy.eval()
 
     step = ckpt.get("step", "?")
     loss_hist = ckpt.get("loss_history", [])
     final_loss = loss_hist[-1][1] if loss_hist else float("nan")
-    print(f" loaded step={step}, final_loss={final_loss:.6f}, "
+    print(f" loaded step={step} ({weight_src} weights), final_loss={final_loss:.6f}, "
           f"action_dim={cfg.action_dim}, state_dim={cfg.state_dim}")
     return policy, action_lo, action_hi, cfg
 
@@ -159,7 +165,9 @@ def add_overlay(frame: np.ndarray, text: str, status: str = "",
 
 def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
              action_lo, action_hi, cfg, device,
-             num_episodes, seed):
+             num_episodes, seed,
+             ensembling: bool = False, ensembling_k: float = 0.5,
+             replan_every: int = 1):
     rng = np.random.default_rng(seed)
     all_frames = []
     n_success = 0
@@ -193,6 +201,7 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
 
         chunk = None
         cursor = 0
+        action_queue: list = []  # only used when ensembling=True
         ever_grasped = False
         img_buffer = []  # reset per episode
 
@@ -247,14 +256,30 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
 
             batch = build_batch(stacked_img, arm_proprio, text_ids, device,
                                 n_history_frames=n_h)
-            if chunk is None or cursor >= cfg.chunk_size:
-                chunk = policy.sample(batch)[0].detach().cpu().numpy()
-                cursor = 0
-            a = chunk[cursor]
-            cursor += 1
-
-            if action_lo is not None:
-                a = denormalize_actions(a, action_lo, action_hi)
+            if ensembling:
+                # Replan every `replan_every` steps (default: every step) and
+                # blend with whatever's left in the queue instead of blindly
+                # committing to a full chunk_size-step open-loop sequence.
+                if not action_queue or step % max(1, replan_every) == 0:
+                    new_chunk = policy.sample(batch)[0].detach().cpu().numpy()
+                    if action_lo is not None:
+                        new_chunk = denormalize_actions(new_chunk, action_lo, action_hi)
+                    q = list(action_queue)
+                    for i, new_a in enumerate(new_chunk):
+                        if i < len(q):
+                            q[i] = ensembling_k * q[i] + (1 - ensembling_k) * new_a
+                        else:
+                            q.append(new_a)
+                    action_queue = q
+                a = action_queue.pop(0)
+            else:
+                if chunk is None or cursor >= cfg.chunk_size:
+                    chunk = policy.sample(batch)[0].detach().cpu().numpy()
+                    cursor = 0
+                a = chunk[cursor]
+                cursor += 1
+                if action_lo is not None:
+                    a = denormalize_actions(a, action_lo, action_hi)
 
             if not np.any(np.isnan(a)):
                 arm_target = np.clip(a[:N_ARM_JOINTS], -3.5, 3.5).astype(np.float64)
@@ -317,15 +342,34 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", default="demos/videos/eval_pick_v8.mp4")
     ap.add_argument("--max-steps", type=int, default=MAX_STEPS)
+    ap.add_argument("--ensembling", action="store_true",
+                     help="Replan every step (or every --replan-every steps) and "
+                          "blend overlapping chunk predictions instead of blindly "
+                          "executing a full chunk_size-step open-loop sequence. "
+                          "Usually improves precision-critical tasks like grasping.")
+    ap.add_argument("--ensembling-k", type=float, default=0.5,
+                     help="Weight given to the OLD (already-queued) prediction when "
+                          "blending with a fresh chunk. 0=only trust the new chunk, "
+                          "1=ignore new chunk entirely.")
+    ap.add_argument("--replan-every", type=int, default=1,
+                     help="With --ensembling, how often (in steps) to query the "
+                          "policy for a new chunk. 1 = every step (most reactive, "
+                          "most compute).")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device={device}")
 
     policy, action_lo, action_hi, cfg = load_policy(args.ckpt, args.img_size, device)
+    if cfg.img_size != args.img_size:
+        print(f" WARNING: --img-size {args.img_size} does not match checkpoint's "
+              f"training resolution cfg.img_size={cfg.img_size}. Overriding to "
+              f"{cfg.img_size} to match training exactly (mismatched resolution "
+              f"is a common cause of silent 0% eval success).")
+    obs_img_size = cfg.img_size  # ALWAYS render observations at training resolution
     model = load_arm_model()
     data = mujoco.MjData(model)
-    obs_renderer = mujoco.Renderer(model, height=args.img_size, width=args.img_size)
+    obs_renderer = mujoco.Renderer(model, height=obs_img_size, width=obs_img_size)
     vid_renderer = mujoco.Renderer(model, height=args.video_size, width=args.video_size)
     text_ids = _tokenize_instruction(INSTRUCTION)
 
@@ -335,6 +379,8 @@ def main():
         policy, model, data, obs_renderer, vid_renderer, text_ids,
         action_lo, action_hi, cfg, device,
         args.num_episodes, args.seed,
+        ensembling=args.ensembling, ensembling_k=args.ensembling_k,
+        replan_every=args.replan_every,
     )
 
     rate = n_success / n_total * 100 if n_total > 0 else 0

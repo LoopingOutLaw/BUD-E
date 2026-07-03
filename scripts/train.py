@@ -176,6 +176,7 @@ def train(
     eval_max_steps: int = 300,
     eval_max_tries: int = 1,
     eval_seed: int = 123,
+    ema_decay: float = 0.999,
 ):
     if data_roots is None:
         raise ValueError(
@@ -207,6 +208,18 @@ def train(
     print(f"Model parameters: {n_params['total']:,}")
     for k, v in n_params.items():
         print(f"  {k}: {v:,}")
+
+    # ── EMA weights ────────────────────────────────────────────────────
+    # Flow-matching/diffusion-style policies are notoriously noisy step to
+    # step; the raw weights at any given checkpoint can be a much worse
+    # policy than the recent average. EMA weights are the de-facto standard
+    # fix (used by basically every diffusion policy / DDPM-adjacent paper)
+    # and cost ~nothing. eval/final checkpoints prefer EMA weights when
+    # ema_decay > 0.
+    ema_enabled = ema_decay > 0.0
+    ema_state = {k: v.detach().clone() for k, v in policy.state_dict().items()} if ema_enabled else None
+    if ema_enabled:
+        print(f"  EMA enabled: decay={ema_decay}")
 
     dl = build_dataloader(data_roots, chunk_size=chunk_size,
                           batch_size=batch_size, num_workers=num_workers,
@@ -261,6 +274,7 @@ def train(
     step = 0
     epoch = 0
     running_loss = 0.0
+    grad_norm = torch.tensor(0.0)
     t0 = time.time()
     dl_iter = iter(dl)
     loss_history = []
@@ -269,6 +283,42 @@ def train(
 
     if resume is not None:
         ckpt = torch.load(resume, map_location=device, weights_only=False)
+
+        # Guard against silent corruption: if the CLI flags used for this resume
+        # don't match the architecture the checkpoint was actually trained with,
+        # policy.load_state_dict can still succeed (shapes may coincidentally
+        # match) while optimizer.load_state_dict silently applies Adam momentum
+        # to the wrong parameters (param_groups membership shifts when e.g.
+        # dinov2_finetune_blocks changes, since only requires_grad=True params
+        # are included). This has no crash and no error message — it just makes
+        # training quietly worse. Fail loudly instead.
+        saved_cfg = ckpt.get("config", {})
+        _checks = [
+            ("img_size", cfg.img_size, saved_cfg.get("img_size")),
+            ("chunk_size", cfg.chunk_size, saved_cfg.get("chunk_size")),
+            ("n_history_frames", cfg.n_history_frames, saved_cfg.get("n_history_frames")),
+            ("use_dinov2", cfg.use_dinov2, saved_cfg.get("use_dinov2")),
+            ("dinov2_finetune_blocks", cfg.dinov2_finetune_blocks, saved_cfg.get("dinov2_finetune_blocks")),
+            ("use_minilm", cfg.use_minilm, saved_cfg.get("use_minilm")),
+            ("action_dim", cfg.action_dim, saved_cfg.get("action_dim")),
+            ("state_dim", cfg.state_dim, saved_cfg.get("state_dim")),
+        ]
+        _mismatches = [f"{name}: checkpoint={saved!r} vs current CLI={cur!r}"
+                       for name, cur, saved in _checks
+                       if saved is not None and saved != cur]
+        if _mismatches:
+            raise ValueError(
+                "Refusing to resume: CLI flags don't match the checkpoint's "
+                "saved training config. Continuing anyway risks silently "
+                "corrupting the optimizer state (wrong Adam momentum applied "
+                "to the wrong parameters) with no crash and no warning.\n  "
+                + "\n  ".join(_mismatches)
+                + "\nEither fix your CLI flags to match, or if this change is "
+                  "intentional, delete the optimizer_state_dict from the "
+                  "checkpoint before resuming (this restarts Adam's momentum "
+                  "but keeps the trained weights)."
+            )
+
         policy.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if "scaler_state_dict" in ckpt:
@@ -276,6 +326,17 @@ def train(
         step = ckpt["step"]
         loss_history = ckpt.get("loss_history", [])
         eval_history = ckpt.get("eval_history", [])
+        if ema_enabled:
+            if "ema_state_dict" in ckpt:
+                ema_state = {k: v.to(device) for k, v in ckpt["ema_state_dict"].items()}
+                print("  resumed EMA weights from checkpoint")
+            else:
+                # Older checkpoint with no EMA tracking: reseed from the
+                # resumed raw weights rather than silently keeping the EMA
+                # snapshot from before load_state_dict (which would be from
+                # a freshly-initialized, untrained policy).
+                ema_state = {k: v.detach().clone() for k, v in policy.state_dict().items()}
+                print("  no EMA state in checkpoint; reseeded EMA from resumed raw weights")
         # Fast-forward scheduler using optimizer-update units (not microbatch)
         opt_steps_done = step // grad_accum_steps
         for _ in range(opt_steps_done):
@@ -312,10 +373,17 @@ def train(
 
         if (step + 1) % grad_accum_steps == 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
+            if ema_enabled:
+                with torch.no_grad():
+                    for k, v in policy.state_dict().items():
+                        if torch.is_floating_point(v):
+                            ema_state[k].mul_(ema_decay).add_(v, alpha=1.0 - ema_decay)
+                        else:
+                            ema_state[k].copy_(v)  # non-float buffers (e.g. counters): just copy
 
         running_loss += loss.item()
         step += 1
@@ -325,11 +393,18 @@ def train(
             elapsed = time.time() - t0
             sps = step / elapsed
             loss_history.append((step, avg))
-            print(f"step {step:6d} | loss {avg:.6f} | lr {scheduler.get_last_lr()[0]:.2e} | "
+            print(f"step {step:6d} | loss {avg:.6f} | grad_norm {float(grad_norm):.3f} | "
+                  f"lr {scheduler.get_last_lr()[0]:.2e} | "
                   f"{sps:.1f} steps/s | epoch {epoch}")
             running_loss = 0.0
 
         if eval_every > 0 and step > 0 and step % eval_every == 0:
+            if ema_enabled:
+                # EMA weights are what actually gets deployed at inference
+                # time, so measure success against those, not the noisier
+                # raw weights. Swap in, eval, swap back.
+                _raw_backup = {k: v.detach().clone() for k, v in policy.state_dict().items()}
+                policy.load_state_dict(ema_state)
             eval_rate, eval_n_success, eval_n_total = run_closed_loop_eval(
                 policy, cfg, _action_lo, _action_hi, device,
                 num_episodes=eval_episodes,
@@ -338,8 +413,10 @@ def train(
                 seed=eval_seed,
                 eval_state=eval_state,
             )
+            if ema_enabled:
+                policy.load_state_dict(_raw_backup)
             eval_history.append((step, eval_rate))
-            print(f"  [eval] step {step:6d} | closed-loop success "
+            print(f"  [eval{'/ema' if ema_enabled else ''}] step {step:6d} | closed-loop success "
                   f"{eval_n_success}/{eval_n_total} ({eval_rate*100:.0f}%)")
 
         if step % save_every == 0:
@@ -347,6 +424,7 @@ def train(
             torch.save({
                 "step": step,
                 "model_state_dict": policy.state_dict(),
+                "ema_state_dict": ema_state if ema_enabled else None,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scaler_state_dict": scaler.state_dict(),
                 "loss_history": loss_history,
@@ -362,6 +440,7 @@ def train(
                     "chunk_size": cfg.chunk_size,
                     "action_dim": cfg.action_dim,
                     "state_dim": cfg.state_dim,
+                    "ema_decay": ema_decay if ema_enabled else None,
                 },
             }, ckpt_path)
             print(f"  saved checkpoint: {ckpt_path}")
@@ -373,11 +452,19 @@ def train(
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
+        if ema_enabled:
+            with torch.no_grad():
+                for k, v in policy.state_dict().items():
+                    if torch.is_floating_point(v):
+                        ema_state[k].mul_(ema_decay).add_(v, alpha=1.0 - ema_decay)
+                    else:
+                        ema_state[k].copy_(v)
 
     final_ckpt = ckpt_dir / f"{task_name}_final.pt"
     torch.save({
         "step": step,
         "model_state_dict": policy.state_dict(),
+        "ema_state_dict": ema_state if ema_enabled else None,
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
         "loss_history": loss_history,
@@ -393,6 +480,7 @@ def train(
             "chunk_size": cfg.chunk_size,
             "action_dim": cfg.action_dim,
             "state_dim": cfg.state_dim,
+            "ema_decay": ema_decay if ema_enabled else None,
         },
     }, final_ckpt)
     print(f"Training done in {time.time()-t0:.0f}s. Final checkpoint: {final_ckpt}")
@@ -459,6 +547,13 @@ if __name__ == "__main__":
                              "progress signal, not a final benchmark).")
     parser.add_argument("--eval-max-tries", type=int, default=1,
                         help="Retries per eval episode. 1 = single-shot.")
+    parser.add_argument("--ema-decay", type=float, default=0.999,
+                        help="EMA decay for a shadow copy of the weights "
+                             "(0 disables). EMA weights are used for "
+                             "closed-loop --eval-every checks and are saved "
+                             "alongside raw weights in every checkpoint as "
+                             "ema_state_dict. Prefer loading ema_state_dict "
+                             "over model_state_dict at eval/deploy time.")
     parser.add_argument("--eval-seed", type=int, default=123,
                         help="Fixed seed for eval cube positions so success "
                              "curves are comparable across checkpoints.")
@@ -494,4 +589,5 @@ if __name__ == "__main__":
         eval_max_steps=args.eval_max_steps,
         eval_max_tries=args.eval_max_tries,
         eval_seed=args.eval_seed,
+        ema_decay=args.ema_decay,
     )
