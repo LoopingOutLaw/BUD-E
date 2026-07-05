@@ -112,6 +112,10 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--img-size", type=int, default=64)
     ap.add_argument("--keep-failures", action="store_true")
+    ap.add_argument("--recovery-jitter-xy", type=float, default=0.0,
+                    help="Max XY waypoint jitter in meters during approach/descent, decayed to zero before close.")
+    ap.add_argument("--recovery-jitter-prob", type=float, default=0.0,
+                    help="Probability that an episode uses recoverable approach/descent jitter.")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -128,6 +132,10 @@ def main():
     n_never_grasped = 0
     n_written = 0
     t0 = time.time()
+
+    if args.recovery_jitter_xy > 0.0 and args.recovery_jitter_prob > 0.0:
+        print("  recovery jitter enabled: "
+              f"xy=+/-{args.recovery_jitter_xy:.3f}m  prob={args.recovery_jitter_prob:.2f}")
 
     for i in range(args.max_eps):
         # Cube position: wide randomization to force visual grounding
@@ -158,7 +166,14 @@ def main():
         for _ in range(50):
             mujoco.mj_step(model, data)
 
-        policy = ScriptedPickAndPlace(model, data, cube_start_xy=np.array([cx, cy]))
+        policy = ScriptedPickAndPlace(
+            model,
+            data,
+            cube_start_xy=np.array([cx, cy]),
+            recovery_jitter_xy=args.recovery_jitter_xy,
+            recovery_jitter_prob=args.recovery_jitter_prob,
+            rng=rng,
+        )
         renderer = mujoco.Renderer(model, height=args.img_size, width=args.img_size)
 
         ep = _main_loop(model, data, policy, renderer, cam_ids)
