@@ -65,6 +65,7 @@ def load_policy(ckpt_path: str, img_size: int, device: str):
     cfg.use_visual_action_cond = saved_cfg.get("use_visual_action_cond", False)
     cfg.use_context_action_head = saved_cfg.get("use_context_action_head", False)
     cfg.use_perception = saved_cfg.get("use_perception", False)
+    cfg.use_perception_action_cond = saved_cfg.get("use_perception_action_cond", False)
     cfg.perception_dim = saved_cfg.get("perception_dim", 3)
 
     action_lo = ckpt.get("action_norm_lo", None)
