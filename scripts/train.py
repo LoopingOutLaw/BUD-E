@@ -256,6 +256,7 @@ def train(
     use_visual_action_cond: bool = True,
     use_context_action_head: bool = True,
     use_perception: bool = True,
+    use_perception_action_cond: bool = True,
     early_bc_weight: float = 12.0,
     early_bc_frac: float = 0.22,
     lazy_videos: bool = False,
@@ -288,6 +289,7 @@ def train(
     cfg.use_visual_action_cond = use_visual_action_cond
     cfg.use_context_action_head = use_context_action_head
     cfg.use_perception = use_perception
+    cfg.use_perception_action_cond = use_perception_action_cond
     cfg.perception_dim = 3
     # Auto-detect action/state dims from dataset if possible; fall back to 6 (SO-101 5-arm + 1-grip).
     cfg.action_dim = action_dim_override if (action_dim_override := _detect_action_dim(data_roots)) else 6
@@ -443,6 +445,7 @@ def train(
             ("use_visual_action_cond", cfg.use_visual_action_cond, saved_cfg.get("use_visual_action_cond", False)),
             ("use_context_action_head", cfg.use_context_action_head, saved_cfg.get("use_context_action_head", False)),
             ("use_perception", cfg.use_perception, saved_cfg.get("use_perception", False)),
+            ("use_perception_action_cond", cfg.use_perception_action_cond, saved_cfg.get("use_perception_action_cond", False)),
         ]
         _mismatches = [f"{name}: checkpoint={saved!r} vs current CLI={cur!r}"
                        for name, cur, saved in _checks
@@ -588,6 +591,7 @@ def train(
                     "use_visual_action_cond": cfg.use_visual_action_cond,
                     "use_context_action_head": cfg.use_context_action_head,
                     "use_perception": cfg.use_perception,
+                    "use_perception_action_cond": cfg.use_perception_action_cond,
                     "perception_dim": cfg.perception_dim,
                 },
             }, ckpt_path)
@@ -655,6 +659,7 @@ def train(
             "use_visual_action_cond": cfg.use_visual_action_cond,
             "use_context_action_head": cfg.use_context_action_head,
             "use_perception": cfg.use_perception,
+            "use_perception_action_cond": cfg.use_perception_action_cond,
             "perception_dim": cfg.perception_dim,
         },
     }, final_ckpt)
@@ -715,6 +720,8 @@ if __name__ == "__main__":
                         help="Disable the spatial context action decoder and use the older vector BC head.")
     parser.add_argument("--no-perception", action="store_true",
                         help="Disable the pixel-derived red-cube centroid token.")
+    parser.add_argument("--no-perception-action-cond", action="store_true",
+                        help="Disable direct pixel-centroid conditioning in the action decoder.")
     parser.add_argument("--early-bc-weight", type=float, default=12.0,
                         help="Extra BC loss weight for early approach frames where cube visual grounding matters most.")
     parser.add_argument("--early-bc-frac", type=float, default=0.22,
@@ -797,6 +804,7 @@ if __name__ == "__main__":
         use_visual_action_cond=not args.no_visual_action_cond,
         use_context_action_head=not args.no_context_action_head,
         use_perception=not args.no_perception,
+        use_perception_action_cond=not args.no_perception_action_cond,
         early_bc_weight=args.early_bc_weight,
         early_bc_frac=args.early_bc_frac,
         lazy_videos=args.lazy_videos,

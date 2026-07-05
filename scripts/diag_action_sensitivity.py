@@ -51,6 +51,7 @@ def load_policy(path: str, device: str):
     cfg.use_visual_action_cond = saved.get("use_visual_action_cond", False)
     cfg.use_context_action_head = saved.get("use_context_action_head", False)
     cfg.use_perception = saved.get("use_perception", False)
+    cfg.use_perception_action_cond = saved.get("use_perception_action_cond", False)
     cfg.perception_dim = saved.get("perception_dim", 3)
     cfg.patch_size = 16
 

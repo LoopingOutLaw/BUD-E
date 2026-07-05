@@ -36,7 +36,8 @@ for step, p, cfg, final_loss, loss_hist, eval_hist in rows:
           f"action_dim={cfg.get('action_dim')} state_dim={cfg.get('state_dim')} "
           f"dinov2_finetune_blocks={cfg.get('dinov2_finetune_blocks')} "
           f"bc={cfg.get('use_bc_head')} visual_cond={cfg.get('use_visual_action_cond')} "
-          f"context={cfg.get('use_context_action_head')} perception={cfg.get('use_perception')}")
+          f"context={cfg.get('use_context_action_head')} perception={cfg.get('use_perception')} "
+          f"perception_action_cond={cfg.get('use_perception_action_cond')}")
     if loss_hist:
         print(f"  loss: first={loss_hist[0]}  mid={loss_hist[len(loss_hist)//2]}  last={loss_hist[-1]}")
     else:

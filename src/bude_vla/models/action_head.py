@@ -165,17 +165,26 @@ class ContextActionHead(nn.Module):
     """Deterministic action chunk decoder over the full VLA token context.
 
     Learned action queries cross-attend to all policy tokens, including spatial
-    visual patch tokens. This avoids the failure mode where a single state token
-    becomes proprio/phase-only and drops cube location information.
+    visual patch tokens. Optional direct conditioning lets deployment-critical
+    pixel features affect the action queries and residual output directly, so
+    they cannot be silently dropped by the backbone state token.
     """
 
     def __init__(self, action_dim: int = 6, chunk_size: int = 8,
                  d: int = 256, hidden_dim: int = 512,
-                 depth: int = 2, heads: int = 8):
+                 depth: int = 2, heads: int = 8,
+                 cond_dim: int = 0):
         super().__init__()
         self.action_dim = action_dim
         self.chunk_size = chunk_size
         self.queries = nn.Parameter(torch.randn(1, chunk_size, d) * 0.02)
+        self.query_cond = (
+            nn.Sequential(
+                nn.LayerNorm(cond_dim),
+                nn.Linear(cond_dim, d),
+            )
+            if cond_dim > 0 else None
+        )
         layer = nn.TransformerDecoderLayer(
             d_model=d,
             nhead=heads,
@@ -192,9 +201,24 @@ class ContextActionHead(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, action_dim),
         )
+        self.cond_residual = (
+            nn.Sequential(
+                nn.LayerNorm(cond_dim),
+                nn.Linear(cond_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, chunk_size * action_dim),
+            )
+            if cond_dim > 0 else None
+        )
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, cond: torch.Tensor | None = None) -> torch.Tensor:
         b = tokens.shape[0]
         q = self.queries.expand(b, -1, -1)
+        if cond is not None and self.query_cond is not None:
+            q = q + self.query_cond(cond).unsqueeze(1)
         h = self.decoder(q, tokens)
-        return torch.tanh(self.out(h))
+        logits = self.out(h)
+        if cond is not None and self.cond_residual is not None:
+            residual = self.cond_residual(cond).view(b, self.chunk_size, self.action_dim)
+            logits = logits + residual
+        return torch.tanh(logits)

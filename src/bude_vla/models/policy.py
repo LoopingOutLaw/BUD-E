@@ -53,6 +53,7 @@ class BUDEConfig:
     use_visual_action_cond: bool = False
     use_context_action_head: bool = False
     use_perception: bool = False
+    use_perception_action_cond: bool = False
     perception_dim: int = 3
 
 
@@ -159,6 +160,7 @@ class BUDEPolicy(nn.Module):
             )
             if cfg.use_visual_action_cond else None
         )
+        context_cond_dim = cfg.d * 2 if (cfg.use_perception_action_cond and cfg.use_perception) else 0
         self.context_action_head = (
             ContextActionHead(
                 action_dim=cfg.action_dim,
@@ -167,6 +169,7 @@ class BUDEPolicy(nn.Module):
                 hidden_dim=cfg.action_head_hidden_dim,
                 depth=2,
                 heads=cfg.backbone_heads,
+                cond_dim=context_cond_dim,
             )
             if cfg.use_context_action_head else None
         )
@@ -177,6 +180,27 @@ class BUDEPolicy(nn.Module):
 
     def _patch_start_index(self) -> int:
         return self.cfg.n_prompts + 1 + int(self.perception_proj is not None)
+
+    def _perception_input(self, batch: dict, ref: torch.Tensor) -> torch.Tensor:
+        perception = batch.get("perception")
+        if perception is None:
+            return torch.zeros(
+                ref.shape[0], self.cfg.perception_dim,
+                dtype=ref.dtype, device=ref.device,
+            )
+        return perception.to(device=ref.device, dtype=ref.dtype)
+
+    def _perception_embedding(self, batch: dict, ref: torch.Tensor) -> torch.Tensor | None:
+        if self.perception_proj is None:
+            return None
+        return self.perception_proj(self._perception_input(batch, ref))
+
+    def _context_action_cond(self, batch: dict, tokens: torch.Tensor) -> torch.Tensor | None:
+        if not self.cfg.use_perception_action_cond or self.perception_proj is None:
+            return None
+        state_hidden = tokens[:, self.cfg.n_prompts, :]
+        perception_emb = self._perception_embedding(batch, tokens)
+        return torch.cat([state_hidden, perception_emb], dim=-1)
 
     def encode(self, batch: dict) -> torch.Tensor:
         """Build the input token sequence and run the backbone.
@@ -200,15 +224,8 @@ class BUDEPolicy(nn.Module):
 
         token_parts = [prompts, state_token]
         if self.perception_proj is not None:
-            perception = batch.get("perception")
-            if perception is None:
-                perception = torch.zeros(
-                    images.shape[0], self.cfg.perception_dim,
-                    dtype=images.dtype, device=images.device,
-                )
-            else:
-                perception = perception.to(device=images.device, dtype=images.dtype)
-            token_parts.append(self.perception_proj(perception).unsqueeze(1))
+            perception_emb = self._perception_embedding(batch, images)
+            token_parts.append(perception_emb.unsqueeze(1))
         token_parts.extend([patch_tokens, text_tokens])
 
         tokens = torch.cat(token_parts, dim=1)
@@ -242,7 +259,7 @@ class BUDEPolicy(nn.Module):
         v_pred = self.action_head(x_t, tau, state_hidden)
         out = {"velocity": v_pred, "tokens": tokens}
         if self.context_action_head is not None:
-            out["bc_actions"] = self.context_action_head(tokens)
+            out["bc_actions"] = self.context_action_head(tokens, self._context_action_cond(batch, tokens))
         elif self.bc_action_head is not None:
             out["bc_actions"] = self.bc_action_head(state_hidden)
         return out
@@ -252,7 +269,7 @@ class BUDEPolicy(nn.Module):
         """Inference: predict the action chunk via flow matching."""
         tokens = self.encode(batch)
         if self.context_action_head is not None:
-            return self.context_action_head(tokens)
+            return self.context_action_head(tokens, self._context_action_cond(batch, tokens))
         n_p = self.cfg.n_prompts
         state_hidden = tokens[:, n_p, :]
         if self.action_cond_proj is not None:
