@@ -39,6 +39,43 @@ def collate_fn(batch: list[dict]) -> dict:
     return out
 
 
+def build_bc_loss_weights(
+    phase: torch.Tensor | None,
+    mask: torch.Tensor,
+    action_dim: int,
+    early_bc_frac: float,
+    early_bc_weight: float,
+    late_bc_frac: float,
+    late_bc_weight: float,
+    gripper_loss_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return sample/dimension weights and denominator for weighted BC loss."""
+    if phase is None:
+        sample_w = torch.ones((mask.shape[0], 1, 1), device=mask.device, dtype=mask.dtype)
+    else:
+        phase = phase.to(device=mask.device, dtype=mask.dtype)
+        sample_w_1d = torch.ones_like(phase)
+        if early_bc_weight != 1.0:
+            sample_w_1d = torch.where(
+                phase <= early_bc_frac,
+                torch.full_like(sample_w_1d, early_bc_weight),
+                sample_w_1d,
+            )
+        if late_bc_weight != 1.0:
+            sample_w_1d = torch.where(
+                phase >= late_bc_frac,
+                torch.full_like(sample_w_1d, late_bc_weight),
+                sample_w_1d,
+            )
+        sample_w = sample_w_1d.view(-1, 1, 1)
+
+    dim_w = torch.ones(action_dim, device=mask.device, dtype=mask.dtype)
+    if action_dim > 0:
+        dim_w[-1] = gripper_loss_weight
+    dim_w_view = dim_w.view(1, 1, action_dim)
+    denom = (mask.unsqueeze(-1) * sample_w * dim_w_view).sum().clamp_min(1.0)
+    return sample_w, dim_w, denom
+
 
 class PhaseBalancedBatchSampler(torch.utils.data.Sampler[list[int]]):
     """Sample batches across episodes at similar phases.
@@ -253,12 +290,16 @@ def train(
     ema_decay: float = 0.999,
     use_bc_head: bool = True,
     bc_loss_weight: float = 1.0,
+    flow_loss_weight: float = 1.0,
     use_visual_action_cond: bool = True,
     use_context_action_head: bool = True,
     use_perception: bool = True,
     use_perception_action_cond: bool = True,
     early_bc_weight: float = 12.0,
     early_bc_frac: float = 0.22,
+    late_bc_weight: float = 1.0,
+    late_bc_frac: float = 0.35,
+    gripper_loss_weight: float = 1.0,
     lazy_videos: bool = False,
     lazy_cache_size: int = 8,
     episode_batches: bool = True,
@@ -513,16 +554,18 @@ def train(
             flow_loss = (((v_pred - v_target) ** 2) * mask).sum() / (mask.sum() * v_pred.shape[-1])
             if "bc_actions" in out:
                 bc_err = ((out["bc_actions"] - batch["actions"]) ** 2) * mask
-                if "phase" in batch:
-                    sample_w = torch.where(
-                        batch["phase"] <= early_bc_frac,
-                        torch.full_like(batch["phase"], early_bc_weight),
-                        torch.ones_like(batch["phase"]),
-                    ).view(-1, 1, 1)
-                    bc_loss = (bc_err * sample_w).sum() / ((mask * sample_w).sum() * v_pred.shape[-1])
-                else:
-                    bc_loss = bc_err.sum() / (mask.sum() * v_pred.shape[-1])
-                loss = flow_loss + bc_loss_weight * bc_loss
+                sample_w, dim_w, bc_denom = build_bc_loss_weights(
+                    phase=batch.get("phase"),
+                    mask=mask.squeeze(-1),
+                    action_dim=v_pred.shape[-1],
+                    early_bc_frac=early_bc_frac,
+                    early_bc_weight=early_bc_weight,
+                    late_bc_frac=late_bc_frac,
+                    late_bc_weight=late_bc_weight,
+                    gripper_loss_weight=gripper_loss_weight,
+                )
+                bc_loss = (bc_err * sample_w * dim_w.view(1, 1, -1)).sum() / bc_denom
+                loss = flow_loss_weight * flow_loss + bc_loss_weight * bc_loss
             else:
                 bc_loss = torch.zeros((), device=device)
                 loss = flow_loss
@@ -588,6 +631,12 @@ def train(
                     "ema_decay": ema_decay if ema_enabled else None,
                     "use_bc_head": cfg.use_bc_head,
                     "bc_loss_weight": bc_loss_weight if cfg.use_bc_head else None,
+                    "flow_loss_weight": flow_loss_weight,
+                    "early_bc_weight": early_bc_weight if cfg.use_bc_head else None,
+                    "early_bc_frac": early_bc_frac if cfg.use_bc_head else None,
+                    "late_bc_weight": late_bc_weight if cfg.use_bc_head else None,
+                    "late_bc_frac": late_bc_frac if cfg.use_bc_head else None,
+                    "gripper_loss_weight": gripper_loss_weight if cfg.use_bc_head else None,
                     "use_visual_action_cond": cfg.use_visual_action_cond,
                     "use_context_action_head": cfg.use_context_action_head,
                     "use_perception": cfg.use_perception,
@@ -656,6 +705,12 @@ def train(
             "ema_decay": ema_decay if ema_enabled else None,
             "use_bc_head": cfg.use_bc_head,
             "bc_loss_weight": bc_loss_weight if cfg.use_bc_head else None,
+            "flow_loss_weight": flow_loss_weight,
+            "early_bc_weight": early_bc_weight if cfg.use_bc_head else None,
+            "early_bc_frac": early_bc_frac if cfg.use_bc_head else None,
+            "late_bc_weight": late_bc_weight if cfg.use_bc_head else None,
+            "late_bc_frac": late_bc_frac if cfg.use_bc_head else None,
+            "gripper_loss_weight": gripper_loss_weight if cfg.use_bc_head else None,
             "use_visual_action_cond": cfg.use_visual_action_cond,
             "use_context_action_head": cfg.use_context_action_head,
             "use_perception": cfg.use_perception,
@@ -714,6 +769,8 @@ if __name__ == "__main__":
                         help="Disable the deterministic behavior-cloning action head. New training enables it by default for stable receding-horizon rollout.")
     parser.add_argument("--bc-loss-weight", type=float, default=1.0,
                         help="Weight for direct normalized action-chunk MSE when the BC head is enabled.")
+    parser.add_argument("--flow-loss-weight", type=float, default=1.0,
+                        help="Weight for auxiliary flow-matching loss. Lower this when deploying the BC/context head.")
     parser.add_argument("--no-visual-action-cond", action="store_true",
                         help="Do not add pooled visual patch tokens to the action conditioning vector.")
     parser.add_argument("--no-context-action-head", action="store_true",
@@ -726,6 +783,12 @@ if __name__ == "__main__":
                         help="Extra BC loss weight for early approach frames where cube visual grounding matters most.")
     parser.add_argument("--early-bc-frac", type=float, default=0.22,
                         help="Episode phase threshold for early-frame BC weighting.")
+    parser.add_argument("--late-bc-weight", type=float, default=1.0,
+                        help="Extra BC loss weight for late close/lift/move frames.")
+    parser.add_argument("--late-bc-frac", type=float, default=0.35,
+                        help="Episode phase threshold where late-frame BC weighting starts.")
+    parser.add_argument("--gripper-loss-weight", type=float, default=1.0,
+                        help="BC loss multiplier for the gripper action dimension.")
     parser.add_argument("--init-from", default=None,
                         help="Initialize model weights from a checkpoint without loading optimizer/scheduler state. Useful for adding the BC head to an existing flow checkpoint.")
     parser.add_argument("--resume", default=None,
@@ -801,12 +864,16 @@ if __name__ == "__main__":
         ema_decay=args.ema_decay,
         use_bc_head=not args.no_bc_head,
         bc_loss_weight=args.bc_loss_weight,
+        flow_loss_weight=args.flow_loss_weight,
         use_visual_action_cond=not args.no_visual_action_cond,
         use_context_action_head=not args.no_context_action_head,
         use_perception=not args.no_perception,
         use_perception_action_cond=not args.no_perception_action_cond,
         early_bc_weight=args.early_bc_weight,
         early_bc_frac=args.early_bc_frac,
+        late_bc_weight=args.late_bc_weight,
+        late_bc_frac=args.late_bc_frac,
+        gripper_loss_weight=args.gripper_loss_weight,
         lazy_videos=args.lazy_videos,
         lazy_cache_size=args.lazy_cache_size,
         episode_batches=not args.no_episode_batches,

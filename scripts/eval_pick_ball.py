@@ -95,6 +95,32 @@ def load_policy(ckpt_path: str, img_size: int, device: str):
     return policy, action_lo, action_hi, cfg
 
 
+def parse_cube_positions(spec: str | None) -> list[tuple[float, float]] | None:
+    """Parse explicit eval cube positions formatted as "x,y;x,y"."""
+    if spec is None or not spec.strip():
+        return None
+    positions: list[tuple[float, float]] = []
+    for raw_pair in spec.split(";"):
+        pair = raw_pair.strip()
+        if not pair:
+            continue
+        parts = [part.strip() for part in pair.split(",")]
+        if len(parts) != 2:
+            raise ValueError(
+                f"Invalid cube position {pair!r}; expected x,y pairs separated by semicolons"
+            )
+        try:
+            x, y = float(parts[0]), float(parts[1])
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid cube position {pair!r}; x,y values must be numbers"
+            ) from exc
+        positions.append((x, y))
+    if not positions:
+        raise ValueError("--cube-positions did not contain any x,y pairs")
+    return positions
+
+
 def reset_cube(data, cx: float, cy: float):
     data.qpos[CUBE_QPOS_START:CUBE_QPOS_START + 3] = [cx, cy, CUBE_REST_Z]
     data.qpos[CUBE_QPOS_START + 3:CUBE_QPOS_START + 7] = [1.0, 0.0, 0.0, 0.0]
@@ -177,7 +203,10 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
              num_episodes, seed,
              ensembling: bool = False, ensembling_k: float = 0.5,
              replan_every: int = 1,
-             exec_first_only: bool = False):
+             exec_first_only: bool = False,
+             cube_positions: list[tuple[float, float]] | None = None,
+             cube_x_range: tuple[float, float] = (0.15, 0.35),
+             cube_y_range: tuple[float, float] = (-0.10, 0.10)):
     rng = np.random.default_rng(seed)
     all_frames = []
     n_success = 0
@@ -197,8 +226,11 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
     C_single = 6  # single-frame dual-cam channels
 
     for ep in range(num_episodes):
-        cx = float(rng.uniform(0.15, 0.35))
-        cy = float(rng.uniform(-0.10, 0.10))
+        if cube_positions:
+            cx, cy = cube_positions[ep % len(cube_positions)]
+        else:
+            cx = float(rng.uniform(cube_x_range[0], cube_x_range[1]))
+            cy = float(rng.uniform(cube_y_range[0], cube_y_range[1]))
         print(f" ep {ep:3d} cube=({cx:.2f},{cy:.2f})", end=" ", flush=True)
 
         mujoco.mj_resetData(model, data)
@@ -374,6 +406,15 @@ def main():
     ap.add_argument("--exec-first-only", action="store_true",
                     help="Drop all but chunk[0] of each sampled chunk and re-sample "
                          "every step. Equivalent to chunk_size=1 without retraining.")
+    ap.add_argument("--cube-positions", default=None,
+                    help="Explicit eval cube positions as 'x,y;x,y'. Repeats if "
+                         "--num-episodes is larger than the list.")
+    ap.add_argument("--cube-x-range", nargs=2, type=float, default=(0.15, 0.35),
+                    metavar=("MIN", "MAX"),
+                    help="Random eval cube x range used when --cube-positions is unset.")
+    ap.add_argument("--cube-y-range", nargs=2, type=float, default=(-0.10, 0.10),
+                    metavar=("MIN", "MAX"),
+                    help="Random eval cube y range used when --cube-positions is unset.")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -392,6 +433,9 @@ def main():
     vid_renderer = mujoco.Renderer(model, height=args.video_size, width=args.video_size)
     text_ids = _tokenize_instruction(INSTRUCTION)
 
+    cube_positions = parse_cube_positions(args.cube_positions)
+    if cube_positions:
+        print(f"Using fixed eval cube positions: {cube_positions}")
     print(f"Running {args.num_episodes} eval episodes "
           f"(obs={args.img_size}x{args.img_size}, video={args.video_size}x{args.video_size})...")
     n_success, n_total, frames = run_eval(
@@ -401,6 +445,9 @@ def main():
         ensembling=args.ensembling, ensembling_k=args.ensembling_k,
         replan_every=args.replan_every,
         exec_first_only=args.exec_first_only,
+        cube_positions=cube_positions,
+        cube_x_range=tuple(args.cube_x_range),
+        cube_y_range=tuple(args.cube_y_range),
     )
 
     rate = n_success / n_total * 100 if n_total > 0 else 0
