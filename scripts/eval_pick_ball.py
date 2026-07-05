@@ -151,8 +151,8 @@ def is_success(data) -> bool:
     return err < SUCCESS_THRESHOLD
 
 
-def is_failure(data, step) -> bool:
-    if step >= MAX_STEPS:
+def is_failure(data, step, max_steps: int = MAX_STEPS) -> bool:
+    if step >= max_steps:
         return True
     cube_id = mujoco.mj_name2id(data.model, mujoco.mjtObj.mjOBJ_BODY, "cube")
     cube_pos = data.xpos[cube_id]
@@ -206,7 +206,8 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
              exec_first_only: bool = False,
              cube_positions: list[tuple[float, float]] | None = None,
              cube_x_range: tuple[float, float] = (0.15, 0.35),
-             cube_y_range: tuple[float, float] = (-0.10, 0.10)):
+             cube_y_range: tuple[float, float] = (-0.10, 0.10),
+             max_steps: int = MAX_STEPS):
     rng = np.random.default_rng(seed)
     all_frames = []
     n_success = 0
@@ -247,7 +248,7 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
         ever_grasped = False
         img_buffer = []  # reset per episode
 
-        for step in range(MAX_STEPS):
+        for step in range(max_steps):
             # Render from SAME cameras as training
             obs_renderer.update_scene(data, camera=front_top_cam)
             img_top = np.asarray(obs_renderer.render()).copy()
@@ -360,7 +361,7 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
                 print(f"SUCCESS (step {step})")
                 break
 
-            if is_failure(data, step):
+            if is_failure(data, step, max_steps=max_steps):
                 f = add_overlay(vid_frame, f"ep {ep}", "FAILED")
                 all_frames.append(f)
                 print(f"FAILED (step {step})")
@@ -448,6 +449,7 @@ def main():
         cube_positions=cube_positions,
         cube_x_range=tuple(args.cube_x_range),
         cube_y_range=tuple(args.cube_y_range),
+        max_steps=args.max_steps,
     )
 
     rate = n_success / n_total * 100 if n_total > 0 else 0

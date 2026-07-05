@@ -29,6 +29,17 @@ class TrainingControlsTest(unittest.TestCase):
         self.assertEqual(dim_w.tolist(), [1.0, 1.0, 1.0, 1.0, 1.0, 7.0])
         self.assertAlmostEqual(denom.item(), (2.0 + 5.0 + 5.0) * 4 * 12.0)
 
+
+    def test_recovery_offset_decays_before_final_grasp(self):
+        from bude_vla.scripted_pick_and_place import decaying_recovery_offset
+
+        offset = torch.tensor([0.02, -0.01]).numpy()
+
+        self.assertEqual(decaying_recovery_offset(offset, 0, 100).round(6).tolist(), [0.02, -0.01])
+        self.assertEqual(decaying_recovery_offset(offset, 50, 100).round(6).tolist(), [0.01, -0.005])
+        self.assertEqual(decaying_recovery_offset(offset, 100, 100).round(6).tolist(), [0.0, -0.0])
+        self.assertEqual(decaying_recovery_offset(offset, 150, 100).round(6).tolist(), [0.0, -0.0])
+
     def test_parse_cube_positions_accepts_explicit_reachable_eval_set(self):
         from scripts.eval_pick_ball import parse_cube_positions
 

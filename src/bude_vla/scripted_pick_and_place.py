@@ -59,6 +59,14 @@ PHASE_NAMES = {
 }
 
 
+def decaying_recovery_offset(offset_xy: np.ndarray, phase_step: int, total_steps: int) -> np.ndarray:
+    """Linearly remove recovery jitter so final grasp targets the real cube."""
+    if total_steps <= 0:
+        return np.zeros_like(offset_xy, dtype=np.float64)
+    frac = min(max(float(phase_step) / float(total_steps), 0.0), 1.0)
+    return np.asarray(offset_xy, dtype=np.float64) * (1.0 - frac)
+
+
 class ScriptedPickAndPlace:
     """Physics-only pick-and-place using ggand0/pick-101's proven approach.
 
@@ -66,7 +74,10 @@ class ScriptedPickAndPlace:
     + friction hold the cube naturally through contact dynamics.
     """
 
-    def __init__(self, model, data, cube_start_xy, target_xy=(0.32, 0.16)):
+    def __init__(self, model, data, cube_start_xy, target_xy=(0.32, 0.16),
+                 recovery_jitter_xy: float = 0.0,
+                 recovery_jitter_prob: float = 0.0,
+                 rng: np.random.Generator | None = None):
         self.model = model
         self.cube_start_xy = np.asarray(cube_start_xy, dtype=np.float64)
         self.target_xy = np.asarray(target_xy, dtype=np.float64)
@@ -74,6 +85,17 @@ class ScriptedPickAndPlace:
         self.phase_step = 0
         self._total_steps = 0
         self._max_steps = 2000
+
+        rng = rng if rng is not None else np.random.default_rng()
+        use_recovery = recovery_jitter_xy > 0.0 and rng.random() < recovery_jitter_prob
+        if use_recovery:
+            self._approach_recovery_xy = rng.uniform(
+                -recovery_jitter_xy, recovery_jitter_xy, size=2)
+            self._descent_recovery_xy = rng.uniform(
+                -recovery_jitter_xy, recovery_jitter_xy, size=2)
+        else:
+            self._approach_recovery_xy = np.zeros(2, dtype=np.float64)
+            self._descent_recovery_xy = np.zeros(2, dtype=np.float64)
 
         # IK controller (matching pick-101: targets gripperframe)
         self.ik = IKController(model, data, end_effector_site="gripperframe")
@@ -130,6 +152,8 @@ class ScriptedPickAndPlace:
             above_pos = cube_live.copy()
             above_pos[2] += GRASP_Z_OFFSET + HEIGHT_OFFSET
             above_pos[1] += FINGER_WIDTH_OFFSET
+            above_pos[:2] += decaying_recovery_offset(
+                self._approach_recovery_xy, self.phase_step, APPROACH_STEPS)
 
             ctrl = self.ik.step_toward_target(
                 above_pos, gripper_action=GRIPPER_OPEN,
@@ -145,6 +169,8 @@ class ScriptedPickAndPlace:
             grasp_target = cube_live.copy()
             grasp_target[2] += GRASP_Z_OFFSET
             grasp_target[1] += FINGER_WIDTH_OFFSET
+            grasp_target[:2] += decaying_recovery_offset(
+                self._descent_recovery_xy, self.phase_step, DESCENT_STEPS)
 
             ctrl = self.ik.step_toward_target(
                 grasp_target, gripper_action=GRIPPER_OPEN,
