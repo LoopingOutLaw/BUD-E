@@ -23,6 +23,8 @@ def main() -> None:
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--early-prob', type=float, default=0.75)
     ap.add_argument('--early-max-frac', type=float, default=0.22)
+    ap.add_argument('--phase-bins', type=int, default=0,
+                    help='If >0, ignore --early-prob and sample equally from this many episode phase bins.')
     args = ap.parse_args()
 
     root = Path(args.data_root)
@@ -48,16 +50,30 @@ def main() -> None:
 
     selected_by_ep: dict[int, set[int]] = {e['ep_idx']: set() for e in episodes}
     n_eps = len(episodes)
-    while sum(len(v) for v in selected_by_ep.values()) < args.max_frames:
-        ep_i = int(rng.choice(n_eps, p=weights))
-        ep = episodes[ep_i]
-        if rng.random() < args.early_prob:
-            phase = float(rng.uniform(0.0, args.early_max_frac))
-        else:
-            phase = float(rng.uniform(0.0, 1.0))
-        local = int(round(phase * max(0, ep['length'] - 1))) + int(rng.integers(-4, 5))
-        local = min(max(local, 0), ep['length'] - 1)
-        selected_by_ep[ep['ep_idx']].add(local)
+    if args.phase_bins > 0:
+        per_bin = int(np.ceil(args.max_frames / args.phase_bins))
+        for bin_i in range(args.phase_bins):
+            lo = bin_i / args.phase_bins
+            hi = (bin_i + 1) / args.phase_bins
+            target = min(args.max_frames, (bin_i + 1) * per_bin)
+            while sum(len(v) for v in selected_by_ep.values()) < target:
+                ep_i = int(rng.choice(n_eps, p=weights))
+                ep = episodes[ep_i]
+                phase = float(rng.uniform(lo, hi))
+                local = int(round(phase * max(0, ep['length'] - 1))) + int(rng.integers(-4, 5))
+                local = min(max(local, 0), ep['length'] - 1)
+                selected_by_ep[ep['ep_idx']].add(local)
+    else:
+        while sum(len(v) for v in selected_by_ep.values()) < args.max_frames:
+            ep_i = int(rng.choice(n_eps, p=weights))
+            ep = episodes[ep_i]
+            if rng.random() < args.early_prob:
+                phase = float(rng.uniform(0.0, args.early_max_frac))
+            else:
+                phase = float(rng.uniform(0.0, 1.0))
+            local = int(round(phase * max(0, ep['length'] - 1))) + int(rng.integers(-4, 5))
+            local = min(max(local, 0), ep['length'] - 1)
+            selected_by_ep[ep['ep_idx']].add(local)
 
     total_sel = sum(len(v) for v in selected_by_ep.values())
     first_ep = episodes[0]
@@ -104,6 +120,7 @@ def main() -> None:
         'seed': args.seed,
         'early_prob': args.early_prob,
         'early_max_frac': args.early_max_frac,
+        'phase_bins': int(args.phase_bins),
     }
     (out / 'meta.json').write_text(json.dumps(meta, indent=2))
     print(f'done: {out} frames={total_sel} shape={(total_sel, H, W, channels)}')
