@@ -39,6 +39,53 @@ def collate_fn(batch: list[dict]) -> dict:
     return out
 
 
+
+class PhaseBalancedBatchSampler(torch.utils.data.Sampler[list[int]]):
+    """Sample batches across episodes at similar phases.
+
+    This is slower than single-episode batches, but it is better for visual
+    grounding: each batch contains different cube positions at comparable task
+    phases, so the model cannot minimize BC loss by predicting one average
+    approach action. The lazy cache stays bounded by --lazy-cache-size.
+    """
+
+    def __init__(self, dataset: BUDETrainingDataset, batch_size: int,
+                 seed: int = 0, early_prob: float = 0.5,
+                 early_max_frac: float = 0.18):
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+        self.early_prob = float(early_prob)
+        self.early_max_frac = float(early_max_frac)
+        self.n_batches = max(1, len(dataset) // self.batch_size)
+
+    def __len__(self) -> int:
+        return self.n_batches
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed)
+        ep_lengths = np.asarray([int(ep["length"]) for ep in self.dataset._episodes], dtype=np.int64)
+        ep_weights = ep_lengths.astype(np.float64)
+        ep_weights = ep_weights / ep_weights.sum()
+        n_eps = len(ep_lengths)
+        for _ in range(self.n_batches):
+            if rng.random() < self.early_prob:
+                phase = float(rng.uniform(0.0, self.early_max_frac))
+            else:
+                phase = float(rng.uniform(0.0, 1.0))
+            replace = n_eps < self.batch_size
+            ep_ids = rng.choice(n_eps, size=self.batch_size, replace=replace, p=ep_weights)
+            batch = []
+            for ep_i in ep_ids:
+                length = int(ep_lengths[ep_i])
+                # Small jitter avoids repeatedly sampling identical frame numbers.
+                jitter = int(rng.integers(-3, 4))
+                local = int(round(phase * max(0, length - 1))) + jitter
+                local = min(max(local, 0), length - 1)
+                batch.append(self.dataset._cum_frames[int(ep_i)] + local)
+            yield batch
+
+
 def _detect_dim(roots, key):
     """Read dataset shape for `key` from the first valid info.json."""
     for root in roots:
@@ -66,11 +113,18 @@ def _detect_state_dim(roots: list) -> int | None:
 def build_dataloader(roots: list[str | Path], chunk_size: int = 4,
                      batch_size: int = 32, num_workers: int = 0,
                      augment: bool = False,
-                     n_history_frames: int = 1) -> torch.utils.data.DataLoader:
+                     n_history_frames: int = 1,
+                     lazy_videos: bool = False,
+                     lazy_cache_size: int = 8,
+                     episode_batches: bool = True,
+                     frame_cache: str | Path | None = None) -> torch.utils.data.DataLoader:
     all_frames = []
     for root in roots:
         ds = BUDETrainingDataset(root, chunk_size=chunk_size, augment=augment,
-                                 n_history_frames=n_history_frames)
+                                 n_history_frames=n_history_frames,
+                                 lazy_videos=lazy_videos,
+                                 lazy_cache_size=lazy_cache_size,
+                                 frame_cache=frame_cache)
         ds.read()
         all_frames.append(ds)
         print(f"  loaded {len(ds)} frames from {root}")
@@ -80,12 +134,31 @@ def build_dataloader(roots: list[str | Path], chunk_size: int = 4,
     else:
         combined = torch.utils.data.ConcatDataset(all_frames)
 
-    dl = torch.utils.data.DataLoader(
-        combined, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, collate_fn=collate_fn,
-        pin_memory=False, drop_last=True,
-        persistent_workers=num_workers > 0,
+    if frame_cache is not None:
+        print(f"  frame cache: random-access cached frames enabled ({frame_cache})")
+
+    use_episode_batches = (
+        lazy_videos
+        and frame_cache is None
+        and episode_batches
+        and len(all_frames) == 1
+        and isinstance(combined, BUDETrainingDataset)
     )
+    if use_episode_batches:
+        sampler = PhaseBalancedBatchSampler(combined, batch_size=batch_size)
+        dl = torch.utils.data.DataLoader(
+            combined, batch_sampler=sampler,
+            num_workers=num_workers, collate_fn=collate_fn,
+            pin_memory=False, persistent_workers=num_workers > 0,
+        )
+        print("  lazy video batching: phase-balanced multi-episode batches enabled")
+    else:
+        dl = torch.utils.data.DataLoader(
+            combined, batch_size=batch_size, shuffle=True,
+            num_workers=num_workers, collate_fn=collate_fn,
+            pin_memory=False, drop_last=True,
+            persistent_workers=num_workers > 0,
+        )
     print(f"  total frames: {len(combined)}, batches/epoch: {len(dl)}, "
           f"history_frames: {n_history_frames}")
     return dl
@@ -166,6 +239,7 @@ def train(
     augment: bool = False,
     task_name: str = "policy",
     resume: str | None = None,
+    init_from: str | None = None,
     num_workers: int = 0,
     use_dinov2: bool = False,
     dinov2_finetune_blocks: int = 4,
@@ -177,6 +251,17 @@ def train(
     eval_max_tries: int = 1,
     eval_seed: int = 123,
     ema_decay: float = 0.999,
+    use_bc_head: bool = True,
+    bc_loss_weight: float = 1.0,
+    use_visual_action_cond: bool = True,
+    use_context_action_head: bool = True,
+    use_perception: bool = True,
+    early_bc_weight: float = 12.0,
+    early_bc_frac: float = 0.22,
+    lazy_videos: bool = False,
+    lazy_cache_size: int = 8,
+    episode_batches: bool = True,
+    frame_cache: str | None = None,
 ):
     if data_roots is None:
         raise ValueError(
@@ -199,11 +284,55 @@ def train(
     cfg.dinov2_finetune_blocks = dinov2_finetune_blocks
     cfg.use_minilm = use_minilm
     cfg.n_history_frames = n_history_frames
+    cfg.use_bc_head = use_bc_head
+    cfg.use_visual_action_cond = use_visual_action_cond
+    cfg.use_context_action_head = use_context_action_head
+    cfg.use_perception = use_perception
+    cfg.perception_dim = 3
     # Auto-detect action/state dims from dataset if possible; fall back to 6 (SO-101 5-arm + 1-grip).
     cfg.action_dim = action_dim_override if (action_dim_override := _detect_action_dim(data_roots)) else 6
     cfg.state_dim  = state_dim_override  if (state_dim_override  := _detect_state_dim(data_roots))  else 6
 
     policy = BUDEPolicy(cfg).to(device)
+
+    if init_from is not None and resume is not None:
+        raise ValueError("Use either --init-from for weight initialization or --resume for exact continuation, not both.")
+
+    if init_from is not None:
+        init_ckpt = torch.load(init_from, map_location=device, weights_only=False)
+        saved_cfg = init_ckpt.get("config", {})
+        _checks = [
+            ("img_size", cfg.img_size, saved_cfg.get("img_size")),
+            ("chunk_size", cfg.chunk_size, saved_cfg.get("chunk_size")),
+            ("n_history_frames", cfg.n_history_frames, saved_cfg.get("n_history_frames")),
+            ("use_dinov2", cfg.use_dinov2, saved_cfg.get("use_dinov2")),
+            ("dinov2_finetune_blocks", cfg.dinov2_finetune_blocks, saved_cfg.get("dinov2_finetune_blocks")),
+            ("use_minilm", cfg.use_minilm, saved_cfg.get("use_minilm")),
+            ("action_dim", cfg.action_dim, saved_cfg.get("action_dim")),
+            ("state_dim", cfg.state_dim, saved_cfg.get("state_dim")),
+        ]
+        _mismatches = [f"{name}: checkpoint={saved!r} vs current CLI={cur!r}"
+                       for name, cur, saved in _checks
+                       if saved is not None and saved != cur]
+        if _mismatches:
+            raise ValueError(
+                "Refusing --init-from: architecture/data flags do not match.\n  "
+                + "\n  ".join(_mismatches)
+            )
+        init_sd = init_ckpt.get("ema_state_dict") or init_ckpt["model_state_dict"]
+        missing, unexpected = policy.load_state_dict(init_sd, strict=False)
+        allowed_prefixes = ("bc_action_head.", "action_cond_proj.", "context_action_head.", "perception_proj.")
+        allowed_missing = [k for k in missing if k.startswith(allowed_prefixes)]
+        other_missing = [k for k in missing if not k.startswith(allowed_prefixes)]
+        if other_missing or unexpected:
+            raise ValueError(
+                "Unexpected --init-from state_dict mismatch:\n"
+                f"  missing={other_missing}\n  unexpected={unexpected}"
+            )
+        print(f"  initialized weights from {init_from}")
+        if allowed_missing:
+            print(f"  initialized new modules from scratch ({len(allowed_missing)} tensors)")
+
     n_params = policy.n_params()
     print(f"Model parameters: {n_params['total']:,}")
     for k, v in n_params.items():
@@ -224,7 +353,11 @@ def train(
     dl = build_dataloader(data_roots, chunk_size=chunk_size,
                           batch_size=batch_size, num_workers=num_workers,
                           augment=augment,
-                          n_history_frames=n_history_frames)
+                          n_history_frames=n_history_frames,
+                          lazy_videos=lazy_videos,
+                          lazy_cache_size=lazy_cache_size,
+                          episode_batches=episode_batches,
+                          frame_cache=frame_cache)
 
     from bude_vla.data.action_normalization import load_action_stats, DEFAULT_LO, DEFAULT_HI
     _action_lo, _action_hi = DEFAULT_LO.copy(), DEFAULT_HI.copy()
@@ -276,6 +409,8 @@ def train(
     step = 0
     epoch = 0
     running_loss = 0.0
+    running_flow_loss = 0.0
+    running_bc_loss = 0.0
     grad_norm = torch.tensor(0.0)
     t0 = time.time()
     dl_iter = iter(dl)
@@ -304,6 +439,10 @@ def train(
             ("use_minilm", cfg.use_minilm, saved_cfg.get("use_minilm")),
             ("action_dim", cfg.action_dim, saved_cfg.get("action_dim")),
             ("state_dim", cfg.state_dim, saved_cfg.get("state_dim")),
+            ("use_bc_head", cfg.use_bc_head, saved_cfg.get("use_bc_head", False)),
+            ("use_visual_action_cond", cfg.use_visual_action_cond, saved_cfg.get("use_visual_action_cond", False)),
+            ("use_context_action_head", cfg.use_context_action_head, saved_cfg.get("use_context_action_head", False)),
+            ("use_perception", cfg.use_perception, saved_cfg.get("use_perception", False)),
         ]
         _mismatches = [f"{name}: checkpoint={saved!r} vs current CLI={cur!r}"
                        for name, cur, saved in _checks
@@ -368,7 +507,22 @@ def train(
             v_pred = out["velocity"]
             v_target = batch["actions"] - batch["noise"]
             mask = batch["mask"].unsqueeze(-1)  # (B, chunk_size, 1)
-            loss = (((v_pred - v_target) ** 2) * mask).sum() / (mask.sum() * v_pred.shape[-1])
+            flow_loss = (((v_pred - v_target) ** 2) * mask).sum() / (mask.sum() * v_pred.shape[-1])
+            if "bc_actions" in out:
+                bc_err = ((out["bc_actions"] - batch["actions"]) ** 2) * mask
+                if "phase" in batch:
+                    sample_w = torch.where(
+                        batch["phase"] <= early_bc_frac,
+                        torch.full_like(batch["phase"], early_bc_weight),
+                        torch.ones_like(batch["phase"]),
+                    ).view(-1, 1, 1)
+                    bc_loss = (bc_err * sample_w).sum() / ((mask * sample_w).sum() * v_pred.shape[-1])
+                else:
+                    bc_loss = bc_err.sum() / (mask.sum() * v_pred.shape[-1])
+                loss = flow_loss + bc_loss_weight * bc_loss
+            else:
+                bc_loss = torch.zeros((), device=device)
+                loss = flow_loss
             loss_scaled = loss / grad_accum_steps
 
         scaler.scale(loss_scaled).backward()
@@ -388,38 +542,24 @@ def train(
                             ema_state[k].copy_(v)  # non-float buffers (e.g. counters): just copy
 
         running_loss += loss.item()
+        running_flow_loss += flow_loss.item()
+        running_bc_loss += bc_loss.item()
         step += 1
 
         if step % 100 == 0:
             avg = running_loss / 100
+            flow_avg = running_flow_loss / 100
+            bc_avg = running_bc_loss / 100
             elapsed = time.time() - t0
             sps = step / elapsed
             loss_history.append((step, avg))
-            print(f"step {step:6d} | loss {avg:.6f} | grad_norm {float(grad_norm):.3f} | "
+            print(f"step {step:6d} | loss {avg:.6f} | flow {flow_avg:.6f} | "
+                  f"bc {bc_avg:.6f} | grad_norm {float(grad_norm):.3f} | "
                   f"lr {scheduler.get_last_lr()[0]:.2e} | "
                   f"{sps:.1f} steps/s | epoch {epoch}")
             running_loss = 0.0
-
-        if eval_every > 0 and step > 0 and step % eval_every == 0:
-            if ema_enabled:
-                # EMA weights are what actually gets deployed at inference
-                # time, so measure success against those, not the noisier
-                # raw weights. Swap in, eval, swap back.
-                _raw_backup = {k: v.detach().clone() for k, v in policy.state_dict().items()}
-                policy.load_state_dict(ema_state)
-            eval_rate, eval_n_success, eval_n_total = run_closed_loop_eval(
-                policy, cfg, _action_lo, _action_hi, device,
-                num_episodes=eval_episodes,
-                max_steps_per_try=eval_max_steps,
-                max_tries=eval_max_tries,
-                seed=eval_seed,
-                eval_state=eval_state,
-            )
-            if ema_enabled:
-                policy.load_state_dict(_raw_backup)
-            eval_history.append((step, eval_rate))
-            print(f"  [eval{'/ema' if ema_enabled else ''}] step {step:6d} | closed-loop success "
-                  f"{eval_n_success}/{eval_n_total} ({eval_rate*100:.0f}%)")
+            running_flow_loss = 0.0
+            running_bc_loss = 0.0
 
         if step % save_every == 0:
             ckpt_path = ckpt_dir / f"{task_name}_step_{step:06d}.pt"
@@ -443,9 +583,36 @@ def train(
                     "action_dim": cfg.action_dim,
                     "state_dim": cfg.state_dim,
                     "ema_decay": ema_decay if ema_enabled else None,
+                    "use_bc_head": cfg.use_bc_head,
+                    "bc_loss_weight": bc_loss_weight if cfg.use_bc_head else None,
+                    "use_visual_action_cond": cfg.use_visual_action_cond,
+                    "use_context_action_head": cfg.use_context_action_head,
+                    "use_perception": cfg.use_perception,
+                    "perception_dim": cfg.perception_dim,
                 },
             }, ckpt_path)
             print(f"  saved checkpoint: {ckpt_path}")
+
+        if eval_every > 0 and step > 0 and step % eval_every == 0:
+            if ema_enabled:
+                # EMA weights are what actually gets deployed at inference
+                # time, so measure success against those, not the noisier
+                # raw weights. Swap in, eval, swap back.
+                _raw_backup = {k: v.detach().clone() for k, v in policy.state_dict().items()}
+                policy.load_state_dict(ema_state)
+            eval_rate, eval_n_success, eval_n_total = run_closed_loop_eval(
+                policy, cfg, _action_lo, _action_hi, device,
+                num_episodes=eval_episodes,
+                max_steps_per_try=eval_max_steps,
+                max_tries=eval_max_tries,
+                seed=eval_seed,
+                eval_state=eval_state,
+            )
+            if ema_enabled:
+                policy.load_state_dict(_raw_backup)
+            eval_history.append((step, eval_rate))
+            print(f"  [eval{'/ema' if ema_enabled else ''}] step {step:6d} | closed-loop success "
+                  f"{eval_n_success}/{eval_n_total} ({eval_rate*100:.0f}%)")
 
     # Flush any remaining accumulated gradients
     if step % grad_accum_steps != 0:
@@ -483,6 +650,12 @@ def train(
             "action_dim": cfg.action_dim,
             "state_dim": cfg.state_dim,
             "ema_decay": ema_decay if ema_enabled else None,
+            "use_bc_head": cfg.use_bc_head,
+            "bc_loss_weight": bc_loss_weight if cfg.use_bc_head else None,
+            "use_visual_action_cond": cfg.use_visual_action_cond,
+            "use_context_action_head": cfg.use_context_action_head,
+            "use_perception": cfg.use_perception,
+            "perception_dim": cfg.perception_dim,
         },
     }, final_ckpt)
     print(f"Training done in {time.time()-t0:.0f}s. Final checkpoint: {final_ckpt}")
@@ -522,6 +695,32 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=0,
                         help="DataLoader workers (0=single-thread). Use 2-4 "
                              "to keep GPU fed when augmentation is on.")
+    parser.add_argument("--lazy-videos", action="store_true", default=False,
+                        help="Decode MP4s lazily per-episode instead of "
+                             "predecoding all_images.npy. Use when the .npy "
+                             "does not fit on disk or is corrupted.")
+    parser.add_argument("--lazy-cache-size", type=int, default=1,
+                        help="Per-worker LRU cache size (num episodes held decoded in RAM). Use 1 with lazy episode batches to avoid RAM spikes.")
+    parser.add_argument("--no-episode-batches", action="store_true",
+                        help="Disable phase-balanced lazy-video batch sampling. Normal random frame shuffling is much more RAM/CPU intensive.")
+    parser.add_argument("--frame-cache", default=None,
+                        help="Path to a prebuilt stacked frame cache from scripts/build_frame_cache.py. Avoids MP4 decoding during training.")
+    parser.add_argument("--no-bc-head", action="store_true",
+                        help="Disable the deterministic behavior-cloning action head. New training enables it by default for stable receding-horizon rollout.")
+    parser.add_argument("--bc-loss-weight", type=float, default=1.0,
+                        help="Weight for direct normalized action-chunk MSE when the BC head is enabled.")
+    parser.add_argument("--no-visual-action-cond", action="store_true",
+                        help="Do not add pooled visual patch tokens to the action conditioning vector.")
+    parser.add_argument("--no-context-action-head", action="store_true",
+                        help="Disable the spatial context action decoder and use the older vector BC head.")
+    parser.add_argument("--no-perception", action="store_true",
+                        help="Disable the pixel-derived red-cube centroid token.")
+    parser.add_argument("--early-bc-weight", type=float, default=12.0,
+                        help="Extra BC loss weight for early approach frames where cube visual grounding matters most.")
+    parser.add_argument("--early-bc-frac", type=float, default=0.22,
+                        help="Episode phase threshold for early-frame BC weighting.")
+    parser.add_argument("--init-from", default=None,
+                        help="Initialize model weights from a checkpoint without loading optimizer/scheduler state. Useful for adding the BC head to an existing flow checkpoint.")
     parser.add_argument("--resume", default=None,
                         help="Path to a checkpoint to resume training from. "
                              "Restores model, optimizer, step counter, and "
@@ -580,6 +779,7 @@ if __name__ == "__main__":
         save_every=args.save_every,
         augment=args.augment,
         resume=args.resume,
+        init_from=args.init_from,
         task_name=args.task,
         num_workers=args.num_workers,
         use_dinov2=args.use_dinov2,
@@ -592,4 +792,15 @@ if __name__ == "__main__":
         eval_max_tries=args.eval_max_tries,
         eval_seed=args.eval_seed,
         ema_decay=args.ema_decay,
+        use_bc_head=not args.no_bc_head,
+        bc_loss_weight=args.bc_loss_weight,
+        use_visual_action_cond=not args.no_visual_action_cond,
+        use_context_action_head=not args.no_context_action_head,
+        use_perception=not args.no_perception,
+        early_bc_weight=args.early_bc_weight,
+        early_bc_frac=args.early_bc_frac,
+        lazy_videos=args.lazy_videos,
+        lazy_cache_size=args.lazy_cache_size,
+        episode_batches=not args.no_episode_batches,
+        frame_cache=args.frame_cache,
     )

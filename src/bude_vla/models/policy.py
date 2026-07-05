@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from bude_vla.models.action_head import FlowMatchingActionHead
+from bude_vla.models.action_head import ContextActionHead, DirectActionHead, FlowMatchingActionHead
 from bude_vla.models.backbone import PolicyTransformer
 from bude_vla.models.proprio import ProprioProjector
 from bude_vla.models.soft_prompts import SoftPrompts
@@ -49,6 +49,11 @@ class BUDEConfig:
     action_head_temporal_heads: int = 4
     use_temporal_head: bool = True
     flow_n_steps: int = 50
+    use_bc_head: bool = False
+    use_visual_action_cond: bool = False
+    use_context_action_head: bool = False
+    use_perception: bool = False
+    perception_dim: int = 3
 
 
 class BUDEPolicy(nn.Module):
@@ -111,6 +116,15 @@ class BUDEPolicy(nn.Module):
                 heads=cfg.text_heads,
             )
         self.proprio = ProprioProjector(state_dim=cfg.state_dim, out_dim=cfg.d)
+        self.perception_proj = (
+            nn.Sequential(
+                nn.LayerNorm(cfg.perception_dim),
+                nn.Linear(cfg.perception_dim, cfg.d),
+                nn.SiLU(),
+                nn.Linear(cfg.d, cfg.d),
+            )
+            if cfg.use_perception else None
+        )
         self.soft_prompts = SoftPrompts(n_domains=cfg.n_domains,
                                         n_prompts=cfg.n_prompts, d=cfg.d)
         self.backbone = PolicyTransformer(
@@ -127,10 +141,42 @@ class BUDEPolicy(nn.Module):
             temporal_depth=cfg.action_head_temporal_depth if cfg.use_temporal_head else 0,
             temporal_heads=cfg.action_head_temporal_heads,
         )
+        self.bc_action_head = (
+            DirectActionHead(
+                action_dim=cfg.action_dim,
+                chunk_size=cfg.chunk_size,
+                d=cfg.d,
+                hidden_dim=cfg.action_head_hidden_dim,
+            )
+            if cfg.use_bc_head else None
+        )
+        self.action_cond_proj = (
+            nn.Sequential(
+                nn.LayerNorm(cfg.d * 3),
+                nn.Linear(cfg.d * 3, cfg.d),
+                nn.SiLU(),
+                nn.Linear(cfg.d, cfg.d),
+            )
+            if cfg.use_visual_action_cond else None
+        )
+        self.context_action_head = (
+            ContextActionHead(
+                action_dim=cfg.action_dim,
+                chunk_size=cfg.chunk_size,
+                d=cfg.d,
+                hidden_dim=cfg.action_head_hidden_dim,
+                depth=2,
+                heads=cfg.backbone_heads,
+            )
+            if cfg.use_context_action_head else None
+        )
 
         self.chunk_size = cfg.chunk_size
         self.action_dim = cfg.action_dim
         self.d = cfg.d
+
+    def _patch_start_index(self) -> int:
+        return self.cfg.n_prompts + 1 + int(self.perception_proj is not None)
 
     def encode(self, batch: dict) -> torch.Tensor:
         """Build the input token sequence and run the backbone.
@@ -152,7 +198,20 @@ class BUDEPolicy(nn.Module):
         state_token = self.proprio(proprio).unsqueeze(1)  # (B, 1, d)
         prompts = self.soft_prompts.gather(domain_id)    # (B, N_p, d)
 
-        tokens = torch.cat([prompts, state_token, patch_tokens, text_tokens], dim=1)
+        token_parts = [prompts, state_token]
+        if self.perception_proj is not None:
+            perception = batch.get("perception")
+            if perception is None:
+                perception = torch.zeros(
+                    images.shape[0], self.cfg.perception_dim,
+                    dtype=images.dtype, device=images.device,
+                )
+            else:
+                perception = perception.to(device=images.device, dtype=images.dtype)
+            token_parts.append(self.perception_proj(perception).unsqueeze(1))
+        token_parts.extend([patch_tokens, text_tokens])
+
+        tokens = torch.cat(token_parts, dim=1)
         tokens = self.backbone(tokens)
         return tokens
 
@@ -163,25 +222,65 @@ class BUDEPolicy(nn.Module):
         noise = batch["noise"]          # (B, T, A)
 
         tokens = self.encode(batch)
-        # Pull the state token out (always at position n_prompts)
+        # Pull the state token out (always at position n_prompts).
+        # Optionally add pooled visual patch tokens so action decoding cannot
+        # collapse to a proprio/phase-only policy.
         n_p = self.cfg.n_prompts
         state_hidden = tokens[:, n_p, :]                      # (B, d)
+        if self.action_cond_proj is not None:
+            n_patch = self.vision.num_patches if hasattr(self.vision, "num_patches") else self.vision.patch_embed.num_patches
+            patch_start = self._patch_start_index()
+            patches = tokens[:, patch_start:patch_start + n_patch, :]
+            visual_mean = patches.mean(dim=1)
+            visual_max = patches.max(dim=1).values
+            state_hidden = self.action_cond_proj(torch.cat([state_hidden, visual_mean, visual_max], dim=-1))
 
         # x_t at training time: (1-tau) * noise + tau * actions
         # and the velocity target is actions - noise
         tau_b = tau.view(-1, 1, 1)
         x_t = (1.0 - tau_b) * noise + tau_b * actions
         v_pred = self.action_head(x_t, tau, state_hidden)
-        return {"velocity": v_pred, "tokens": tokens}
+        out = {"velocity": v_pred, "tokens": tokens}
+        if self.context_action_head is not None:
+            out["bc_actions"] = self.context_action_head(tokens)
+        elif self.bc_action_head is not None:
+            out["bc_actions"] = self.bc_action_head(state_hidden)
+        return out
 
     @torch.no_grad()
     def sample(self, batch: dict) -> torch.Tensor:
         """Inference: predict the action chunk via flow matching."""
         tokens = self.encode(batch)
+        if self.context_action_head is not None:
+            return self.context_action_head(tokens)
         n_p = self.cfg.n_prompts
         state_hidden = tokens[:, n_p, :]
+        if self.action_cond_proj is not None:
+            n_patch = self.vision.num_patches if hasattr(self.vision, "num_patches") else self.vision.patch_embed.num_patches
+            patch_start = self._patch_start_index()
+            patches = tokens[:, patch_start:patch_start + n_patch, :]
+            visual_mean = patches.mean(dim=1)
+            visual_max = patches.max(dim=1).values
+            state_hidden = self.action_cond_proj(torch.cat([state_hidden, visual_mean, visual_max], dim=-1))
+        if self.bc_action_head is not None:
+            return self.bc_action_head(state_hidden)
         actions = self.action_head.sample(state_hidden)
         return actions
+
+    @torch.no_grad()
+    def sample_flow(self, batch: dict) -> torch.Tensor:
+        """Inference through the stochastic flow head, even when BC is enabled."""
+        tokens = self.encode(batch)
+        n_p = self.cfg.n_prompts
+        state_hidden = tokens[:, n_p, :]
+        if self.action_cond_proj is not None:
+            n_patch = self.vision.num_patches if hasattr(self.vision, "num_patches") else self.vision.patch_embed.num_patches
+            patch_start = self._patch_start_index()
+            patches = tokens[:, patch_start:patch_start + n_patch, :]
+            visual_mean = patches.mean(dim=1)
+            visual_max = patches.max(dim=1).values
+            state_hidden = self.action_cond_proj(torch.cat([state_hidden, visual_mean, visual_max], dim=-1))
+        return self.action_head.sample(state_hidden)
 
     def n_params(self) -> dict[str, int]:
         def parts(m: nn.Module) -> int:
@@ -195,5 +294,13 @@ class BUDEPolicy(nn.Module):
             "backbone": parts(self.backbone),
             "action_head": parts(self.action_head),
         }
+        if self.bc_action_head is not None:
+            out["bc_action_head"] = parts(self.bc_action_head)
+        if self.action_cond_proj is not None:
+            out["action_cond_proj"] = parts(self.action_cond_proj)
+        if self.context_action_head is not None:
+            out["context_action_head"] = parts(self.context_action_head)
+        if self.perception_proj is not None:
+            out["perception_proj"] = parts(self.perception_proj)
         out["total"] = sum(out.values())
         return out
