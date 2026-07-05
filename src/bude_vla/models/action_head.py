@@ -128,3 +128,73 @@ class FlowMatchingActionHead(nn.Module):
             v = self.forward(x, tau, cond)
             x = x + v / self.n_steps
         return torch.clamp(x, -1.0, 1.0)
+
+
+class DirectActionHead(nn.Module):
+    """Deterministic chunk predictor for behavior cloning rollouts.
+
+    Flow matching is useful when the action distribution is genuinely
+    multi-modal. For this scripted SO-101 pick task, the expert is mostly
+    deterministic given image + proprio, so a direct normalized-action head is
+    a better deployment control surface and a useful auxiliary loss.
+    """
+
+    def __init__(self, action_dim: int = 6, chunk_size: int = 8,
+                 d: int = 256, hidden_dim: int = 512):
+        super().__init__()
+        self.action_dim = action_dim
+        self.chunk_size = chunk_size
+        self.net = nn.Sequential(
+            nn.LayerNorm(d),
+            nn.Linear(d, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, chunk_size * action_dim),
+        )
+
+    def forward(self, cond: torch.Tensor) -> torch.Tensor:
+        b = cond.shape[0]
+        out = self.net(cond)
+        out = out.view(b, self.chunk_size, self.action_dim)
+        return torch.tanh(out)
+
+
+
+class ContextActionHead(nn.Module):
+    """Deterministic action chunk decoder over the full VLA token context.
+
+    Learned action queries cross-attend to all policy tokens, including spatial
+    visual patch tokens. This avoids the failure mode where a single state token
+    becomes proprio/phase-only and drops cube location information.
+    """
+
+    def __init__(self, action_dim: int = 6, chunk_size: int = 8,
+                 d: int = 256, hidden_dim: int = 512,
+                 depth: int = 2, heads: int = 8):
+        super().__init__()
+        self.action_dim = action_dim
+        self.chunk_size = chunk_size
+        self.queries = nn.Parameter(torch.randn(1, chunk_size, d) * 0.02)
+        layer = nn.TransformerDecoderLayer(
+            d_model=d,
+            nhead=heads,
+            dim_feedforward=hidden_dim,
+            activation="gelu",
+            dropout=0.0,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(layer, num_layers=depth)
+        self.out = nn.Sequential(
+            nn.LayerNorm(d),
+            nn.Linear(d, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, action_dim),
+        )
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        b = tokens.shape[0]
+        q = self.queries.expand(b, -1, -1)
+        h = self.decoder(q, tokens)
+        return torch.tanh(self.out(h))

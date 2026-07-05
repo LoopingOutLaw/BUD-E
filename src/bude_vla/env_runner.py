@@ -26,6 +26,7 @@ from bude_vla.data.action_normalization import (
     load_action_stats,
 )
 from bude_vla.data.lerobot_v3 import _domain_from_instruction
+from bude_vla.perception import detect_red_centroid
 from bude_vla.envs.so101_mjx import (
     ARM_QPOS_START, ARM_QPOS_END,
     GRIPPER_QPOS_START, GRIPPER_QPOS_END,
@@ -150,13 +151,15 @@ def _build_proprio(model, data, state_dim: int) -> np.ndarray:
 
 def _build_batch(image: np.ndarray, proprio: np.ndarray,
                  text_ids: np.ndarray, instruction: str, domain_id: int,
-                 device: str) -> dict:
+                 device: str, n_history_frames: int = 1) -> dict:
+    perception = detect_red_centroid(image, n_history_frames=n_history_frames)
     img = torch.from_numpy(image.astype(np.float32)).permute(2, 0, 1) / 255.0
     return {
         "images": img.unsqueeze(0).to(device),
         "text_ids": torch.from_numpy(text_ids).unsqueeze(0).to(device),
         "instruction": [instruction],
         "proprio": torch.from_numpy(proprio.astype(np.float32)).unsqueeze(0).to(device),
+        "perception": torch.from_numpy(perception).unsqueeze(0).to(device),
         "domain_id": torch.tensor([domain_id], dtype=torch.long).to(device),
     }
 
@@ -279,10 +282,14 @@ class PolicyRolloutRunner:
             cursor = 0
             self._frame_buffer = []
             self._action_queue = []
+            ever_grasped = False
 
             for step in range(self.max_steps_per_try):
                 img = self._render(data)
                 stacked = self._stacked_view(img)
+                current_grasp = is_grasping_from_contacts(self.model, data)
+                if current_grasp > 0.5:
+                    ever_grasped = True
                 arm_proprio = _build_proprio(self.model, data, self.state_dim)
                 if record_video_mode and record_camera != "default":
                     frames.append(self._render(data, camera=record_camera))
@@ -300,7 +307,8 @@ class PolicyRolloutRunner:
                     batch = _build_batch(stacked, arm_proprio, self.text_ids,
                                          _PICK_INSTRUCTION,
                                          domain_id=_domain_from_instruction(_PICK_INSTRUCTION),
-                                         device=self.device)
+                                         device=self.device,
+                                         n_history_frames=self.n_history_frames)
                     new_chunk = policy.sample(batch)[0].detach().cpu().numpy()
                     if self._use_norm:
                         new_chunk = denormalize_actions(
@@ -319,7 +327,8 @@ class PolicyRolloutRunner:
                         batch = _build_batch(stacked, arm_proprio, self.text_ids,
                                              _PICK_INSTRUCTION,
                                              domain_id=_domain_from_instruction(_PICK_INSTRUCTION),
-                                             device=self.device)
+                                             device=self.device,
+                                             n_history_frames=self.n_history_frames)
                         chunk = policy.sample(batch)[0].detach().cpu().numpy()
                         cursor = 0
                     a = chunk[cursor]
@@ -337,7 +346,7 @@ class PolicyRolloutRunner:
                 _carry_cube_with(self.model, data)
                 _smooth_arm_to(arm_target, try_idx)
 
-                if _is_success(self.model, data):
+                if _is_success(self.model, data) and ever_grasped:
                     success = True
                     if record_video_mode and record_camera != "default":
                         frames.append(self._render(data, camera=record_camera))

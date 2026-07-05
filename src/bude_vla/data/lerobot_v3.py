@@ -18,6 +18,7 @@ from typing import List
 import numpy as np
 import torch
 
+from bude_vla.perception import detect_red_centroid
 from bude_vla.data.action_normalization import (
     DEFAULT_HI,
     DEFAULT_LO,
@@ -300,7 +301,10 @@ class BUDETrainingDataset:
                  brightness_range: float = 0.10,
                  crop_pad: int = 8,
                  normalize: bool = True,
-                 n_history_frames: int = 1):
+                 n_history_frames: int = 1,
+                 lazy_videos: bool = True,
+                 lazy_cache_size: int = 8,
+                 frame_cache: str | Path | None = None):
         self.root = Path(root)
         self.chunk_size = chunk_size
         self.augment = augment
@@ -308,10 +312,23 @@ class BUDETrainingDataset:
         self.crop_pad = crop_pad
         self.normalize = normalize
         self.n_history_frames = n_history_frames
+        # When True, skip the giant all_images.npy precache and decode MP4s
+        # lazily per-episode. Required when the .npy would not fit on disk
+        # (1.5 TiB cache on a 338 GB volume, for example) or when the cache
+        # is corrupted.
+        self._lazy_videos = lazy_videos
+        self._lazy_cache_size = lazy_cache_size
+        # Per-worker LRU cache of decoded episodes: ep_idx -> (T,H,W,6) uint8.
+        # Insertion order = LRU order; pop(0) evicts oldest.
+        self._lazy_cache: dict[int, np.ndarray] = {}
+        self._frame_cache_dir = Path(frame_cache) if frame_cache is not None else None
+        self._cache_images: np.ndarray | None = None
+        self._cache_global_indices: np.ndarray | None = None
         self._episodes: list[dict] = []
         self._cum_frames: list[int] = []
         self._total_frames = 0
         self._images: np.ndarray | None = None
+        self._has_wrist: bool = True
         self._rng = np.random.default_rng()
         self._action_lo: np.ndarray | None = None
         self._action_hi: np.ndarray | None = None
@@ -350,13 +367,45 @@ class BUDETrainingDataset:
             self._cum_frames.append(self._total_frames)
             self._total_frames += T
 
+        if self._frame_cache_dir is not None:
+            img_path = self._frame_cache_dir / "images.uint8.npy"
+            idx_path = self._frame_cache_dir / "global_indices.npy"
+            if not img_path.exists() or not idx_path.exists():
+                raise FileNotFoundError(
+                    f"frame cache missing {img_path} or {idx_path}; run scripts/build_frame_cache.py first")
+            self._cache_images = np.load(str(img_path), mmap_mode="r")
+            self._cache_global_indices = np.load(str(idx_path), mmap_mode="r")
+            if self._cache_images.shape[0] != self._cache_global_indices.shape[0]:
+                raise ValueError("frame cache image/index length mismatch")
+            self._images = None
+            self._total_frames = int(self._cache_global_indices.shape[0])
+            if self.normalize:
+                info_path = self.root / "meta" / "info.json"
+                self._action_lo, self._action_hi = load_action_stats(info_path)
+            return self
+
         npy_path = self.root / "all_images.npy"
-        if npy_path.exists():
-            self._images = np.load(str(npy_path), mmap_mode="r")
-            assert self._images.shape[0] == self._total_frames, \
-                f"npy has {self._images.shape[0]} frames, expected {self._total_frames}"
-        else:
-            self._precache_images(npy_path)
+        use_npy = False
+        if not self._lazy_videos and npy_path.exists():
+            existing = np.load(str(npy_path), mmap_mode="r")
+            if existing.shape[0] == self._total_frames:
+                # Sanity: at least the first episode must have real content.
+                if existing.ndim == 4 and np.asarray(existing[0]).max() > 0:
+                    self._images = existing
+                    self._has_wrist = existing.shape[-1] == 6
+                    use_npy = True
+                else:
+                    import warnings
+                    warnings.warn(
+                        f"all_images.npy exists but its first frame is all-zero "
+                        f"(corrupted cache). Falling back to lazy MP4 loading.")
+            else:
+                import warnings
+                warnings.warn(
+                    f"all_images.npy shape mismatch: {existing.shape[0]} vs "
+                    f"{self._total_frames} expected. Falling back to lazy MP4 loading.")
+        if not use_npy:
+            self._images = None  # lazy mode: decode per-episode via _load_episode_frames
 
         if self.normalize:
             info_path = self.root / "meta" / "info.json"
@@ -418,10 +467,37 @@ class BUDETrainingDataset:
         del all_imgs
         self._images = np.load(str(npy_path), mmap_mode="r")
 
+    def _load_episode_frames(self, ep_idx: int) -> np.ndarray:
+        cached = self._lazy_cache.get(ep_idx)
+        if cached is not None:
+            return cached
+        ep = next(e for e in self._episodes if e["ep_idx"] == ep_idx)
+        chunk_idx = ep["chunk_idx"]
+        vid_top = (self.root / "videos" / f"chunk-{chunk_idx:03d}" /
+                   "observation.images.top" / f"episode_{ep_idx:06d}.mp4")
+        import imageio.v3 as iio
+        frames_top = iio.imread(str(vid_top), plugin="pyav")
+        vid_wrist = (self.root / "videos" / f"chunk-{chunk_idx:03d}" /
+                     "observation.images.wrist" / f"episode_{ep_idx:06d}.mp4")
+        if vid_wrist.exists():
+            frames_wrist = iio.imread(str(vid_wrist), plugin="pyav")
+            frames = np.concatenate([frames_top, frames_wrist], axis=-1)
+        else:
+            frames = np.concatenate([frames_top, frames_top], axis=-1)
+        self._lazy_cache[ep_idx] = frames
+        while len(self._lazy_cache) > self._lazy_cache_size:
+            self._lazy_cache.pop(next(iter(self._lazy_cache)))
+        return frames
+
     def __len__(self) -> int:
         return self._total_frames
 
     def __getitem__(self, idx: int) -> dict:
+        cache_row = None
+        if self._cache_global_indices is not None:
+            cache_row = int(idx)
+            idx = int(self._cache_global_indices[cache_row])
+
         ep_i = 0
         while ep_i < len(self._cum_frames) - 1 and idx >= self._cum_frames[ep_i + 1]:
             ep_i += 1
@@ -431,20 +507,47 @@ class BUDETrainingDataset:
         # Stack n_history_frames: current frame plus up to n_history_frames-1
         # earlier frames from the same episode. Clamped to episode start.
         n_h = self.n_history_frames
-        if n_h <= 1:
-            stacked = self._images[idx]  # (H, W, 6)
+        if self._cache_images is not None:
+            stacked = self._cache_images[cache_row]
+            expected_c = n_h * 6
+            if stacked.shape[-1] != expected_c:
+                raise ValueError(
+                    f"frame cache has {stacked.shape[-1]} channels but "
+                    f"n_history_frames={n_h} requires {expected_c}. "
+                    "Rebuild the cache with matching --n-history-frames."
+                )
+        elif self._images is not None:
+            if n_h <= 1:
+                stacked = self._images[idx]
+            else:
+                start = max(0, frame_in_ep - (n_h - 1))
+                window = self._images[idx - (frame_in_ep - start): idx + 1]
+                if window.shape[0] < n_h:
+                    pad_n = n_h - window.shape[0]
+                    pad = np.repeat(window[:1], pad_n, axis=0)
+                    window = np.concatenate([pad, window], axis=0)
+                window = np.ascontiguousarray(window)
+                stacked = np.transpose(window, (1, 2, 0, 3)).reshape(
+                    window.shape[1], window.shape[2], window.shape[0] * window.shape[-1])
         else:
-            start = max(0, frame_in_ep - (n_h - 1))
-            window = self._images[idx - (frame_in_ep - start): idx + 1]
-            # Repeat the earliest frame if we're at the boundary
-            if window.shape[0] < n_h:
-                pad_n = n_h - window.shape[0]
-                pad = np.repeat(window[:1], pad_n, axis=0)
-                window = np.concatenate([pad, window], axis=0)
-            window = np.ascontiguousarray(window)
-            stacked = np.transpose(window, (1, 2, 0, 3)).reshape(
-                window.shape[1], window.shape[2], window.shape[0] * window.shape[-1])
+            ep_frames = self._load_episode_frames(ep["ep_idx"])
+            T = ep_frames.shape[0]
+            if frame_in_ep >= T:
+                frame_in_ep = T - 1
+            if n_h <= 1:
+                stacked = ep_frames[frame_in_ep]
+            else:
+                start = max(0, frame_in_ep - (n_h - 1))
+                sel = ep_frames[start: frame_in_ep + 1]
+                if sel.shape[0] < n_h:
+                    pad_n = n_h - sel.shape[0]
+                    pad = np.repeat(sel[:1], pad_n, axis=0)
+                    sel = np.concatenate([pad, sel], axis=0)
+                sel = np.ascontiguousarray(sel)
+                stacked = np.transpose(sel, (1, 2, 0, 3)).reshape(
+                    sel.shape[1], sel.shape[2], sel.shape[0] * sel.shape[-1])
 
+        perception = torch.from_numpy(detect_red_centroid(stacked, n_history_frames=n_h))
         img = torch.from_numpy(
             stacked.astype(np.float32)
         ).permute(2, 0, 1).contiguous() / 255.0
@@ -471,14 +574,21 @@ class BUDETrainingDataset:
         tau = torch.rand(1).squeeze()
         noise = torch.randn_like(act)
 
+        phase = torch.tensor(
+            float(frame_in_ep) / float(max(1, ep["length"] - 1)),
+            dtype=torch.float32,
+        )
+
         return {
             "images": img,
             "text_ids": txt,
             "instruction": ep["instruction"],
             "proprio": st,
+            "perception": perception,
             "domain_id": dom,
             "actions": act,
             "tau": tau,
             "noise": noise,
             "mask": mask,
+            "phase": phase,
         }

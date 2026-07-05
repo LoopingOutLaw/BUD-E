@@ -43,6 +43,7 @@ from bude_vla.envs.so101_mjx import (
     is_grasping_from_contacts,
 )
 from bude_vla.models.policy import BUDEPolicy, BUDEConfig
+from bude_vla.perception import detect_red_centroid
 
 SUCCESS_THRESHOLD = 0.05
 INSTRUCTION = "pick up the red cube and place it in the blue target zone"
@@ -60,6 +61,11 @@ def load_policy(ckpt_path: str, img_size: int, device: str):
     cfg.n_history_frames = saved_cfg.get("n_history_frames", 1)
     cfg.chunk_size = saved_cfg.get("chunk_size", 4)
     cfg.img_size = saved_cfg.get("img_size", img_size)
+    cfg.use_bc_head = saved_cfg.get("use_bc_head", False)
+    cfg.use_visual_action_cond = saved_cfg.get("use_visual_action_cond", False)
+    cfg.use_context_action_head = saved_cfg.get("use_context_action_head", False)
+    cfg.use_perception = saved_cfg.get("use_perception", False)
+    cfg.perception_dim = saved_cfg.get("perception_dim", 3)
 
     action_lo = ckpt.get("action_norm_lo", None)
     action_hi = ckpt.get("action_norm_hi", None)
@@ -137,12 +143,14 @@ def build_batch(image: np.ndarray, proprio: np.ndarray,
                 n_history_frames: int = 1) -> dict:
     # For n_history_frames > 1: image is already stacked (H, W, n_h*6)
     # For n_history_frames == 1: image is just (H, W, 6)
+    perception = detect_red_centroid(image, n_history_frames=n_history_frames)
     img = torch.from_numpy(image.astype(np.float32)).permute(2, 0, 1) / 255.0
     return {
         "images": img.unsqueeze(0).to(device),
         "text_ids": torch.from_numpy(text_ids).unsqueeze(0).to(device),
         "instruction": [INSTRUCTION],
         "proprio": torch.from_numpy(proprio.astype(np.float32)).unsqueeze(0).to(device),
+        "perception": torch.from_numpy(perception).unsqueeze(0).to(device),
         "domain_id": torch.tensor([_domain_from_instruction(INSTRUCTION)], dtype=torch.long).to(device),
     }
 
@@ -167,7 +175,8 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
              action_lo, action_hi, cfg, device,
              num_episodes, seed,
              ensembling: bool = False, ensembling_k: float = 0.5,
-             replan_every: int = 1):
+             replan_every: int = 1,
+             exec_first_only: bool = False):
     rng = np.random.default_rng(seed)
     all_frames = []
     n_success = 0
@@ -273,13 +282,19 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
                     action_queue = q
                 a = action_queue.pop(0)
             else:
-                if chunk is None or cursor >= cfg.chunk_size:
+                if exec_first_only:
                     chunk = policy.sample(batch)[0].detach().cpu().numpy()
-                    cursor = 0
-                a = chunk[cursor]
-                cursor += 1
-                if action_lo is not None:
-                    a = denormalize_actions(a, action_lo, action_hi)
+                    a = chunk[0]
+                    if action_lo is not None:
+                        a = denormalize_actions(a, action_lo, action_hi)
+                else:
+                    if chunk is None or cursor >= cfg.chunk_size:
+                        chunk = policy.sample(batch)[0].detach().cpu().numpy()
+                        cursor = 0
+                    a = chunk[cursor]
+                    cursor += 1
+                    if action_lo is not None:
+                        a = denormalize_actions(a, action_lo, action_hi)
 
             if not np.any(np.isnan(a)):
                 arm_target = np.clip(a[:N_ARM_JOINTS], -3.5, 3.5).astype(np.float64)
@@ -352,9 +367,12 @@ def main():
                           "blending with a fresh chunk. 0=only trust the new chunk, "
                           "1=ignore new chunk entirely.")
     ap.add_argument("--replan-every", type=int, default=1,
-                     help="With --ensembling, how often (in steps) to query the "
-                          "policy for a new chunk. 1 = every step (most reactive, "
-                          "most compute).")
+                    help="With --ensembling, how often (in steps) to query the "
+                         "policy for a new chunk. 1 = every step (most reactive, "
+                         "most compute).")
+    ap.add_argument("--exec-first-only", action="store_true",
+                    help="Drop all but chunk[0] of each sampled chunk and re-sample "
+                         "every step. Equivalent to chunk_size=1 without retraining.")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -381,6 +399,7 @@ def main():
         args.num_episodes, args.seed,
         ensembling=args.ensembling, ensembling_k=args.ensembling_k,
         replan_every=args.replan_every,
+        exec_first_only=args.exec_first_only,
     )
 
     rate = n_success / n_total * 100 if n_total > 0 else 0
