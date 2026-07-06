@@ -73,23 +73,13 @@ class TrainingControlsTest(unittest.TestCase):
         self.assertEqual(hi.tolist(), [1.0, 2.0])
 
 
-    def test_adapt_proprio_state_dict_for_progress_preserves_old_weights(self):
-        from scripts.train import adapt_proprio_state_dict_for_progress
 
-        sd = {
-            "proprio.norm.weight": torch.arange(3, dtype=torch.float32),
-            "proprio.norm.bias": torch.arange(3, dtype=torch.float32) + 10,
-            "proprio.proj.weight": torch.ones(2, 3),
-            "proprio.proj.bias": torch.ones(2),
-        }
+    def test_action_dim_weights_emphasize_gripper_for_flow_and_bc(self):
+        from scripts.train import build_action_dim_weights
 
-        out = adapt_proprio_state_dict_for_progress(sd, saved_state_dim=3, current_state_dim=4)
+        w = build_action_dim_weights(6, torch.device("cpu"), torch.float32, 5.0)
 
-        self.assertEqual(out["proprio.norm.weight"].tolist(), [0.0, 1.0, 2.0, 1.0])
-        self.assertEqual(out["proprio.norm.bias"].tolist(), [10.0, 11.0, 12.0, 0.0])
-        self.assertEqual(out["proprio.proj.weight"].shape, torch.Size([2, 4]))
-        self.assertTrue(torch.equal(out["proprio.proj.weight"][:, :3], torch.ones(2, 3)))
-        self.assertTrue(torch.equal(out["proprio.proj.weight"][:, 3], torch.zeros(2)))
+        self.assertEqual(w.tolist(), [1.0, 1.0, 1.0, 1.0, 1.0, 5.0])
 
     def test_parse_cube_positions_accepts_explicit_reachable_eval_set(self):
         from scripts.eval_pick_ball import parse_cube_positions

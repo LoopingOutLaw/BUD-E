@@ -305,8 +305,7 @@ class BUDETrainingDataset:
                  lazy_videos: bool = True,
                  lazy_cache_size: int = 8,
                  frame_cache: str | Path | None = None,
-                 action_stats: tuple[np.ndarray, np.ndarray] | None = None,
-                 append_progress_to_proprio: bool = False):
+                 action_stats: tuple[np.ndarray, np.ndarray] | None = None):
         self.root = Path(root)
         self.chunk_size = chunk_size
         self.augment = augment
@@ -335,7 +334,6 @@ class BUDETrainingDataset:
         self._action_lo: np.ndarray | None = None
         self._action_hi: np.ndarray | None = None
         self._action_stats_override = action_stats
-        self.append_progress_to_proprio = bool(append_progress_to_proprio)
 
     def read(self) -> "BUDETrainingDataset":
         from pyarrow import parquet as pq
@@ -565,11 +563,8 @@ class BUDETrainingDataset:
             img = _augment_image(img, self._rng,
                                  brightness_range=self.brightness_range,
                                  crop_pad=self.crop_pad)
-        st_np = ep["states"][frame_in_ep]
+        st = torch.from_numpy(ep["states"][frame_in_ep])
         phase_value = float(frame_in_ep) / float(max(1, ep["length"] - 1))
-        if self.append_progress_to_proprio:
-            st_np = np.concatenate([st_np, np.array([phase_value], dtype=np.float32)], axis=0)
-        st = torch.from_numpy(st_np.astype(np.float32))
         txt = torch.from_numpy(ep["token_ids"])
         dom = torch.tensor(ep["domain_id"], dtype=torch.long)
 
