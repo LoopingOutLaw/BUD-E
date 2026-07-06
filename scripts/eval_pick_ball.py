@@ -221,7 +221,8 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
     target_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
     gripperframe_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
 
-    use_9d = (cfg.state_dim == 9)
+    use_9d = (cfg.state_dim in (9, 10))
+    use_progress_signal = (cfg.state_dim == 10)
     use_contact_signal = (cfg.state_dim >= 7)
     n_h = cfg.n_history_frames
     C_single = 6  # single-frame dual-cam channels
@@ -284,11 +285,14 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
             if use_9d:
                 target_pos = data.xpos[target_body_id]
                 target_rel = target_pos[:2] - gripper_pos[:2]
-                arm_proprio = np.concatenate([
+                parts = [
                     data.qpos[ARM_QPOS_START:GRIPPER_QPOS_START + 1],  # 6D
                     target_rel,                                         # 2D
                     [is_grasping],                                      # 1D = 9D
-                ]).astype(np.float32)
+                ]
+                if use_progress_signal:
+                    parts.append([min(float(step) / 1000.0, 1.0)])       # 1D progress = 10D
+                arm_proprio = np.concatenate(parts).astype(np.float32)
             elif use_contact_signal:
                 arm_proprio = np.concatenate([
                     data.qpos[ARM_QPOS_START:GRIPPER_QPOS_START + 1],  # 6D
