@@ -9,6 +9,10 @@ dist/
 .venv/
 venv/
 wandb/
+train_log*.txt
+.omo/
+eval_videos/
+logs/
 checkpoints/
 datasets/
 data/
