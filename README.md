@@ -6,6 +6,11 @@ re-implemented from scratch with reference to X-VLA (Zheng et al., 2025).
 **Status:** In development. See `docs/superpowers/specs/2026-06-13-bude-vla-design.md`
 for the design and `docs/architecture.md` for the architecture writeup.
 
+The current SO-101 pick-and-place training trail is documented in
+[`docs/pick_vla_training_notes.md`](docs/pick_vla_training_notes.md), including
+the v26 base run, the v27 precision fine-tune plan, eval settings, and the
+reasoning behind removing shortcut progress proprio.
+
 ## Quick start
 
 ```bash
