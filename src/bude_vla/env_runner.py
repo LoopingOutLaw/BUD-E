@@ -125,7 +125,7 @@ def _is_success(model, data, threshold: float = 0.05) -> bool:
     )
 
 
-def _build_proprio(model, data, state_dim: int) -> np.ndarray:
+def _build_proprio(model, data, state_dim: int, progress: float | None = None) -> np.ndarray:
     """Build proprio vector matching training dimension."""
     gripperframe_id = mujoco.mj_name2id(
         model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
@@ -139,12 +139,15 @@ def _build_proprio(model, data, state_dim: int) -> np.ndarray:
     elif state_dim == 7:
         is_g = is_grasping_from_contacts(model, data)
         return np.concatenate([base, [is_g]]).astype(np.float32)
-    elif state_dim == 9:
+    elif state_dim in (9, 10):
         gripper_pos = data.site_xpos[gripperframe_id]
         target_pos = data.xpos[target_body_id]
         target_rel = target_pos[:2] - gripper_pos[:2]
         is_g = is_grasping_from_contacts(model, data)
-        return np.concatenate([base, target_rel, [is_g]]).astype(np.float32)
+        parts = [base, target_rel, [is_g]]
+        if state_dim == 10:
+            parts.append([0.0 if progress is None else float(np.clip(progress, 0.0, 1.0))])
+        return np.concatenate(parts).astype(np.float32)
     else:
         raise ValueError(f"Unsupported state_dim: {state_dim}")
 
@@ -290,7 +293,8 @@ class PolicyRolloutRunner:
                 current_grasp = is_grasping_from_contacts(self.model, data)
                 if current_grasp > 0.5:
                     ever_grasped = True
-                arm_proprio = _build_proprio(self.model, data, self.state_dim)
+                progress = min(float(step) / 1000.0, 1.0)
+                arm_proprio = _build_proprio(self.model, data, self.state_dim, progress=progress)
                 if record_video_mode and record_camera != "default":
                     frames.append(self._render(data, camera=record_camera))
                 else:
