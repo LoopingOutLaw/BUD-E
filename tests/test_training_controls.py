@@ -40,6 +40,14 @@ class TrainingControlsTest(unittest.TestCase):
         self.assertEqual(decaying_recovery_offset(offset, 100, 100).round(6).tolist(), [0.0, -0.0])
         self.assertEqual(decaying_recovery_offset(offset, 150, 100).round(6).tolist(), [0.0, -0.0])
 
+
+    def test_failed_close_retries_until_retry_budget_is_spent(self):
+        from bude_vla.scripted_pick_and_place import should_retry_close
+
+        self.assertTrue(should_retry_close(contact_step=None, retries_used=0, max_retries=1))
+        self.assertFalse(should_retry_close(contact_step=12, retries_used=0, max_retries=1))
+        self.assertFalse(should_retry_close(contact_step=None, retries_used=1, max_retries=1))
+
     def test_parse_cube_positions_accepts_explicit_reachable_eval_set(self):
         from scripts.eval_pick_ball import parse_cube_positions
 

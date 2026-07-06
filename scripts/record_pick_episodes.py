@@ -116,6 +116,12 @@ def main():
                     help="Max XY waypoint jitter in meters during approach/descent, decayed to zero before close.")
     ap.add_argument("--recovery-jitter-prob", type=float, default=0.0,
                     help="Probability that an episode uses recoverable approach/descent jitter.")
+    ap.add_argument("--max-grasp-retries", type=int, default=0,
+                    help="Number of failed close attempts the scripted expert may recover from.")
+    ap.add_argument("--retry-miss-xy", type=float, default=0.0,
+                    help="Max XY close-target miss in meters on the first attempt for retry demos.")
+    ap.add_argument("--retry-miss-prob", type=float, default=0.0,
+                    help="Probability that an episode starts with an induced first-attempt miss.")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -136,6 +142,10 @@ def main():
     if args.recovery_jitter_xy > 0.0 and args.recovery_jitter_prob > 0.0:
         print("  recovery jitter enabled: "
               f"xy=+/-{args.recovery_jitter_xy:.3f}m  prob={args.recovery_jitter_prob:.2f}")
+    if args.max_grasp_retries > 0:
+        print("  grasp retry demos enabled: "
+              f"max_retries={args.max_grasp_retries}  "
+              f"miss=+/-{args.retry_miss_xy:.3f}m  prob={args.retry_miss_prob:.2f}")
 
     for i in range(args.max_eps):
         # Cube position: wide randomization to force visual grounding
@@ -172,6 +182,9 @@ def main():
             cube_start_xy=np.array([cx, cy]),
             recovery_jitter_xy=args.recovery_jitter_xy,
             recovery_jitter_prob=args.recovery_jitter_prob,
+            max_grasp_retries=args.max_grasp_retries,
+            retry_miss_xy=args.retry_miss_xy,
+            retry_miss_prob=args.retry_miss_prob,
             rng=rng,
         )
         renderer = mujoco.Renderer(model, height=args.img_size, width=args.img_size)

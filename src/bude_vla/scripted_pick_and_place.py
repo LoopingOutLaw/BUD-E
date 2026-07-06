@@ -67,6 +67,10 @@ def decaying_recovery_offset(offset_xy: np.ndarray, phase_step: int, total_steps
     return np.asarray(offset_xy, dtype=np.float64) * (1.0 - frac)
 
 
+def should_retry_close(contact_step: int | None, retries_used: int, max_retries: int) -> bool:
+    return contact_step is None and retries_used < max(0, max_retries)
+
+
 class ScriptedPickAndPlace:
     """Physics-only pick-and-place using ggand0/pick-101's proven approach.
 
@@ -77,6 +81,9 @@ class ScriptedPickAndPlace:
     def __init__(self, model, data, cube_start_xy, target_xy=(0.32, 0.16),
                  recovery_jitter_xy: float = 0.0,
                  recovery_jitter_prob: float = 0.0,
+                 max_grasp_retries: int = 0,
+                 retry_miss_xy: float = 0.0,
+                 retry_miss_prob: float = 0.0,
                  rng: np.random.Generator | None = None):
         self.model = model
         self.cube_start_xy = np.asarray(cube_start_xy, dtype=np.float64)
@@ -96,6 +103,18 @@ class ScriptedPickAndPlace:
         else:
             self._approach_recovery_xy = np.zeros(2, dtype=np.float64)
             self._descent_recovery_xy = np.zeros(2, dtype=np.float64)
+
+        self.max_grasp_retries = max(0, int(max_grasp_retries))
+        self._retries_used = 0
+        use_retry_miss = (
+            self.max_grasp_retries > 0
+            and retry_miss_xy > 0.0
+            and rng.random() < retry_miss_prob
+        )
+        if use_retry_miss:
+            self._close_retry_miss_xy = rng.uniform(-retry_miss_xy, retry_miss_xy, size=2)
+        else:
+            self._close_retry_miss_xy = np.zeros(2, dtype=np.float64)
 
         # IK controller (matching pick-101: targets gripperframe)
         self.ik = IKController(model, data, end_effector_site="gripperframe")
@@ -183,9 +202,11 @@ class ScriptedPickAndPlace:
 
         elif self.phase == CLOSE:
             # Contact-triggered closing (matching pick-101 exactly)
-            grasp_target = self._cube_start_xyz.copy()
+            grasp_target = self._cube_xyz(data).copy()
             grasp_target[2] += GRASP_Z_OFFSET
             grasp_target[1] += FINGER_WIDTH_OFFSET
+            if self._retries_used == 0:
+                grasp_target[:2] += self._close_retry_miss_xy
 
             if self._contact_step is None:
                 t = min(self.phase_step / 250, 1.0)
@@ -222,8 +243,17 @@ class ScriptedPickAndPlace:
                 if self._contact_step is not None:
                     self._grasp_action = gripper
                     self._grasp_succeeded = True
-                self.phase = LIFT
-                self.phase_step = 0
+                    self.phase = LIFT
+                    self.phase_step = 0
+                elif should_retry_close(self._contact_step, self._retries_used, self.max_grasp_retries):
+                    self._retries_used += 1
+                    self._contact_step = None
+                    self._contact_action = None
+                    self.phase = APPROACH
+                    self.phase_step = 0
+                else:
+                    self.phase = LIFT
+                    self.phase_step = 0
 
         elif self.phase == LIFT:
             grasp_target = self._cube_start_xyz.copy()
@@ -293,4 +323,5 @@ class ScriptedPickAndPlace:
             "phase_step": self.phase_step,
             "grasping": self.is_grasping(model, data) if self.phase >= CLOSE else False,
             "attached": self._grasp_succeeded,
+            "retries_used": self._retries_used,
         }
