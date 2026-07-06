@@ -39,6 +39,18 @@ def collate_fn(batch: list[dict]) -> dict:
     return out
 
 
+def build_action_dim_weights(
+    action_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    gripper_loss_weight: float,
+) -> torch.Tensor:
+    dim_w = torch.ones(action_dim, device=device, dtype=dtype)
+    if action_dim > 0:
+        dim_w[-1] = gripper_loss_weight
+    return dim_w
+
+
 def build_bc_loss_weights(
     phase: torch.Tensor | None,
     mask: torch.Tensor,
@@ -69,9 +81,8 @@ def build_bc_loss_weights(
             )
         sample_w = sample_w_1d.view(-1, 1, 1)
 
-    dim_w = torch.ones(action_dim, device=mask.device, dtype=mask.dtype)
-    if action_dim > 0:
-        dim_w[-1] = gripper_loss_weight
+    dim_w = build_action_dim_weights(
+        action_dim, mask.device, mask.dtype, gripper_loss_weight)
     dim_w_view = dim_w.view(1, 1, action_dim)
     denom = (mask.unsqueeze(-1) * sample_w * dim_w_view).sum().clamp_min(1.0)
     return sample_w, dim_w, denom
@@ -183,23 +194,6 @@ def load_merged_action_stats(roots: list[str | Path]) -> tuple[np.ndarray, np.nd
 
 
 
-def adapt_proprio_state_dict_for_progress(state_dict: dict, saved_state_dim: int, current_state_dim: int) -> dict:
-    if current_state_dim != saved_state_dim + 1:
-        return state_dict
-    sd = dict(state_dict)
-    if "proprio.norm.weight" in sd and sd["proprio.norm.weight"].shape[0] == saved_state_dim:
-        old = sd["proprio.norm.weight"]
-        sd["proprio.norm.weight"] = torch.cat([old, old.new_ones(1)], dim=0)
-    if "proprio.norm.bias" in sd and sd["proprio.norm.bias"].shape[0] == saved_state_dim:
-        old = sd["proprio.norm.bias"]
-        sd["proprio.norm.bias"] = torch.cat([old, old.new_zeros(1)], dim=0)
-    if "proprio.proj.weight" in sd and sd["proprio.proj.weight"].shape[1] == saved_state_dim:
-        old = sd["proprio.proj.weight"]
-        pad = old.new_zeros(old.shape[0], 1)
-        sd["proprio.proj.weight"] = torch.cat([old, pad], dim=1)
-    return sd
-
-
 def build_dataloader(roots: list[str | Path], chunk_size: int = 4,
                      batch_size: int = 32, num_workers: int = 0,
                      augment: bool = False,
@@ -208,8 +202,7 @@ def build_dataloader(roots: list[str | Path], chunk_size: int = 4,
                      lazy_cache_size: int = 8,
                      episode_batches: bool = True,
                      frame_cache: str | Path | None = None,
-                     action_stats: tuple[np.ndarray, np.ndarray] | None = None,
-                     append_progress_to_proprio: bool = False) -> torch.utils.data.DataLoader:
+                     action_stats: tuple[np.ndarray, np.ndarray] | None = None) -> torch.utils.data.DataLoader:
     all_frames = []
     frame_caches = resolve_frame_caches(roots, frame_cache)
     for root, root_frame_cache in zip(roots, frame_caches):
@@ -218,8 +211,7 @@ def build_dataloader(roots: list[str | Path], chunk_size: int = 4,
                                  lazy_videos=lazy_videos,
                                  lazy_cache_size=lazy_cache_size,
                                  frame_cache=root_frame_cache,
-                                 action_stats=action_stats,
-                                 append_progress_to_proprio=append_progress_to_proprio)
+                                 action_stats=action_stats)
         ds.read()
         all_frames.append(ds)
         cache_note = f" cache={root_frame_cache}" if root_frame_cache is not None else ""
@@ -363,7 +355,6 @@ def train(
     lazy_cache_size: int = 8,
     episode_batches: bool = True,
     frame_cache: str | None = None,
-    append_progress_to_proprio: bool = False,
 ):
     if data_roots is None:
         raise ValueError(
@@ -395,8 +386,6 @@ def train(
     # Auto-detect action/state dims from dataset if possible; fall back to 6 (SO-101 5-arm + 1-grip).
     cfg.action_dim = action_dim_override if (action_dim_override := _detect_action_dim(data_roots)) else 6
     cfg.state_dim  = state_dim_override  if (state_dim_override  := _detect_state_dim(data_roots))  else 6
-    if append_progress_to_proprio:
-        cfg.state_dim += 1
 
     policy = BUDEPolicy(cfg).to(device)
 
@@ -416,8 +405,6 @@ def train(
             ("action_dim", cfg.action_dim, saved_cfg.get("action_dim")),
             ("state_dim", cfg.state_dim, saved_cfg.get("state_dim")),
         ]
-        if append_progress_to_proprio and saved_cfg.get("state_dim") == cfg.state_dim - 1:
-            _checks = [item for item in _checks if item[0] != "state_dim"]
         _mismatches = [f"{name}: checkpoint={saved!r} vs current CLI={cur!r}"
                        for name, cur, saved in _checks
                        if saved is not None and saved != cur]
@@ -427,8 +414,6 @@ def train(
                 + "\n  ".join(_mismatches)
             )
         init_sd = init_ckpt.get("ema_state_dict") or init_ckpt["model_state_dict"]
-        init_sd = adapt_proprio_state_dict_for_progress(
-            init_sd, int(saved_cfg.get("state_dim", cfg.state_dim)), cfg.state_dim)
         missing, unexpected = policy.load_state_dict(init_sd, strict=False)
         allowed_prefixes = ("bc_action_head.", "action_cond_proj.", "context_action_head.", "perception_proj.")
         allowed_missing = [k for k in missing if k.startswith(allowed_prefixes)]
@@ -441,8 +426,6 @@ def train(
         print(f"  initialized weights from {init_from}")
         if allowed_missing:
             print(f"  initialized new modules from scratch ({len(allowed_missing)} tensors)")
-        if append_progress_to_proprio and saved_cfg.get("state_dim") == cfg.state_dim - 1:
-            print("  expanded proprio projector for appended progress scalar")
 
     n_params = policy.n_params()
     print(f"Model parameters: {n_params['total']:,}")
@@ -472,8 +455,7 @@ def train(
                           lazy_cache_size=lazy_cache_size,
                           episode_batches=episode_batches,
                           frame_cache=frame_cache,
-                          action_stats=(_action_lo, _action_hi),
-                          append_progress_to_proprio=append_progress_to_proprio)
+                          action_stats=(_action_lo, _action_hi))
 
     # Differential LR: pretrained DINOv2 backbone gets backbone_lr,
     # new modules (proj, text, proprio, backbone transformer, action head) get lr.
@@ -614,7 +596,11 @@ def train(
             v_pred = out["velocity"]
             v_target = batch["actions"] - batch["noise"]
             mask = batch["mask"].unsqueeze(-1)  # (B, chunk_size, 1)
-            flow_loss = (((v_pred - v_target) ** 2) * mask).sum() / (mask.sum() * v_pred.shape[-1])
+            flow_dim_w = build_action_dim_weights(
+                v_pred.shape[-1], mask.device, mask.dtype, gripper_loss_weight)
+            flow_dim_w_view = flow_dim_w.view(1, 1, -1)
+            flow_denom = (mask * flow_dim_w_view).sum().clamp_min(1.0)
+            flow_loss = (((v_pred - v_target) ** 2) * mask * flow_dim_w_view).sum() / flow_denom
             if "bc_actions" in out:
                 bc_err = ((out["bc_actions"] - batch["actions"]) ** 2) * mask
                 sample_w, dim_w, bc_denom = build_bc_loss_weights(
@@ -705,7 +691,6 @@ def train(
                     "use_perception": cfg.use_perception,
                     "use_perception_action_cond": cfg.use_perception_action_cond,
                     "perception_dim": cfg.perception_dim,
-                    "append_progress_to_proprio": append_progress_to_proprio,
                 },
             }, ckpt_path)
             print(f"  saved checkpoint: {ckpt_path}")
@@ -780,7 +765,6 @@ def train(
             "use_perception": cfg.use_perception,
             "use_perception_action_cond": cfg.use_perception_action_cond,
             "perception_dim": cfg.perception_dim,
-            "append_progress_to_proprio": append_progress_to_proprio,
         },
     }, final_ckpt)
     print(f"Training done in {time.time()-t0:.0f}s. Final checkpoint: {final_ckpt}")
@@ -893,8 +877,6 @@ if __name__ == "__main__":
     parser.add_argument("--eval-seed", type=int, default=123,
                         help="Fixed seed for eval cube positions so success "
                              "curves are comparable across checkpoints.")
-    parser.add_argument("--append-progress-proprio", action="store_true",
-                        help="Append normalized rollout progress to proprio. This is non-privileged timing context, not cube position.")
     args = parser.parse_args()
 
     roots = args.data_root
@@ -945,5 +927,4 @@ if __name__ == "__main__":
         lazy_cache_size=args.lazy_cache_size,
         episode_batches=not args.no_episode_batches,
         frame_cache=args.frame_cache,
-        append_progress_to_proprio=args.append_progress_proprio,
     )
