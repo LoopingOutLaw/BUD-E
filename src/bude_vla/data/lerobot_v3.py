@@ -304,7 +304,8 @@ class BUDETrainingDataset:
                  n_history_frames: int = 1,
                  lazy_videos: bool = True,
                  lazy_cache_size: int = 8,
-                 frame_cache: str | Path | None = None):
+                 frame_cache: str | Path | None = None,
+                 action_stats: tuple[np.ndarray, np.ndarray] | None = None):
         self.root = Path(root)
         self.chunk_size = chunk_size
         self.augment = augment
@@ -332,6 +333,7 @@ class BUDETrainingDataset:
         self._rng = np.random.default_rng()
         self._action_lo: np.ndarray | None = None
         self._action_hi: np.ndarray | None = None
+        self._action_stats_override = action_stats
 
     def read(self) -> "BUDETrainingDataset":
         from pyarrow import parquet as pq
@@ -380,8 +382,11 @@ class BUDETrainingDataset:
             self._images = None
             self._total_frames = int(self._cache_global_indices.shape[0])
             if self.normalize:
-                info_path = self.root / "meta" / "info.json"
-                self._action_lo, self._action_hi = load_action_stats(info_path)
+                if self._action_stats_override is not None:
+                    self._action_lo, self._action_hi = self._action_stats_override
+                else:
+                    info_path = self.root / "meta" / "info.json"
+                    self._action_lo, self._action_hi = load_action_stats(info_path)
             return self
 
         npy_path = self.root / "all_images.npy"
@@ -409,19 +414,22 @@ class BUDETrainingDataset:
 
         if self.normalize:
             info_path = self.root / "meta" / "info.json"
-            self._action_lo, self._action_hi = load_action_stats(info_path)
-            try:
-                _is_default = (self._action_lo.shape == DEFAULT_LO.shape
-                               and (self._action_lo == DEFAULT_LO).all()
-                               and (self._action_hi == DEFAULT_HI).all())
-            except (ValueError, AttributeError):
-                _is_default = False
-            if _is_default:
-                import warnings
-                warnings.warn(
-                    f"action_normalization missing in {info_path}; falling back "
-                    f"to defaults. Call finalize_dataset() after recording to fix."
-                )
+            if self._action_stats_override is not None:
+                self._action_lo, self._action_hi = self._action_stats_override
+            else:
+                self._action_lo, self._action_hi = load_action_stats(info_path)
+                try:
+                    _is_default = (self._action_lo.shape == DEFAULT_LO.shape
+                                   and (self._action_lo == DEFAULT_LO).all()
+                                   and (self._action_hi == DEFAULT_HI).all())
+                except (ValueError, AttributeError):
+                    _is_default = False
+                if _is_default:
+                    import warnings
+                    warnings.warn(
+                        f"action_normalization missing in {info_path}; falling back "
+                        f"to defaults. Call finalize_dataset() after recording to fix."
+                    )
 
         return self
 

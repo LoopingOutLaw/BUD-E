@@ -147,6 +147,40 @@ def _detect_state_dim(roots: list) -> int | None:
     return _detect_dim(roots, "observation.state")
 
 
+def resolve_frame_caches(roots: list[str | Path], frame_cache: str | Path | None) -> list[str | None]:
+    if frame_cache is None:
+        return [None] * len(roots)
+    cache_text = str(frame_cache)
+    caches = cache_text.split(":") if ":" in cache_text else [cache_text]
+    if len(roots) == 1:
+        if len(caches) != 1:
+            raise ValueError("A single --data-root needs exactly one --frame-cache path")
+        return caches
+    if len(caches) != len(roots):
+        raise ValueError(
+            "When using multiple --data-root values, --frame-cache must provide "
+            "the same number of colon-separated cache paths."
+        )
+    return caches
+
+
+def merge_action_stats(stats: list[tuple[np.ndarray, np.ndarray]]) -> tuple[np.ndarray, np.ndarray]:
+    if not stats:
+        raise ValueError("No action stats to merge")
+    lows = np.stack([lo for lo, _hi in stats], axis=0)
+    highs = np.stack([hi for _lo, hi in stats], axis=0)
+    return lows.min(axis=0).astype(np.float32), highs.max(axis=0).astype(np.float32)
+
+
+def load_merged_action_stats(roots: list[str | Path]) -> tuple[np.ndarray, np.ndarray]:
+    from bude_vla.data.action_normalization import load_action_stats
+
+    return merge_action_stats([
+        load_action_stats(Path(root) / "meta" / "info.json")
+        for root in roots
+    ])
+
+
 def build_dataloader(roots: list[str | Path], chunk_size: int = 4,
                      batch_size: int = 32, num_workers: int = 0,
                      augment: bool = False,
@@ -154,17 +188,21 @@ def build_dataloader(roots: list[str | Path], chunk_size: int = 4,
                      lazy_videos: bool = False,
                      lazy_cache_size: int = 8,
                      episode_batches: bool = True,
-                     frame_cache: str | Path | None = None) -> torch.utils.data.DataLoader:
+                     frame_cache: str | Path | None = None,
+                     action_stats: tuple[np.ndarray, np.ndarray] | None = None) -> torch.utils.data.DataLoader:
     all_frames = []
-    for root in roots:
+    frame_caches = resolve_frame_caches(roots, frame_cache)
+    for root, root_frame_cache in zip(roots, frame_caches):
         ds = BUDETrainingDataset(root, chunk_size=chunk_size, augment=augment,
                                  n_history_frames=n_history_frames,
                                  lazy_videos=lazy_videos,
                                  lazy_cache_size=lazy_cache_size,
-                                 frame_cache=frame_cache)
+                                 frame_cache=root_frame_cache,
+                                 action_stats=action_stats)
         ds.read()
         all_frames.append(ds)
-        print(f"  loaded {len(ds)} frames from {root}")
+        cache_note = f" cache={root_frame_cache}" if root_frame_cache is not None else ""
+        print(f"  loaded {len(ds)} frames from {root}{cache_note}")
 
     if len(all_frames) == 1:
         combined = all_frames[0]
@@ -172,7 +210,7 @@ def build_dataloader(roots: list[str | Path], chunk_size: int = 4,
         combined = torch.utils.data.ConcatDataset(all_frames)
 
     if frame_cache is not None:
-        print(f"  frame cache: random-access cached frames enabled ({frame_cache})")
+        print("  frame cache: random-access cached frames enabled")
 
     use_episode_batches = (
         lazy_videos
@@ -393,6 +431,9 @@ def train(
     if ema_enabled:
         print(f"  EMA enabled: decay={ema_decay}")
 
+    _action_lo, _action_hi = load_merged_action_stats(data_roots)
+    print(f"  action_norm lo={_action_lo[:3]}  hi={_action_hi[:3]}")
+
     dl = build_dataloader(data_roots, chunk_size=chunk_size,
                           batch_size=batch_size, num_workers=num_workers,
                           augment=augment,
@@ -400,17 +441,8 @@ def train(
                           lazy_videos=lazy_videos,
                           lazy_cache_size=lazy_cache_size,
                           episode_batches=episode_batches,
-                          frame_cache=frame_cache)
-
-    from bude_vla.data.action_normalization import load_action_stats, DEFAULT_LO, DEFAULT_HI
-    _action_lo, _action_hi = DEFAULT_LO.copy(), DEFAULT_HI.copy()
-    for _root in data_roots:
-        _info = Path(_root) / "meta" / "info.json"
-        _lo, _hi = load_action_stats(_info)
-        if not (np.array_equal(_lo, DEFAULT_LO) and np.array_equal(_hi, DEFAULT_HI)):
-            _action_lo, _action_hi = _lo, _hi
-            break
-    print(f"  action_norm lo={_action_lo[:3]}  hi={_action_hi[:3]}")
+                          frame_cache=frame_cache,
+                          action_stats=(_action_lo, _action_hi))
 
     # Differential LR: pretrained DINOv2 backbone gets backbone_lr,
     # new modules (proj, text, proprio, backbone transformer, action head) get lr.

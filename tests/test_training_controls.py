@@ -48,6 +48,30 @@ class TrainingControlsTest(unittest.TestCase):
         self.assertFalse(should_retry_close(contact_step=12, retries_used=0, max_retries=1))
         self.assertFalse(should_retry_close(contact_step=None, retries_used=1, max_retries=1))
 
+
+    def test_resolve_frame_caches_matches_multiple_roots(self):
+        from scripts.train import resolve_frame_caches
+
+        roots = ["data/a", "data/b"]
+
+        self.assertEqual(resolve_frame_caches(roots, None), [None, None])
+        self.assertEqual(resolve_frame_caches(roots, "cache/a:cache/b"), ["cache/a", "cache/b"])
+        with self.assertRaisesRegex(ValueError, "same number"):
+            resolve_frame_caches(roots, "cache/a")
+
+
+    def test_merge_action_stats_uses_per_dimension_union(self):
+        import numpy as np
+        from scripts.train import merge_action_stats
+
+        lo, hi = merge_action_stats([
+            (np.array([-1.0, -0.5]), np.array([0.5, 2.0])),
+            (np.array([-0.2, -1.5]), np.array([1.0, 1.2])),
+        ])
+
+        self.assertEqual(lo.tolist(), [-1.0, -1.5])
+        self.assertEqual(hi.tolist(), [1.0, 2.0])
+
     def test_parse_cube_positions_accepts_explicit_reachable_eval_set(self):
         from scripts.eval_pick_ball import parse_cube_positions
 
