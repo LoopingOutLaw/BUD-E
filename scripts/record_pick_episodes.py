@@ -114,6 +114,8 @@ def main():
     ap.add_argument("--keep-failures", action="store_true")
     ap.add_argument("--recovery-jitter-xy", type=float, default=0.0,
                     help="Max XY waypoint jitter in meters during approach/descent, decayed to zero before close.")
+    ap.add_argument("--recovery-jitter-z", type=float, default=0.0,
+                    help="Max Z/depth jitter in meters during descent, decayed to zero before close.")
     ap.add_argument("--recovery-jitter-prob", type=float, default=0.0,
                     help="Probability that an episode uses recoverable approach/descent jitter.")
     ap.add_argument("--max-grasp-retries", type=int, default=0,
@@ -139,9 +141,11 @@ def main():
     n_written = 0
     t0 = time.time()
 
-    if args.recovery_jitter_xy > 0.0 and args.recovery_jitter_prob > 0.0:
+    if (args.recovery_jitter_xy > 0.0 or args.recovery_jitter_z > 0.0) and args.recovery_jitter_prob > 0.0:
         print("  recovery jitter enabled: "
-              f"xy=+/-{args.recovery_jitter_xy:.3f}m  prob={args.recovery_jitter_prob:.2f}")
+              f"xy=+/-{args.recovery_jitter_xy:.3f}m  "
+              f"z=+/-{args.recovery_jitter_z:.3f}m  "
+              f"prob={args.recovery_jitter_prob:.2f}")
     if args.max_grasp_retries > 0:
         print("  grasp retry demos enabled: "
               f"max_retries={args.max_grasp_retries}  "
@@ -181,6 +185,7 @@ def main():
             data,
             cube_start_xy=np.array([cx, cy]),
             recovery_jitter_xy=args.recovery_jitter_xy,
+            recovery_jitter_z=args.recovery_jitter_z,
             recovery_jitter_prob=args.recovery_jitter_prob,
             max_grasp_retries=args.max_grasp_retries,
             retry_miss_xy=args.retry_miss_xy,

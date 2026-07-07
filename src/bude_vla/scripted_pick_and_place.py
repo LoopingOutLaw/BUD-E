@@ -67,6 +67,14 @@ def decaying_recovery_offset(offset_xy: np.ndarray, phase_step: int, total_steps
     return np.asarray(offset_xy, dtype=np.float64) * (1.0 - frac)
 
 
+def decaying_recovery_scalar(offset: float, phase_step: int, total_steps: int) -> float:
+    """Scalar version of decaying recovery jitter for depth/height demos."""
+    if total_steps <= 0:
+        return 0.0
+    frac = min(max(float(phase_step) / float(total_steps), 0.0), 1.0)
+    return float(offset) * (1.0 - frac)
+
+
 def should_retry_close(contact_step: int | None, retries_used: int, max_retries: int) -> bool:
     return contact_step is None and retries_used < max(0, max_retries)
 
@@ -80,6 +88,7 @@ class ScriptedPickAndPlace:
 
     def __init__(self, model, data, cube_start_xy, target_xy=(0.32, 0.16),
                  recovery_jitter_xy: float = 0.0,
+                 recovery_jitter_z: float = 0.0,
                  recovery_jitter_prob: float = 0.0,
                  max_grasp_retries: int = 0,
                  retry_miss_xy: float = 0.0,
@@ -94,15 +103,20 @@ class ScriptedPickAndPlace:
         self._max_steps = 2000
 
         rng = rng if rng is not None else np.random.default_rng()
-        use_recovery = recovery_jitter_xy > 0.0 and rng.random() < recovery_jitter_prob
+        use_recovery = recovery_jitter_prob > 0.0 and (
+            recovery_jitter_xy > 0.0 or recovery_jitter_z > 0.0
+        ) and rng.random() < recovery_jitter_prob
         if use_recovery:
             self._approach_recovery_xy = rng.uniform(
                 -recovery_jitter_xy, recovery_jitter_xy, size=2)
             self._descent_recovery_xy = rng.uniform(
                 -recovery_jitter_xy, recovery_jitter_xy, size=2)
+            self._descent_recovery_z = float(rng.uniform(
+                -recovery_jitter_z, recovery_jitter_z))
         else:
             self._approach_recovery_xy = np.zeros(2, dtype=np.float64)
             self._descent_recovery_xy = np.zeros(2, dtype=np.float64)
+            self._descent_recovery_z = 0.0
 
         self.max_grasp_retries = max(0, int(max_grasp_retries))
         self._retries_used = 0
@@ -190,6 +204,8 @@ class ScriptedPickAndPlace:
             grasp_target[1] += FINGER_WIDTH_OFFSET
             grasp_target[:2] += decaying_recovery_offset(
                 self._descent_recovery_xy, self.phase_step, DESCENT_STEPS)
+            grasp_target[2] += decaying_recovery_scalar(
+                self._descent_recovery_z, self.phase_step, DESCENT_STEPS)
 
             ctrl = self.ik.step_toward_target(
                 grasp_target, gripper_action=GRIPPER_OPEN,

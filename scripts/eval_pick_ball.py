@@ -204,6 +204,7 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
              ensembling: bool = False, ensembling_k: float = 0.5,
              replan_every: int = 1,
              exec_first_only: bool = False,
+             debug_actions: bool = False,
              cube_positions: list[tuple[float, float]] | None = None,
              cube_x_range: tuple[float, float] = (0.15, 0.35),
              cube_y_range: tuple[float, float] = (-0.10, 0.10),
@@ -331,8 +332,16 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
                         a = denormalize_actions(a, action_lo, action_hi)
 
             if not np.any(np.isnan(a)):
-                arm_target = np.clip(a[:N_ARM_JOINTS], -3.5, 3.5).astype(np.float64)
+                raw_arm_target = np.asarray(a[:N_ARM_JOINTS], dtype=np.float64)
+                arm_target = np.clip(raw_arm_target, -3.5, 3.5).astype(np.float64)
                 gripper_ctrl = float(np.clip(a[N_ARM_JOINTS], -1.5, 1.5))
+                if debug_actions and (step < 20 or step % 50 == 0):
+                    clipped = bool(np.any(np.abs(raw_arm_target - arm_target) > 1e-6))
+                    print(
+                        f"    step {step:04d} raw_arm={np.array2string(raw_arm_target, precision=3)} "
+                        f"clip={clipped} grip={gripper_ctrl:+.3f}",
+                        flush=True,
+                    )
             else:
                 arm_target = np.array([0.0, -0.5, 0.95, np.pi/2, np.pi/2])
                 gripper_ctrl = 0.3
@@ -407,6 +416,8 @@ def main():
     ap.add_argument("--exec-first-only", action="store_true",
                     help="Drop all but chunk[0] of each sampled chunk and re-sample "
                          "every step. Equivalent to chunk_size=1 without retraining.")
+    ap.add_argument("--debug-actions", action="store_true",
+                    help="Print pre-clip arm targets during eval to diagnose joint-limit clipping.")
     ap.add_argument("--cube-positions", default=None,
                     help="Explicit eval cube positions as 'x,y;x,y'. Repeats if "
                          "--num-episodes is larger than the list.")
@@ -446,6 +457,7 @@ def main():
         ensembling=args.ensembling, ensembling_k=args.ensembling_k,
         replan_every=args.replan_every,
         exec_first_only=args.exec_first_only,
+        debug_actions=args.debug_actions,
         cube_positions=cube_positions,
         cube_x_range=tuple(args.cube_x_range),
         cube_y_range=tuple(args.cube_y_range),

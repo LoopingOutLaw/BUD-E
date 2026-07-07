@@ -41,6 +41,15 @@ class TrainingControlsTest(unittest.TestCase):
         self.assertEqual(decaying_recovery_offset(offset, 150, 100).round(6).tolist(), [0.0, -0.0])
 
 
+    def test_recovery_scalar_decays_before_final_grasp(self):
+        from bude_vla.scripted_pick_and_place import decaying_recovery_scalar
+
+        self.assertEqual(round(decaying_recovery_scalar(0.012, 0, 100), 6), 0.012)
+        self.assertEqual(round(decaying_recovery_scalar(0.012, 50, 100), 6), 0.006)
+        self.assertEqual(round(decaying_recovery_scalar(0.012, 100, 100), 6), 0.0)
+        self.assertEqual(round(decaying_recovery_scalar(0.012, 150, 100), 6), 0.0)
+
+
     def test_failed_close_retries_until_retry_budget_is_spent(self):
         from bude_vla.scripted_pick_and_place import should_retry_close
 
