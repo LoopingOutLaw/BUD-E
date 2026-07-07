@@ -27,6 +27,7 @@ CLOSE = 2
 LIFT = 3
 MOVE = 4
 RELEASE = 5
+BACKOFF = 6
 
 # Gripper params matching ggand0/pick-101 exactly
 GRIPPER_OPEN = 0.3
@@ -52,10 +53,12 @@ LIFT_STEPS = 100
 HOLD_STEPS = 50
 MOVE_STEPS = 300
 RELEASE_STEPS = 100
+BACKOFF_STEPS = 70
+NUDGE_DESCENT_STEPS = 65
 
 PHASE_NAMES = {
     0: "APPROACH", 1: "DESCENT", 2: "CLOSE", 3: "LIFT",
-    4: "MOVE", 5: "RELEASE",
+    4: "MOVE", 5: "RELEASE", 6: "BACKOFF",
 }
 
 
@@ -91,6 +94,9 @@ class ScriptedPickAndPlace:
                  recovery_jitter_z: float = 0.0,
                  recovery_jitter_prob: float = 0.0,
                  max_grasp_retries: int = 0,
+                 nudge_recovery_prob: float = 0.0,
+                 nudge_recovery_xy: float = 0.0,
+                 nudge_recovery_z: float = 0.0,
                  retry_miss_xy: float = 0.0,
                  retry_miss_prob: float = 0.0,
                  rng: np.random.Generator | None = None):
@@ -100,7 +106,7 @@ class ScriptedPickAndPlace:
         self.phase = APPROACH
         self.phase_step = 0
         self._total_steps = 0
-        self._max_steps = 2000
+        self._max_steps = 2200
 
         rng = rng if rng is not None else np.random.default_rng()
         use_recovery = recovery_jitter_prob > 0.0 and (
@@ -120,6 +126,22 @@ class ScriptedPickAndPlace:
 
         self.max_grasp_retries = max(0, int(max_grasp_retries))
         self._retries_used = 0
+        self._nudge_recovery_enabled = (
+            nudge_recovery_prob > 0.0
+            and (nudge_recovery_xy > 0.0 or nudge_recovery_z > 0.0)
+            and rng.random() < nudge_recovery_prob
+        )
+        self._nudge_recovery_done = False
+        self._nudge_touched = False
+        if self._nudge_recovery_enabled:
+            self._nudge_recovery_xy = rng.uniform(
+                -nudge_recovery_xy, nudge_recovery_xy, size=2)
+            self._nudge_recovery_z = -abs(float(rng.uniform(
+                0.0, nudge_recovery_z)))
+        else:
+            self._nudge_recovery_xy = np.zeros(2, dtype=np.float64)
+            self._nudge_recovery_z = 0.0
+
         use_retry_miss = (
             self.max_grasp_retries > 0
             and retry_miss_xy > 0.0
@@ -153,14 +175,23 @@ class ScriptedPickAndPlace:
     def _cube_xyz(self, data):
         return data.xpos[self.cube_body_id].copy()
 
-    def is_grasping(self, model, data):
-        """Contact-based grasp detection — both finger pads touching cube."""
+    def _cube_pad_contacts(self, data) -> set[int]:
         contacts = set()
         for i in range(data.ncon):
             g1, g2 = data.contact[i].geom1, data.contact[i].geom2
             if g1 == self.cube_geom_id or g2 == self.cube_geom_id:
                 other = g2 if g1 == self.cube_geom_id else g1
                 contacts.add(other)
+        return contacts
+
+    def is_touching_cube(self, model, data):
+        """Any finger-pad contact with the cube, including failed nudges."""
+        contacts = self._cube_pad_contacts(data)
+        return self.static_pad_id in contacts or self.moving_pad_id in contacts
+
+    def is_grasping(self, model, data):
+        """Contact-based grasp detection — both finger pads touching cube."""
+        contacts = self._cube_pad_contacts(data)
         has_static = self.static_pad_id in contacts
         has_moving = self.moving_pad_id in contacts
         return has_static and has_moving
@@ -202,18 +233,45 @@ class ScriptedPickAndPlace:
             grasp_target = cube_live.copy()
             grasp_target[2] += GRASP_Z_OFFSET
             grasp_target[1] += FINGER_WIDTH_OFFSET
-            grasp_target[:2] += decaying_recovery_offset(
-                self._descent_recovery_xy, self.phase_step, DESCENT_STEPS)
-            grasp_target[2] += decaying_recovery_scalar(
-                self._descent_recovery_z, self.phase_step, DESCENT_STEPS)
+            if self._nudge_recovery_enabled and not self._nudge_recovery_done:
+                grasp_target[:2] += self._nudge_recovery_xy
+                grasp_target[2] += self._nudge_recovery_z
+            else:
+                grasp_target[:2] += decaying_recovery_offset(
+                    self._descent_recovery_xy, self.phase_step, DESCENT_STEPS)
+                grasp_target[2] += decaying_recovery_scalar(
+                    self._descent_recovery_z, self.phase_step, DESCENT_STEPS)
 
             ctrl = self.ik.step_toward_target(
                 grasp_target, gripper_action=GRIPPER_OPEN,
                 gain=0.8, locked_joints=locked_joints,
             )
 
-            if self.phase_step >= DESCENT_STEPS:
+            if (
+                self._nudge_recovery_enabled
+                and not self._nudge_recovery_done
+                and (self.is_touching_cube(model, data) or self.phase_step >= NUDGE_DESCENT_STEPS)
+            ):
+                self._nudge_touched = self._nudge_touched or self.is_touching_cube(model, data)
+                self.phase = BACKOFF
+                self.phase_step = 0
+            elif self.phase_step >= DESCENT_STEPS:
                 self.phase = CLOSE
+                self.phase_step = 0
+
+        elif self.phase == BACKOFF:
+            backoff_pos = self._cube_xyz(data).copy()
+            backoff_pos[2] += GRASP_Z_OFFSET + HEIGHT_OFFSET + 0.025
+            backoff_pos[1] += FINGER_WIDTH_OFFSET
+
+            ctrl = self.ik.step_toward_target(
+                backoff_pos, gripper_action=GRIPPER_OPEN,
+                gain=0.7, locked_joints=locked_joints,
+            )
+
+            if self.phase_step >= BACKOFF_STEPS:
+                self._nudge_recovery_done = True
+                self.phase = DESCENT
                 self.phase_step = 0
 
         elif self.phase == CLOSE:
@@ -340,4 +398,6 @@ class ScriptedPickAndPlace:
             "grasping": self.is_grasping(model, data) if self.phase >= CLOSE else False,
             "attached": self._grasp_succeeded,
             "retries_used": self._retries_used,
+            "nudge_recovery": self._nudge_recovery_enabled,
+            "nudge_touched": self._nudge_touched,
         }

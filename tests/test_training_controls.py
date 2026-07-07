@@ -50,6 +50,12 @@ class TrainingControlsTest(unittest.TestCase):
         self.assertEqual(round(decaying_recovery_scalar(0.012, 150, 100), 6), 0.0)
 
 
+    def test_phase_names_include_nudge_backoff_recovery(self):
+        from bude_vla.scripted_pick_and_place import BACKOFF, PHASE_NAMES
+
+        self.assertEqual(PHASE_NAMES[BACKOFF], "BACKOFF")
+
+
     def test_failed_close_retries_until_retry_budget_is_spent(self):
         from bude_vla.scripted_pick_and_place import should_retry_close
 

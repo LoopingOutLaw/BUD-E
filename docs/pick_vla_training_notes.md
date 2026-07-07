@@ -108,9 +108,9 @@ PYTHONUNBUFFERED=1 MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/pytho
 
 ## v27 Precision Fine-Tune
 
-The next step is not a full reset. It is a precision-grasp fine-tune from v26. The goal is to reduce final XY/Z offset, teach descent-depth correction, and delay gripper closing until the wrist is centered over the cube.
+The next step is not a full reset. It is a precision-grasp fine-tune from v26. The goal is to reduce final XY/Z offset, teach descent-depth correction, show backoff/retry after light cube nudges, and delay gripper closing until the wrist is centered over the cube.
 
-Record cleaner precision and descent-depth recovery data:
+Record cleaner precision and descent-depth and touch/nudge recovery data:
 
 ```bash
 MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/record_pick_episodes.py \
@@ -120,7 +120,10 @@ MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/record_pi
   --img-size 224 \
   --recovery-jitter-xy 0.004 \
   --recovery-jitter-z 0.010 \
-  --recovery-jitter-prob 0.35 \
+  --recovery-jitter-prob 0.45 \
+  --nudge-recovery-prob 0.35 \
+  --nudge-recovery-xy 0.010 \
+  --nudge-recovery-z 0.010 \
   --max-grasp-retries 0
 ```
 
