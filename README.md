@@ -13,7 +13,7 @@ The current best base run is `pick_v26_unified`:
 - 9D proprioception without progress/time shortcut leakage.
 - Context/perception-conditioned action decoding.
 - Gripper-weighted BC and flow losses.
-- Recovery-jitter demonstration data.
+- Recovery-jitter and touch/nudge backoff demonstration data.
 - Smoothed closed-loop eval through temporal ensembling.
 
 Observed behavior after v26: the arm now reaches toward the cube almost every rollout. The remaining failure mode is precision near the final centimeters: small XY offset and occasional early gripper close. The current next step is `pick_v27_precision`, a precision fine-tune from the v26 60k checkpoint.
@@ -66,7 +66,10 @@ MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/record_pi
   --img-size 224 \
   --recovery-jitter-xy 0.004 \
   --recovery-jitter-z 0.010 \
-  --recovery-jitter-prob 0.35 \
+  --recovery-jitter-prob 0.45 \
+  --nudge-recovery-prob 0.35 \
+  --nudge-recovery-xy 0.010 \
+  --nudge-recovery-z 0.010 \
   --max-grasp-retries 0 \
 && PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/build_frame_cache.py \
   --data-root /home/aditya/bude_vla/data/pick_v27_precision \
