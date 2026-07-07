@@ -109,6 +109,17 @@ class TrainingControlsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "x,y"):
             parse_cube_positions("0.25;0.30,0.04")
 
+    def test_parse_weighted_phase_ranges_for_contact_focused_cache(self):
+        from scripts.build_frame_cache import parse_weighted_phase_ranges
+
+        ranges = parse_weighted_phase_ranges("0.08:0.28:0.70,0.28:0.55:0.25,0.55:1.00:0.05")
+
+        self.assertEqual(ranges, [(0.08, 0.28, 0.70), (0.28, 0.55, 0.25), (0.55, 1.00, 0.05)])
+        with self.assertRaisesRegex(ValueError, "lo:hi:weight"):
+            parse_weighted_phase_ranges("0.1:0.2")
+        with self.assertRaisesRegex(ValueError, "0 <= lo < hi <= 1"):
+            parse_weighted_phase_ranges("0.4:0.2:1")
+
 
 if __name__ == "__main__":
     unittest.main()

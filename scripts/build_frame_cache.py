@@ -14,6 +14,38 @@ import numpy as np
 from pyarrow import parquet as pq
 
 
+def parse_weighted_phase_ranges(spec: str | None) -> list[tuple[float, float, float]]:
+    if spec is None or not str(spec).strip():
+        return []
+    ranges: list[tuple[float, float, float]] = []
+    for raw_part in str(spec).split(','):
+        part = raw_part.strip()
+        fields = part.split(':')
+        if len(fields) != 3:
+            raise ValueError("phase range entries must use lo:hi:weight")
+        try:
+            lo, hi, weight = (float(v) for v in fields)
+        except ValueError as exc:
+            raise ValueError("phase range entries must use numeric lo:hi:weight") from exc
+        if not (0.0 <= lo < hi <= 1.0):
+            raise ValueError("phase ranges must satisfy 0 <= lo < hi <= 1")
+        if weight <= 0.0:
+            raise ValueError("phase range weights must be > 0")
+        ranges.append((lo, hi, weight))
+    return ranges
+
+
+def sample_phase_from_weighted_ranges(
+    rng: np.random.Generator,
+    ranges: list[tuple[float, float, float]],
+) -> float:
+    weights = np.asarray([r[2] for r in ranges], dtype=np.float64)
+    weights /= weights.sum()
+    i = int(rng.choice(len(ranges), p=weights))
+    lo, hi, _weight = ranges[i]
+    return float(rng.uniform(lo, hi))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument('--data-root', default='data/pick_v12')
@@ -25,6 +57,8 @@ def main() -> None:
     ap.add_argument('--early-max-frac', type=float, default=0.22)
     ap.add_argument('--phase-bins', type=int, default=0,
                     help='If >0, ignore --early-prob and sample equally from this many episode phase bins.')
+    ap.add_argument('--phase-ranges', default=None,
+                    help='Weighted phase ranges as lo:hi:weight,...; overrides --phase-bins and --early-prob. Useful for contact/descent-focused caches.')
     args = ap.parse_args()
 
     root = Path(args.data_root)
@@ -50,7 +84,16 @@ def main() -> None:
 
     selected_by_ep: dict[int, set[int]] = {e['ep_idx']: set() for e in episodes}
     n_eps = len(episodes)
-    if args.phase_bins > 0:
+    phase_ranges = parse_weighted_phase_ranges(args.phase_ranges)
+    if phase_ranges:
+        while sum(len(v) for v in selected_by_ep.values()) < args.max_frames:
+            ep_i = int(rng.choice(n_eps, p=weights))
+            ep = episodes[ep_i]
+            phase = sample_phase_from_weighted_ranges(rng, phase_ranges)
+            local = int(round(phase * max(0, ep['length'] - 1))) + int(rng.integers(-4, 5))
+            local = min(max(local, 0), ep['length'] - 1)
+            selected_by_ep[ep['ep_idx']].add(local)
+    elif args.phase_bins > 0:
         per_bin = int(np.ceil(args.max_frames / args.phase_bins))
         for bin_i in range(args.phase_bins):
             lo = bin_i / args.phase_bins
@@ -121,6 +164,7 @@ def main() -> None:
         'early_prob': args.early_prob,
         'early_max_frac': args.early_max_frac,
         'phase_bins': int(args.phase_bins),
+        'phase_ranges': args.phase_ranges,
     }
     (out / 'meta.json').write_text(json.dumps(meta, indent=2))
     print(f'done: {out} frames={total_sel} shape={(total_sel, H, W, channels)}')
