@@ -65,6 +65,7 @@ MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/record_pi
   --seed 77 \
   --img-size 224 \
   --recovery-jitter-xy 0.004 \
+  --recovery-jitter-z 0.010 \
   --recovery-jitter-prob 0.35 \
   --max-grasp-retries 0 \
 && PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/build_frame_cache.py \
