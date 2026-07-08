@@ -224,7 +224,7 @@ def main() -> None:
                 sel = np.concatenate([pad, sel], axis=0)
             stacked = np.transpose(np.ascontiguousarray(sel), (1, 2, 0, 3)).reshape(H, W, channels)
             images[row] = stacked
-            global_indices[row] = ep['start'] + local
+            global_indices[row] = ep.start + local
             row += 1
         if k % 100 == 0:
             print(f'episode {k}/{len(episodes)} rows={row}/{total_sel}', flush=True)
