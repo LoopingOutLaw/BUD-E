@@ -90,9 +90,24 @@ step 0200 grip=-0.306  finally closing after the cube was disturbed
 
 `pick_v30_contact_timing` is the current focused fine-tune. It starts from v29 and trains on compact contact-focused caches. The goal is not generic extra training; it is to emphasize descend/contact/close/recovery frames.
 
-### v31 DAgger round 1
+### v31 contact-filtered DAgger
 
-`pick_v31_dagger_round1` is the next planned run. It differs from v28-v30 because the failure states are not hand-guessed. The v30 policy is rolled out in simulation, the current observation is recorded, and an IK expert labels the corrective action from that actual policy-visited state. This directly targets the terminal off-distribution states where the policy reaches, touches, pushes, or hovers but does not grasp.
+`pick_v31_dagger_balanced` is the latest completed run. It differs from v28-v30 because the failure states are not hand-guessed. The v30 policy is rolled out in simulation, the current observation is recorded, and an IK expert labels the corrective action from that actual policy-visited state. The first unfiltered DAgger attempt was too sparse around contact, so the useful v31 dataset filters for episodes where the policy actually touches the cube.
+
+The contact-filtered dataset is:
+
+```text
+data/pick_v31_dagger_contact
+episodes: 250
+frames: 224348
+state_dim: 10
+any_contact frames: 4472
+any_contact frac: 0.01993331788114893
+is_grasping frames: 480
+is_grasping frac: 0.0021395332251680425
+```
+
+The v31 result improved broad contact but did not solve grasping. On a 100-episode random-position benchmark, v30 had 9/100 any-contact episodes and v31 had 27/100. Strict grasp and final success stayed at 0/100. On the fixed 8-position video eval, v31 also timed out in all episodes. Several episodes nudged or displaced the cube, but none produced a stable grasp/place.
 
 ## v29 Mixed Training
 
@@ -198,9 +213,11 @@ MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/train.py 
 ```
 
 
-## v31 DAgger Round 1
+## v31 Contact-Filtered DAgger
 
-Collect policy-visited states from v30 and label them with the IK expert:
+Collect policy-visited states from v30 and label them with the IK expert. The
+important part is `--min-contact-frames`: without it, most DAgger frames are
+ordinary approach states, which the existing datasets already cover.
 
 ```bash
 cd /home/aditya/bude_vla
@@ -208,48 +225,75 @@ mkdir -p logs
 
 MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/collect_dagger_pick.py \
   --ckpt checkpoints/pick_v30_contact_timing/pick_v30_contact_timing_final.pt \
-  --out data/pick_v31_dagger_round1 \
-  --num-episodes 500 \
-  --max-steps 700 \
+  --out data/pick_v31_dagger_contact \
+  --num-episodes 250 \
+  --max-attempts 2500 \
+  --max-steps 900 \
   --state-dim 10 \
+  --min-contact-frames 2 \
   --exec-first-only \
-  --seed 131 2>&1 | tee logs/pick_v31_dagger_collect.log
+  --seed 131 2>&1 | tee logs/pick_v31_dagger_contact.log
 ```
 
-Build compact caches. Old 9D roots are retained for reaching stability and padded to 10D by the training dataset reader. The DAgger root is native 10D.
+QC result for the dataset that was actually used:
+
+```text
+episodes: 250
+frames: 224348
+state_dim: 10
+any_contact frames: 4472
+any_contact frac: 0.01993331788114893
+is_grasping frames: 480
+is_grasping frac: 0.0021395332251680425
+```
+
+Build compact caches. Old 9D roots are retained for reaching stability and
+padded to 10D by the training dataset reader. The DAgger root is native 10D and
+is sampled heavily around contact.
 
 ```bash
+cd /home/aditya/bude_vla
 PHASE_RANGES="0.04:0.20:0.35,0.20:0.50:0.45,0.50:1.00:0.20"
 
 for root in pick_v26_unified pick_v27_precision pick_v28_depth_nudge_recovery; do
   MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/build_frame_cache.py \
     --data-root data/$root \
-    --out-dir data/$root/cache_224_h4_v31_6k \
-    --max-frames 6000 \
+    --out-dir data/$root/cache_224_h4_v31_balanced10k \
+    --max-frames 10000 \
     --n-history-frames 4 \
     --phase-ranges "$PHASE_RANGES"
 done
 
 MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/build_frame_cache.py \
-  --data-root data/pick_v31_dagger_round1 \
-  --out-dir data/pick_v31_dagger_round1/cache_224_h4_v31_24k \
+  --data-root data/pick_v31_dagger_contact \
+  --out-dir data/pick_v31_dagger_contact/cache_224_h4_contact24k \
   --max-frames 24000 \
   --n-history-frames 4 \
-  --phase-bins 8
+  --contact-prob 0.75 \
+  --contact-jitter 8
 ```
 
-Train the 10D v31 model from the 9D v30 checkpoint. `train.py` adapts the proprio input layer by splitting the legacy strict-grasp column across the new any-contact and strict-grasp columns.
+Train the 10D v31 model from the 9D v30 checkpoint. `train.py` adapts the
+proprio input layer by splitting the legacy strict-grasp column across the new
+any-contact and strict-grasp columns.
 
 ```bash
-FRAME_CACHE="data/pick_v26_unified/cache_224_h4_v31_6k:data/pick_v27_precision/cache_224_h4_v31_6k:data/pick_v28_depth_nudge_recovery/cache_224_h4_v31_6k:data/pick_v31_dagger_round1/cache_224_h4_v31_24k"
+cd /home/aditya/bude_vla
+mkdir -p logs
+
+C1=data/pick_v26_unified/cache_224_h4_v31_balanced10k
+C2=data/pick_v27_precision/cache_224_h4_v31_balanced10k
+C3=data/pick_v28_depth_nudge_recovery/cache_224_h4_v31_balanced10k
+C4=data/pick_v31_dagger_contact/cache_224_h4_contact24k
+FRAME_CACHE="$C1:$C2:$C3:$C4"
 
 MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/train.py \
   --data-root data/pick_v26_unified \
   --data-root data/pick_v27_precision \
   --data-root data/pick_v28_depth_nudge_recovery \
-  --data-root data/pick_v31_dagger_round1 \
+  --data-root data/pick_v31_dagger_contact \
   --frame-cache "$FRAME_CACHE" \
-  --task pick_v31_dagger_round1 \
+  --task pick_v31_dagger_balanced \
   --init-from checkpoints/pick_v30_contact_timing/pick_v30_contact_timing_final.pt \
   --use-dinov2 \
   --img-size 224 \
@@ -258,20 +302,57 @@ MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/train.py 
   --batch-size 8 \
   --grad-accum-steps 4 \
   --num-workers 2 \
-  --n-steps 50000 \
+  --n-steps 60000 \
   --save-every 10000 \
   --eval-every 0 \
   --lr 2e-5 \
   --backbone-lr 1e-6 \
-  --bc-loss-weight 7.0 \
+  --bc-loss-weight 6.0 \
   --flow-loss-weight 0.10 \
   --gripper-loss-weight 12.0 \
-  --early-bc-weight 3.0 \
-  --early-bc-frac 0.10 \
-  --late-bc-weight 18.0 \
-  --late-bc-frac 0.18 \
-  --ema-decay 0.999 2>&1 | tee logs/pick_v31_dagger_round1.log
+  --early-bc-weight 7.0 \
+  --early-bc-frac 0.24 \
+  --late-bc-weight 10.0 \
+  --late-bc-frac 0.35 \
+  --ema-decay 0.999 2>&1 | tee logs/pick_v31_dagger_balanced.log
 ```
+
+### v31 evaluation
+
+Random-position benchmark:
+
+```text
+checkpoint: checkpoints/pick_v31_dagger_balanced/pick_v31_dagger_balanced_final.pt
+episodes: 100
+success episodes: 0/100 (0.000)
+any_contact episodes: 27/100 (0.270)
+strict_grasp episodes: 0/100 (0.000)
+any_contact frames: 65
+strict_grasp frames: 0
+avg any_contact frames/episode: 0.65
+avg strict_grasp frames/episode: 0.00
+median first_touch_step: 130.0
+```
+
+Fixed 8-position eval from 2026-07-09:
+
+```text
+ep 0 cube=(0.25,0.00) failed timeout cube=[0.247,0.038] grasped=False dist=0.142
+ep 1 cube=(0.30,-0.04) failed timeout cube=[0.309,-0.077] grasped=False dist=0.237
+ep 2 cube=(0.30,0.06) failed timeout cube=[0.332,0.005] grasped=False dist=0.156
+ep 3 cube=(0.22,0.05) failed timeout cube=[0.206,0.009] grasped=False dist=0.190
+ep 4 cube=(0.28,-0.08) failed timeout cube=[0.497,-0.040] grasped=False dist=0.267
+ep 5 cube=(0.34,0.03) failed timeout cube=[0.369,0.050] grasped=False dist=0.121
+ep 6 cube=(0.18,-0.04) failed timeout cube=[0.180,-0.032] grasped=False dist=0.238
+ep 7 cube=(0.31,0.08) failed timeout cube=[0.310,0.080] grasped=False dist=0.081
+```
+
+Interpretation: v31 moved the broad-reaching/contact problem in the right
+direction, but it did not teach stable closing and lifting. The next DAgger
+round should start from v31 and collect more contact-to-grasp correction states.
+This is a better next step than more generic training on the same old caches,
+because the remaining failure happens after contact, not during the whole
+approach trajectory.
 
 ## Evaluation
 
