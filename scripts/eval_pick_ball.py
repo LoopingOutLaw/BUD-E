@@ -6,6 +6,7 @@ Matches training conditions:
  - cube at z=CUBE_REST_Z (0.015)
  - wrist_cam (not pov)
  - cube spawn range (0.15-0.35, -0.10-0.10) matching training
+ - 10D proprio [arm(5)+gripper(1)+target_rel(2)+any_contact(1)+is_grasping(1)] for contact-aware checkpoints
  - 9D proprio [arm(5)+gripper(1)+target_rel(2)+is_grasping(1)] for pick_v10 checkpoints
  - 7D proprio [arm(5)+gripper(1)+is_grasping(1)] for pick_v8/v9 checkpoints
  - 6D proprio [arm(5)+gripper(1)] for older pick_v7 checkpoints
@@ -41,6 +42,8 @@ from bude_vla.envs.so101_mjx import (
     N_ARM_JOINTS,
     load_arm_model, CUBE_REST_Z,
     is_grasping_from_contacts,
+    is_touching_cube_from_contacts,
+    build_pick_proprio,
 )
 from bude_vla.models.policy import BUDEPolicy, BUDEConfig
 from bude_vla.perception import detect_red_centroid
@@ -222,7 +225,7 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
     target_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
     gripperframe_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
 
-    use_9d = (cfg.state_dim == 9)
+    use_9d_or_10d = (cfg.state_dim in (9, 10))
     use_contact_signal = (cfg.state_dim >= 7)
     n_h = cfg.n_history_frames
     C_single = 6  # single-frame dual-cam channels
@@ -275,28 +278,11 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
             vid_renderer.update_scene(data, camera=vid_cam)
             vid_frame = np.asarray(vid_renderer.render()).copy()
 
-            # Proprio: 9D [arm(5)+gripper(1)+target_rel(2)+is_grasping(1)] or 7D or 6D
-            # is_grasping uses SAME contact helper as recording — no heuristic mismatch
-            gripper_pos = data.site_xpos[gripperframe_id]
+            # Proprio builder is shared with recording/training to avoid layout drift.
             is_grasping = is_grasping_from_contacts(model, data)
             if is_grasping > 0.5:
                 ever_grasped = True
-
-            if use_9d:
-                target_pos = data.xpos[target_body_id]
-                target_rel = target_pos[:2] - gripper_pos[:2]
-                arm_proprio = np.concatenate([
-                    data.qpos[ARM_QPOS_START:GRIPPER_QPOS_START + 1],  # 6D
-                    target_rel,                                         # 2D
-                    [is_grasping],                                      # 1D = 9D
-                ]).astype(np.float32)
-            elif use_contact_signal:
-                arm_proprio = np.concatenate([
-                    data.qpos[ARM_QPOS_START:GRIPPER_QPOS_START + 1],  # 6D
-                    [is_grasping],                                      # 1D = 7D
-                ]).astype(np.float32)
-            else:
-                arm_proprio = data.qpos[ARM_QPOS_START:GRIPPER_QPOS_END].astype(np.float32).copy()
+            arm_proprio = build_pick_proprio(model, data, cfg.state_dim)
 
             batch = build_batch(stacked_img, arm_proprio, text_ids, device,
                                 n_history_frames=n_h)

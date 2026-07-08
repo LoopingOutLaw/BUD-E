@@ -134,8 +134,9 @@ class PhaseBalancedBatchSampler(torch.utils.data.Sampler[list[int]]):
             yield batch
 
 
-def _detect_dim(roots, key):
-    """Read dataset shape for `key` from the first valid info.json."""
+def _detect_dims(roots, key) -> list[int]:
+    """Read dataset shapes for `key` from available info.json files."""
+    dims: list[int] = []
     for root in roots:
         info_path = Path(root) / "meta" / "info.json"
         if info_path.exists():
@@ -144,18 +145,67 @@ def _detect_dim(roots, key):
                 feat = meta.get("features", {}).get(key, {})
                 shape = feat.get("shape", [])
                 if isinstance(shape, list) and shape:
-                    return int(shape[0])
+                    dims.append(int(shape[0]))
             except (json.JSONDecodeError, ValueError, TypeError):
                 continue
-    return None
+    return dims
+
+
+def _detect_dim(roots, key):
+    dims = _detect_dims(roots, key)
+    return dims[0] if dims else None
 
 
 def _detect_action_dim(roots: list) -> int | None:
-    return _detect_dim(roots, "action")
+    dims = set(_detect_dims(roots, "action"))
+    if not dims:
+        return None
+    if len(dims) != 1:
+        raise ValueError(f"Mixed action dimensions are not supported: {sorted(dims)}")
+    return next(iter(dims))
 
 
 def _detect_state_dim(roots: list) -> int | None:
-    return _detect_dim(roots, "observation.state")
+    dims = _detect_dims(roots, "observation.state")
+    return max(dims) if dims else None
+
+
+def adapt_state_dict_for_state_dim(
+    state_dict: dict[str, torch.Tensor],
+    saved_state_dim: int | None,
+    current_state_dim: int,
+) -> dict[str, torch.Tensor]:
+    """Adapt a 9D pick checkpoint to the 10D any-contact proprio layout.
+
+    Legacy 9D layout: base6 + target_rel2 + is_grasping.
+    New 10D layout:    base6 + target_rel2 + any_contact + is_grasping.
+    The old grasp column is split across the two contact columns so the initial
+    response is close when both signals are equal, while training can separate
+    them.
+    """
+    if saved_state_dim == current_state_dim:
+        return state_dict
+    if not (saved_state_dim == 9 and current_state_dim == 10):
+        return state_dict
+
+    out = dict(state_dict)
+    for key in ("proprio.norm.weight", "proprio.norm.bias"):
+        if key in out and out[key].shape[0] == 9:
+            old = out[key]
+            new_t = old.new_empty(10)
+            new_t[:8] = old[:8]
+            new_t[8] = old[8]
+            new_t[9] = old[8]
+            out[key] = new_t
+    key = "proprio.proj.weight"
+    if key in out and out[key].ndim == 2 and out[key].shape[1] == 9:
+        old = out[key]
+        new_t = old.new_empty((old.shape[0], 10))
+        new_t[:, :8] = old[:, :8]
+        new_t[:, 8] = old[:, 8] * 0.5
+        new_t[:, 9] = old[:, 8] * 0.5
+        out[key] = new_t
+    return out
 
 
 def resolve_frame_caches(roots: list[str | Path], frame_cache: str | Path | None) -> list[str | None]:
@@ -202,7 +252,8 @@ def build_dataloader(roots: list[str | Path], chunk_size: int = 4,
                      lazy_cache_size: int = 8,
                      episode_batches: bool = True,
                      frame_cache: str | Path | None = None,
-                     action_stats: tuple[np.ndarray, np.ndarray] | None = None) -> torch.utils.data.DataLoader:
+                     action_stats: tuple[np.ndarray, np.ndarray] | None = None,
+                     target_state_dim: int | None = None) -> torch.utils.data.DataLoader:
     all_frames = []
     frame_caches = resolve_frame_caches(roots, frame_cache)
     for root, root_frame_cache in zip(roots, frame_caches):
@@ -211,7 +262,8 @@ def build_dataloader(roots: list[str | Path], chunk_size: int = 4,
                                  lazy_videos=lazy_videos,
                                  lazy_cache_size=lazy_cache_size,
                                  frame_cache=root_frame_cache,
-                                 action_stats=action_stats)
+                                 action_stats=action_stats,
+                                 target_state_dim=target_state_dim)
         ds.read()
         all_frames.append(ds)
         cache_note = f" cache={root_frame_cache}" if root_frame_cache is not None else ""
@@ -403,8 +455,11 @@ def train(
             ("dinov2_finetune_blocks", cfg.dinov2_finetune_blocks, saved_cfg.get("dinov2_finetune_blocks")),
             ("use_minilm", cfg.use_minilm, saved_cfg.get("use_minilm")),
             ("action_dim", cfg.action_dim, saved_cfg.get("action_dim")),
-            ("state_dim", cfg.state_dim, saved_cfg.get("state_dim")),
         ]
+        saved_state_dim = saved_cfg.get("state_dim")
+        if saved_state_dim is not None and saved_state_dim != cfg.state_dim:
+            if not (saved_state_dim == 9 and cfg.state_dim == 10):
+                _checks.append(("state_dim", cfg.state_dim, saved_state_dim))
         _mismatches = [f"{name}: checkpoint={saved!r} vs current CLI={cur!r}"
                        for name, cur, saved in _checks
                        if saved is not None and saved != cur]
@@ -414,6 +469,7 @@ def train(
                 + "\n  ".join(_mismatches)
             )
         init_sd = init_ckpt.get("ema_state_dict") or init_ckpt["model_state_dict"]
+        init_sd = adapt_state_dict_for_state_dim(init_sd, saved_cfg.get("state_dim"), cfg.state_dim)
         missing, unexpected = policy.load_state_dict(init_sd, strict=False)
         allowed_prefixes = ("bc_action_head.", "action_cond_proj.", "context_action_head.", "perception_proj.")
         allowed_missing = [k for k in missing if k.startswith(allowed_prefixes)]
@@ -455,7 +511,8 @@ def train(
                           lazy_cache_size=lazy_cache_size,
                           episode_batches=episode_batches,
                           frame_cache=frame_cache,
-                          action_stats=(_action_lo, _action_hi))
+                          action_stats=(_action_lo, _action_hi),
+                          target_state_dim=cfg.state_dim)
 
     # Differential LR: pretrained DINOv2 backbone gets backbone_lr,
     # new modules (proj, text, proprio, backbone transformer, action head) get lr.
