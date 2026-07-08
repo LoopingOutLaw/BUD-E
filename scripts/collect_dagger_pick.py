@@ -1,0 +1,346 @@
+"""Collect DAgger correction data from policy-visited pick states.
+
+The rollout policy controls the simulator. At each visited state, this script
+records the current observation/proprio and labels it with an IK expert action.
+The expert may use simulator state to label data, but cube coordinates are not
+stored in policy observations.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import time
+
+os.environ.setdefault("MUJOCO_GL", "egl")
+
+import mujoco
+import numpy as np
+import torch
+
+from bude_vla.data.action_normalization import denormalize_actions
+from bude_vla.data.lerobot_v3 import finalize_dataset, write_episode
+from bude_vla.data.lerobot_v3 import _tokenize_instruction
+from bude_vla.data.lerobot_v3 import _domain_from_instruction
+from bude_vla.envs.so101_mjx import (
+    ARM_QPOS_START,
+    ARM_QPOS_END,
+    GRIPPER_QPOS_START,
+    GRIPPER_QPOS_END,
+    CUBE_QPOS_START,
+    CUBE_QPOS_END,
+    CUBE_REST_Z,
+    N_ARM_JOINTS,
+    build_pick_proprio,
+    is_grasping_from_contacts,
+    is_touching_cube_from_contacts,
+    load_arm_model,
+)
+from bude_vla.ik import IKController
+from bude_vla.perception import detect_red_centroid
+from bude_vla.scripted_pick_and_place import (
+    FINGER_WIDTH_OFFSET,
+    GRASP_Z_OFFSET,
+    GRIPPER_CLOSED,
+    GRIPPER_OPEN,
+    HEIGHT_OFFSET,
+    WRIST_FLEX_LOCK,
+    WRIST_ROLL_LOCK,
+)
+from eval_pick_ball import INSTRUCTION, load_policy, parse_cube_positions
+
+SUBSTEPS_PER_FRAME = 4
+SUCCESS_THRESHOLD = 0.05
+
+
+def reset_arm(model, data) -> None:
+    data.qpos[0] = 0.0
+    data.qpos[1] = -0.5
+    data.qpos[2] = 0.95
+    data.qpos[3] = WRIST_FLEX_LOCK
+    data.qpos[4] = WRIST_ROLL_LOCK
+    data.qpos[GRIPPER_QPOS_START] = GRIPPER_OPEN
+    data.ctrl[:5] = data.qpos[:5]
+    data.ctrl[GRIPPER_QPOS_START] = GRIPPER_OPEN
+    mujoco.mj_forward(model, data)
+
+
+def reset_cube(data, cx: float, cy: float) -> None:
+    data.qpos[CUBE_QPOS_START:CUBE_QPOS_START + 3] = [cx, cy, CUBE_REST_Z]
+    data.qpos[CUBE_QPOS_START + 3:CUBE_QPOS_START + 7] = [1.0, 0.0, 0.0, 0.0]
+    data.qvel[CUBE_QPOS_START:CUBE_QPOS_END] = 0.0
+    mujoco.mj_forward(data.model, data)
+
+
+def is_success(model, data) -> bool:
+    cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
+    target_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
+    return bool(np.linalg.norm(data.xpos[cube_id, :2] - data.xpos[target_id, :2]) < SUCCESS_THRESHOLD)
+
+
+def is_failure(model, data, step: int, max_steps: int) -> bool:
+    if step >= max_steps:
+        return True
+    cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
+    cube_pos = data.xpos[cube_id]
+    if np.any(np.isnan(cube_pos)):
+        return True
+    if cube_pos[2] < -0.05 or cube_pos[2] > 1.5:
+        return True
+    if np.any(np.abs(data.qpos[ARM_QPOS_START:ARM_QPOS_END]) > 3.5):
+        return True
+    return False
+
+
+def stack_observation(buffer: list[np.ndarray], n_history_frames: int) -> np.ndarray:
+    if n_history_frames <= 1:
+        return buffer[-1]
+    while len(buffer) < n_history_frames:
+        buffer.insert(0, buffer[0])
+    window = np.stack(buffer[-n_history_frames:], axis=0)
+    window = np.ascontiguousarray(window)
+    return np.transpose(window, (1, 2, 0, 3)).reshape(
+        window.shape[1], window.shape[2], n_history_frames * window.shape[-1]
+    )
+
+
+def build_batch(image: np.ndarray, proprio: np.ndarray, text_ids: np.ndarray,
+                device: str, n_history_frames: int) -> dict:
+    perception = detect_red_centroid(image, n_history_frames=n_history_frames)
+    img = torch.from_numpy(image.astype(np.float32)).permute(2, 0, 1) / 255.0
+    return {
+        "images": img.unsqueeze(0).to(device),
+        "text_ids": torch.from_numpy(text_ids).unsqueeze(0).to(device),
+        "instruction": [INSTRUCTION],
+        "proprio": torch.from_numpy(proprio.astype(np.float32)).unsqueeze(0).to(device),
+        "perception": torch.from_numpy(perception).unsqueeze(0).to(device),
+        "domain_id": torch.tensor([_domain_from_instruction(INSTRUCTION)], dtype=torch.long).to(device),
+    }
+
+
+class DaggerPickExpert:
+    """IK correction expert for policy-visited pick states."""
+
+    def __init__(self, model, data):
+        self.model = model
+        self.data = data
+        self.ik = IKController(model, data, end_effector_site="gripperframe")
+        self.cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
+        self.target_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
+        self.gripper_site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
+
+    def action(self) -> np.ndarray:
+        cube = self.data.xpos[self.cube_id].copy()
+        target = self.data.xpos[self.target_id].copy()
+        ee = self.data.site_xpos[self.gripper_site].copy()
+        grasping = is_grasping_from_contacts(self.model, self.data) > 0.5
+        touching = is_touching_cube_from_contacts(self.model, self.data) > 0.5
+        locked_joints = [3, 4]
+
+        if grasping:
+            if cube[2] < CUBE_REST_Z + 0.045:
+                target_pos = cube.copy()
+                target_pos[2] += HEIGHT_OFFSET + 0.06
+                target_pos[1] += FINGER_WIDTH_OFFSET
+                gain = 0.35
+            elif np.linalg.norm(cube[:2] - target[:2]) > 0.04:
+                target_pos = np.array([
+                    target[0],
+                    target[1] + FINGER_WIDTH_OFFSET,
+                    CUBE_REST_Z + HEIGHT_OFFSET + 0.07,
+                ])
+                gain = 0.35
+            else:
+                target_pos = target.copy()
+                target_pos[2] += GRASP_Z_OFFSET + 0.01
+                target_pos[1] += FINGER_WIDTH_OFFSET
+                gain = 0.25
+            gripper_action = GRIPPER_CLOSED
+        elif touching:
+            target_pos = cube.copy()
+            target_pos[2] += GRASP_Z_OFFSET
+            target_pos[1] += FINGER_WIDTH_OFFSET
+            gain = 0.30
+            gripper_action = GRIPPER_CLOSED
+        else:
+            grasp_xy = cube[:2].copy()
+            grasp_xy[1] += FINGER_WIDTH_OFFSET
+            xy_err = np.linalg.norm(ee[:2] - grasp_xy)
+            target_pos = cube.copy()
+            target_pos[1] += FINGER_WIDTH_OFFSET
+            if xy_err > 0.025 or ee[2] < cube[2] + GRASP_Z_OFFSET + 0.025:
+                target_pos[2] += GRASP_Z_OFFSET + HEIGHT_OFFSET
+                gain = 0.70
+            else:
+                target_pos[2] += GRASP_Z_OFFSET
+                gain = 0.55
+            gripper_action = GRIPPER_OPEN
+
+        ctrl = self.ik.step_toward_target(
+            target_pos,
+            gripper_action=gripper_action,
+            gain=gain,
+            locked_joints=locked_joints,
+        )
+        ctrl[3] = WRIST_FLEX_LOCK
+        ctrl[4] = WRIST_ROLL_LOCK
+        return np.concatenate([ctrl[:N_ARM_JOINTS], [ctrl[GRIPPER_QPOS_START]]]).astype(np.float32)
+
+
+def next_policy_action(policy, batch, cfg, action_lo, action_hi, *,
+                       exec_first_only: bool, chunk_state: dict) -> np.ndarray:
+    if exec_first_only:
+        chunk = policy.sample(batch)[0].detach().cpu().numpy()
+        action = chunk[0]
+    else:
+        if chunk_state.get("chunk") is None or chunk_state.get("cursor", 0) >= cfg.chunk_size:
+            chunk_state["chunk"] = policy.sample(batch)[0].detach().cpu().numpy()
+            chunk_state["cursor"] = 0
+        action = chunk_state["chunk"][chunk_state["cursor"]]
+        chunk_state["cursor"] += 1
+    if action_lo is not None:
+        action = denormalize_actions(action, action_lo, action_hi)
+    return action
+
+
+def rollout_episode(model, policy, cfg, action_lo, action_hi, device: str,
+                    obs_renderer, cube_xy: tuple[float, float], *,
+                    max_steps: int, record_state_dim: int,
+                    exec_first_only: bool) -> dict:
+    data = mujoco.MjData(model)
+    mujoco.mj_resetData(model, data)
+    reset_arm(model, data)
+    reset_cube(data, cube_xy[0], cube_xy[1])
+    for _ in range(50):
+        mujoco.mj_step(model, data)
+
+    front_top_cam = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "front_top")
+    wrist_cam = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_cam")
+    text_ids = _tokenize_instruction(INSTRUCTION)
+    expert = DaggerPickExpert(model, data)
+    img_buffer: list[np.ndarray] = []
+    chunk_state: dict = {"chunk": None, "cursor": 0}
+
+    images: list[np.ndarray] = []
+    proprios: list[np.ndarray] = []
+    expert_actions: list[np.ndarray] = []
+    ever_grasped = False
+
+    for step in range(max_steps):
+        obs_renderer.update_scene(data, camera=front_top_cam)
+        top = np.asarray(obs_renderer.render()).copy()
+        obs_renderer.update_scene(data, camera=wrist_cam)
+        wrist = np.asarray(obs_renderer.render()).copy()
+        image = np.concatenate([top, wrist], axis=-1)
+        img_buffer.append(image)
+        stacked = stack_observation(img_buffer, cfg.n_history_frames)
+
+        record_proprio = build_pick_proprio(model, data, record_state_dim)
+        policy_proprio = build_pick_proprio(model, data, cfg.state_dim)
+        expert_action = expert.action()
+
+        images.append(image.copy())
+        proprios.append(record_proprio)
+        expert_actions.append(expert_action)
+
+        if is_grasping_from_contacts(model, data) > 0.5:
+            ever_grasped = True
+
+        batch = build_batch(stacked, policy_proprio, text_ids, device, cfg.n_history_frames)
+        with torch.no_grad():
+            policy_action = next_policy_action(
+                policy, batch, cfg, action_lo, action_hi,
+                exec_first_only=exec_first_only,
+                chunk_state=chunk_state,
+            )
+
+        if np.any(np.isnan(policy_action)):
+            break
+        arm_target = np.clip(policy_action[:N_ARM_JOINTS], -3.5, 3.5)
+        gripper_ctrl = float(np.clip(policy_action[N_ARM_JOINTS], -1.5, 1.5))
+        data.ctrl[:N_ARM_JOINTS] = arm_target
+        data.ctrl[GRIPPER_QPOS_START] = gripper_ctrl
+        for _ in range(SUBSTEPS_PER_FRAME):
+            mujoco.mj_step(model, data)
+
+        if is_success(model, data):
+            break
+        if is_failure(model, data, step, max_steps):
+            break
+
+    cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
+    target_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
+    cube_final = data.xpos[cube_id].copy()
+    target_pos = data.xpos[target_id].copy()
+    reached_target = bool(np.linalg.norm(cube_final[:2] - target_pos[:2]) < SUCCESS_THRESHOLD)
+    return {
+        "images": np.array(images, dtype=np.uint8),
+        "proprio": np.array(proprios, dtype=np.float32),
+        "actions": np.array(expert_actions, dtype=np.float32),
+        "instruction": INSTRUCTION,
+        "success": bool(reached_target and ever_grasped),
+        "ever_grasped": ever_grasped,
+        "reached_target": reached_target,
+        "cube_final_xyz": cube_final,
+        "target_xyz": target_pos,
+    }
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--num-episodes", type=int, default=200)
+    ap.add_argument("--max-steps", type=int, default=900)
+    ap.add_argument("--seed", type=int, default=123)
+    ap.add_argument("--img-size", type=int, default=224)
+    ap.add_argument("--state-dim", type=int, default=10, choices=[9, 10],
+                    help="Recorded DAgger proprio dimension. Use 10 for any-contact + grasp.")
+    ap.add_argument("--exec-first-only", action="store_true",
+                    help="Replan each step and execute only the first action, matching current eval debugging.")
+    ap.add_argument("--cube-positions", default=None,
+                    help="Optional fixed x,y;x,y list. Otherwise samples the training cube range.")
+    args = ap.parse_args()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    policy, action_lo, action_hi, cfg = load_policy(args.ckpt, args.img_size, device)
+    model = load_arm_model()
+    obs_renderer = mujoco.Renderer(model, height=cfg.img_size, width=cfg.img_size)
+    rng = np.random.default_rng(args.seed)
+    fixed_positions = parse_cube_positions(args.cube_positions)
+
+    os.makedirs(args.out, exist_ok=True)
+    n_written = 0
+    n_success = 0
+    t0 = time.time()
+    for ep_i in range(args.num_episodes):
+        if fixed_positions:
+            cube_xy = fixed_positions[ep_i % len(fixed_positions)]
+        else:
+            cube_xy = (float(rng.uniform(0.15, 0.35)), float(rng.uniform(-0.10, 0.10)))
+        ep = rollout_episode(
+            model, policy, cfg, action_lo, action_hi, device, obs_renderer, cube_xy,
+            max_steps=args.max_steps,
+            record_state_dim=args.state_dim,
+            exec_first_only=args.exec_first_only,
+        )
+        if len(ep["actions"]) >= max(2, cfg.chunk_size):
+            write_episode(args.out, ep)
+            n_written += 1
+            n_success += int(ep["success"])
+        print(
+            f"  ep {ep_i:03d} cube=({cube_xy[0]:.3f},{cube_xy[1]:.3f}) "
+            f"steps={len(ep['actions'])} success={ep['success']} "
+            f"grasped={ep['ever_grasped']} reached={ep['reached_target']} "
+            f"{'[written]' if len(ep['actions']) >= max(2, cfg.chunk_size) else '[skipped-short]'}",
+            flush=True,
+        )
+
+    obs_renderer.close()
+    if n_written:
+        finalize_dataset(args.out)
+    elapsed = time.time() - t0
+    print(f"\n=== DAGGER DONE wrote={n_written}/{args.num_episodes} success={n_success} in {elapsed:.0f}s out={args.out} ===")
+
+
+if __name__ == "__main__":
+    main()

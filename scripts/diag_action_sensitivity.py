@@ -28,6 +28,7 @@ from bude_vla.envs.so101_mjx import (
     CUBE_REST_Z,
     load_arm_model,
     is_grasping_from_contacts,
+    build_pick_proprio,
 )
 from bude_vla.models.policy import BUDEConfig, BUDEPolicy
 from bude_vla.perception import detect_red_centroid
@@ -86,18 +87,7 @@ def reset_cube(data, cx: float, cy: float):
 
 
 def build_proprio(model, data, state_dim: int) -> np.ndarray:
-    base = data.qpos[ARM_QPOS_START:GRIPPER_QPOS_END].astype(np.float32).copy()
-    if state_dim == 6:
-        return base
-    is_g = is_grasping_from_contacts(model, data)
-    if state_dim == 7:
-        return np.concatenate([base, [is_g]]).astype(np.float32)
-    if state_dim == 9:
-        gripperframe_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
-        target_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
-        target_rel = data.xpos[target_body_id, :2] - data.site_xpos[gripperframe_id, :2]
-        return np.concatenate([base, target_rel, [is_g]]).astype(np.float32)
-    raise ValueError(f"unsupported state_dim={state_dim}")
+    return build_pick_proprio(model, data, state_dim)
 
 
 def stack_history(frame: np.ndarray, n_history_frames: int) -> np.ndarray:

@@ -236,13 +236,8 @@ def load_arm_model(xml_path: str | Path | None = None) -> mujoco.MjModel:
     return _build_composite_spec()
 
 
-def is_grasping_from_contacts(model: mujoco.MjModel, data: mujoco.MjData) -> float:
-    """Contact-based grasp detection — both finger pads touching cube.
-
-    Returns 1.0 if both static_finger_pad and moving_finger_pad are in
-    contact with cube_geom, 0.0 otherwise. This is the SAME function used
-    in both recording and eval — no heuristic approximation.
-    """
+def cube_pad_contact_flags(model: mujoco.MjModel, data: mujoco.MjData) -> tuple[bool, bool]:
+    """Return whether static and moving finger pads touch the cube."""
     cube_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "cube_geom")
     static_pad_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "static_finger_pad")
     moving_pad_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "moving_finger_pad")
@@ -252,7 +247,24 @@ def is_grasping_from_contacts(model: mujoco.MjModel, data: mujoco.MjData) -> flo
         g1, g2 = data.contact[i].geom1, data.contact[i].geom2
         if g1 == cube_geom_id or g2 == cube_geom_id:
             contacts.add(g2 if g1 == cube_geom_id else g1)
-    return float(static_pad_id in contacts and moving_pad_id in contacts)
+    return static_pad_id in contacts, moving_pad_id in contacts
+
+
+def is_touching_cube_from_contacts(model: mujoco.MjModel, data: mujoco.MjData) -> float:
+    """Any-pad contact signal, true before strict two-pad grasp."""
+    has_static, has_moving = cube_pad_contact_flags(model, data)
+    return float(has_static or has_moving)
+
+
+def is_grasping_from_contacts(model: mujoco.MjModel, data: mujoco.MjData) -> float:
+    """Contact-based grasp detection — both finger pads touching cube.
+
+    Returns 1.0 if both static_finger_pad and moving_finger_pad are in
+    contact with cube_geom, 0.0 otherwise. This is the SAME function used
+    in both recording and eval — no heuristic approximation.
+    """
+    has_static, has_moving = cube_pad_contact_flags(model, data)
+    return float(has_static and has_moving)
 
 
 def default_joint_angles(model: mujoco.MjModel) -> np.ndarray:
@@ -267,6 +279,43 @@ GRIPPER_QPOS_START = 5
 GRIPPER_QPOS_END = 6
 CUBE_QPOS_START = 6
 CUBE_QPOS_END = 13
+
+
+def build_pick_proprio(model: mujoco.MjModel, data: mujoco.MjData, state_dim: int) -> np.ndarray:
+    """Build pick-task proprio matching recorded training layouts.
+
+    Layouts:
+    - 6D: arm(5) + gripper(1)
+    - 7D: 6D + strict is_grasping
+    - 9D: 6D + target_rel_xy(2) + strict is_grasping
+    - 10D: 6D + target_rel_xy(2) + any_pad_contact + strict is_grasping
+
+    The 10D layout gives the policy an earlier contact signal without exposing
+    privileged cube position. target_rel is target-zone-to-gripper, not cube.
+    """
+    base = data.qpos[ARM_QPOS_START:GRIPPER_QPOS_END].astype(np.float32).copy()
+    if state_dim == 6:
+        return base
+
+    is_grasping = is_grasping_from_contacts(model, data)
+    if state_dim == 7:
+        return np.concatenate([base, [is_grasping]]).astype(np.float32)
+
+    if state_dim in (9, 10):
+        gripperframe_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
+        target_body_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
+        gripper_pos = data.site_xpos[gripperframe_id]
+        target_pos = data.xpos[target_body_id]
+        target_rel = target_pos[:2] - gripper_pos[:2]
+        if state_dim == 9:
+            return np.concatenate([base, target_rel, [is_grasping]]).astype(np.float32)
+        any_contact = is_touching_cube_from_contacts(model, data)
+        return np.concatenate([base, target_rel, [any_contact, is_grasping]]).astype(np.float32)
+
+    raise ValueError(f"Unsupported state_dim: {state_dim}")
+
 
 CUBE_REST_Z = 0.015    # 3cm cube center on floor (floor + half_extent=0.015)
 

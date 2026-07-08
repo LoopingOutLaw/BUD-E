@@ -105,6 +105,24 @@ def _proprio_dim(episode: dict) -> int:
     return int(episode["proprio"].shape[1])
 
 
+def adapt_proprio_states(states: np.ndarray, target_state_dim: int | None) -> np.ndarray:
+    """Adapt legacy proprio layouts for mixed-dataset training.
+
+    The only padded path currently supported is 9D -> 10D:
+    base6 + target_rel2 + is_grasping becomes
+    base6 + target_rel2 + any_contact + is_grasping.
+    For legacy rows, any_contact is conservatively initialized to is_grasping.
+    """
+    states = states.astype(np.float32, copy=False)
+    if target_state_dim is None or states.shape[1] == target_state_dim:
+        return states
+    if states.shape[1] == 9 and target_state_dim == 10:
+        return np.concatenate([states[:, :8], states[:, 8:9], states[:, 8:9]], axis=1).astype(np.float32)
+    raise ValueError(
+        f"Cannot adapt proprio states from {states.shape[1]}D to {target_state_dim}D"
+    )
+
+
 def write_episode(root: str | Path, episode: dict) -> Path:
     """Write one episode to the v3 layout. Return path to the parquet file.
 
@@ -124,8 +142,8 @@ def write_episode(root: str | Path, episode: dict) -> Path:
     assert proprio.shape[0] == T, f"proprio length {proprio.shape[0]} != T {T}"
     state_dim = int(proprio.shape[1])
     action_dim = int(actions.shape[1])
-    assert state_dim in (6, 7, 9), (
-        f"proprio dim {state_dim} not in (6, 7, 9)"
+    assert state_dim in (6, 7, 9, 10), (
+        f"proprio dim {state_dim} not in (6, 7, 9, 10)"
     )
 
     # Find next episode_idx
@@ -305,7 +323,8 @@ class BUDETrainingDataset:
                  lazy_videos: bool = True,
                  lazy_cache_size: int = 8,
                  frame_cache: str | Path | None = None,
-                 action_stats: tuple[np.ndarray, np.ndarray] | None = None):
+                 action_stats: tuple[np.ndarray, np.ndarray] | None = None,
+                 target_state_dim: int | None = None):
         self.root = Path(root)
         self.chunk_size = chunk_size
         self.augment = augment
@@ -334,6 +353,7 @@ class BUDETrainingDataset:
         self._action_lo: np.ndarray | None = None
         self._action_hi: np.ndarray | None = None
         self._action_stats_override = action_stats
+        self._target_state_dim = target_state_dim
 
     def read(self) -> "BUDETrainingDataset":
         from pyarrow import parquet as pq
@@ -351,6 +371,7 @@ class BUDETrainingDataset:
             table = pq.read_table(str(pq_path))
             states = np.stack([np.asarray(row.as_py(), dtype=np.float32)
                                for row in table["observation.state"]])
+            states = adapt_proprio_states(states, self._target_state_dim)
             actions = np.stack([np.asarray(row.as_py(), dtype=np.float32)
                                 for row in table["action"]])
             instruction = table["language_instruction"][0].as_py()

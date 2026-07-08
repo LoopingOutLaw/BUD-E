@@ -28,6 +28,7 @@ from bude_vla.envs.so101_mjx import (
     CUBE_QPOS_START,
     CUBE_REST_Z,
     is_grasping_from_contacts,
+    build_pick_proprio,
 )
 
 INSTRUCTION = "pick up the red cube and place it in the blue target zone"
@@ -35,7 +36,7 @@ INSTRUCTION = "pick up the red cube and place it in the blue target zone"
 SUBSTEPS_PER_FRAME = 4  # match video recorder
 
 
-def _main_loop(model, data, policy, renderer, cam_ids, max_steps=2000):
+def _main_loop(model, data, policy, renderer, cam_ids, max_steps=2000, state_dim=10):
     cube_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
     target_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
     gripperframe_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
@@ -56,16 +57,7 @@ def _main_loop(model, data, policy, renderer, cam_ids, max_steps=2000):
         if is_grasping:
             ever_grasped = True
 
-        # 9D proprio: arm(5) + gripper(1) + target_rel(2) + is_grasping(1)
-        gripper_pos = data.site_xpos[gripperframe_id]
-        target_pos = data.xpos[target_body_id]
-        target_rel = target_pos[:2] - gripper_pos[:2]
-
-        proprio = np.concatenate([
-            data.qpos[ARM_QPOS_START:GRIPPER_QPOS_START + 1],  # 6D
-            target_rel,                                          # 2D
-            [is_grasping],                                       # 1D = 9D total
-        ]).astype(np.float32)
+        proprio = build_pick_proprio(model, data, state_dim)
         proprios.append(proprio)
 
         # Policy step — returns ctrl, recorder calls mj_step
@@ -112,6 +104,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--img-size", type=int, default=64)
     ap.add_argument("--keep-failures", action="store_true")
+    ap.add_argument("--state-dim", type=int, default=10, choices=[6, 7, 9, 10],
+                    help="Recorded proprio dimension. Use 10 for any-contact + grasp contact-aware pick data.")
     ap.add_argument("--recovery-jitter-xy", type=float, default=0.0,
                     help="Max XY waypoint jitter in meters during approach/descent, decayed to zero before close.")
     ap.add_argument("--recovery-jitter-z", type=float, default=0.0,
@@ -208,7 +202,7 @@ def main():
         )
         renderer = mujoco.Renderer(model, height=args.img_size, width=args.img_size)
 
-        ep = _main_loop(model, data, policy, renderer, cam_ids)
+        ep = _main_loop(model, data, policy, renderer, cam_ids, state_dim=args.state_dim)
 
         renderer.close()
 

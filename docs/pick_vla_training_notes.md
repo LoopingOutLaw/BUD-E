@@ -43,6 +43,8 @@ Important changes now in the repo:
 - Mixed cached training support for multiple data roots.
 - Gripper-weighted BC and flow losses.
 - `scripts/build_frame_cache.py --phase-ranges` for contact-focused cache sampling.
+- 10D contact-aware proprio: base6 + target_rel2 + any_pad_contact + strict is_grasping.
+- DAgger collection in `scripts/collect_dagger_pick.py`: policy rollouts labeled by an IK correction expert.
 - Eval debug mode printing raw arm targets, clipping state, and gripper command.
 
 ## Experiment Milestones
@@ -87,6 +89,10 @@ step 0200 grip=-0.306  finally closing after the cube was disturbed
 ### v30 contact timing
 
 `pick_v30_contact_timing` is the current focused fine-tune. It starts from v29 and trains on compact contact-focused caches. The goal is not generic extra training; it is to emphasize descend/contact/close/recovery frames.
+
+### v31 DAgger round 1
+
+`pick_v31_dagger_round1` is the next planned run. It differs from v28-v30 because the failure states are not hand-guessed. The v30 policy is rolled out in simulation, the current observation is recorded, and an IK expert labels the corrective action from that actual policy-visited state. This directly targets the terminal off-distribution states where the policy reaches, touches, pushes, or hovers but does not grasp.
 
 ## v29 Mixed Training
 
@@ -191,6 +197,82 @@ MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/train.py 
   --ema-decay 0.999
 ```
 
+
+## v31 DAgger Round 1
+
+Collect policy-visited states from v30 and label them with the IK expert:
+
+```bash
+cd /home/aditya/bude_vla
+mkdir -p logs
+
+MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/collect_dagger_pick.py \
+  --ckpt checkpoints/pick_v30_contact_timing/pick_v30_contact_timing_final.pt \
+  --out data/pick_v31_dagger_round1 \
+  --num-episodes 500 \
+  --max-steps 700 \
+  --state-dim 10 \
+  --exec-first-only \
+  --seed 131 2>&1 | tee logs/pick_v31_dagger_collect.log
+```
+
+Build compact caches. Old 9D roots are retained for reaching stability and padded to 10D by the training dataset reader. The DAgger root is native 10D.
+
+```bash
+PHASE_RANGES="0.04:0.20:0.35,0.20:0.50:0.45,0.50:1.00:0.20"
+
+for root in pick_v26_unified pick_v27_precision pick_v28_depth_nudge_recovery; do
+  MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/build_frame_cache.py \
+    --data-root data/$root \
+    --out-dir data/$root/cache_224_h4_v31_6k \
+    --max-frames 6000 \
+    --n-history-frames 4 \
+    --phase-ranges "$PHASE_RANGES"
+done
+
+MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/build_frame_cache.py \
+  --data-root data/pick_v31_dagger_round1 \
+  --out-dir data/pick_v31_dagger_round1/cache_224_h4_v31_24k \
+  --max-frames 24000 \
+  --n-history-frames 4 \
+  --phase-bins 8
+```
+
+Train the 10D v31 model from the 9D v30 checkpoint. `train.py` adapts the proprio input layer by splitting the legacy strict-grasp column across the new any-contact and strict-grasp columns.
+
+```bash
+FRAME_CACHE="data/pick_v26_unified/cache_224_h4_v31_6k:data/pick_v27_precision/cache_224_h4_v31_6k:data/pick_v28_depth_nudge_recovery/cache_224_h4_v31_6k:data/pick_v31_dagger_round1/cache_224_h4_v31_24k"
+
+MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/train.py \
+  --data-root data/pick_v26_unified \
+  --data-root data/pick_v27_precision \
+  --data-root data/pick_v28_depth_nudge_recovery \
+  --data-root data/pick_v31_dagger_round1 \
+  --frame-cache "$FRAME_CACHE" \
+  --task pick_v31_dagger_round1 \
+  --init-from checkpoints/pick_v30_contact_timing/pick_v30_contact_timing_final.pt \
+  --use-dinov2 \
+  --img-size 224 \
+  --chunk-size 16 \
+  --n-history-frames 4 \
+  --batch-size 8 \
+  --grad-accum-steps 4 \
+  --num-workers 2 \
+  --n-steps 50000 \
+  --save-every 10000 \
+  --eval-every 0 \
+  --lr 2e-5 \
+  --backbone-lr 1e-6 \
+  --bc-loss-weight 7.0 \
+  --flow-loss-weight 0.10 \
+  --gripper-loss-weight 12.0 \
+  --early-bc-weight 3.0 \
+  --early-bc-frac 0.10 \
+  --late-bc-weight 18.0 \
+  --late-bc-frac 0.18 \
+  --ema-decay 0.999 2>&1 | tee logs/pick_v31_dagger_round1.log
+```
+
 ## Evaluation
 
 Use fixed cube positions for comparable videos:
@@ -244,4 +326,4 @@ Interpretation:
 - Use cached frames for speed; use smaller contact caches when targeting terminal grasp behavior.
 - Keep raw datasets and final checkpoints before deleting caches. Caches are reproducible and can be rebuilt.
 - If a command is accidentally started twice, stop one run and verify which output directory is complete before continuing.
-- If a model reaches the cube but fails to grasp, do not add privileged cube position. Diagnose gripper timing, depth alignment, and contact recovery instead.
+- If a model reaches the cube but fails to grasp, do not add privileged cube position. Diagnose gripper timing, depth alignment, contact recovery, and DAgger correction data instead.

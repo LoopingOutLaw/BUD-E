@@ -34,6 +34,7 @@ from bude_vla.envs.so101_mjx import (
     CUBE_REST_Z,
     N_ARM_JOINTS,
     is_grasping_from_contacts,
+    build_pick_proprio,
 )
 
 
@@ -127,26 +128,7 @@ def _is_success(model, data, threshold: float = 0.05) -> bool:
 
 def _build_proprio(model, data, state_dim: int) -> np.ndarray:
     """Build proprio vector matching training dimension."""
-    gripperframe_id = mujoco.mj_name2id(
-        model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
-    target_body_id = mujoco.mj_name2id(
-        model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
-
-    base = data.qpos[ARM_QPOS_START:GRIPPER_QPOS_END].astype(np.float32).copy()
-
-    if state_dim == 6:
-        return base
-    elif state_dim == 7:
-        is_g = is_grasping_from_contacts(model, data)
-        return np.concatenate([base, [is_g]]).astype(np.float32)
-    elif state_dim == 9:
-        gripper_pos = data.site_xpos[gripperframe_id]
-        target_pos = data.xpos[target_body_id]
-        target_rel = target_pos[:2] - gripper_pos[:2]
-        is_g = is_grasping_from_contacts(model, data)
-        return np.concatenate([base, target_rel, [is_g]]).astype(np.float32)
-    else:
-        raise ValueError(f"Unsupported state_dim: {state_dim}")
+    return build_pick_proprio(model, data, state_dim)
 
 
 def _build_batch(image: np.ndarray, proprio: np.ndarray,
