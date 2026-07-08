@@ -272,14 +272,19 @@ def rollout_episode(model, policy, cfg, action_lo, action_hi, device: str,
     cube_final = data.xpos[cube_id].copy()
     target_pos = data.xpos[target_id].copy()
     reached_target = bool(np.linalg.norm(cube_final[:2] - target_pos[:2]) < SUCCESS_THRESHOLD)
+    proprio_arr = np.array(proprios, dtype=np.float32)
+    any_contact_frames = int((proprio_arr[:, 8] > 0.5).sum()) if proprio_arr.ndim == 2 and proprio_arr.shape[1] >= 10 else 0
+    strict_grasp_frames = int((proprio_arr[:, 9] > 0.5).sum()) if proprio_arr.ndim == 2 and proprio_arr.shape[1] >= 10 else 0
     return {
         "images": np.array(images, dtype=np.uint8),
-        "proprio": np.array(proprios, dtype=np.float32),
+        "proprio": proprio_arr,
         "actions": np.array(expert_actions, dtype=np.float32),
         "instruction": INSTRUCTION,
         "success": bool(reached_target and ever_grasped),
         "ever_grasped": ever_grasped,
         "reached_target": reached_target,
+        "any_contact_frames": any_contact_frames,
+        "strict_grasp_frames": strict_grasp_frames,
         "cube_final_xyz": cube_final,
         "target_xyz": target_pos,
     }
@@ -289,7 +294,12 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--num-episodes", type=int, default=200)
+    ap.add_argument("--num-episodes", type=int, default=200,
+                    help="Target number of written episodes when --min-contact-frames > 0; otherwise rollout attempts.")
+    ap.add_argument("--max-attempts", type=int, default=None,
+                    help="Maximum rollout attempts for contact-filtered collection. Defaults to --num-episodes.")
+    ap.add_argument("--min-contact-frames", type=int, default=0,
+                    help="Only write episodes with at least this many any-contact frames. 0 keeps all non-short episodes.")
     ap.add_argument("--max-steps", type=int, default=900)
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--img-size", type=int, default=224)
@@ -309,12 +319,20 @@ def main() -> None:
     fixed_positions = parse_cube_positions(args.cube_positions)
 
     os.makedirs(args.out, exist_ok=True)
+    target_written = int(args.num_episodes)
+    max_attempts = int(args.max_attempts) if args.max_attempts is not None else target_written
+    if args.min_contact_frames <= 0:
+        max_attempts = target_written
     n_written = 0
     n_success = 0
+    n_short = 0
+    n_contact_poor = 0
     t0 = time.time()
-    for ep_i in range(args.num_episodes):
+    for attempt_i in range(max_attempts):
+        if args.min_contact_frames > 0 and n_written >= target_written:
+            break
         if fixed_positions:
-            cube_xy = fixed_positions[ep_i % len(fixed_positions)]
+            cube_xy = fixed_positions[attempt_i % len(fixed_positions)]
         else:
             cube_xy = (float(rng.uniform(0.15, 0.35)), float(rng.uniform(-0.10, 0.10)))
         ep = rollout_episode(
@@ -323,15 +341,24 @@ def main() -> None:
             record_state_dim=args.state_dim,
             exec_first_only=args.exec_first_only,
         )
-        if len(ep["actions"]) >= max(2, cfg.chunk_size):
+        long_enough = len(ep["actions"]) >= max(2, cfg.chunk_size)
+        contact_enough = int(ep["any_contact_frames"]) >= max(0, args.min_contact_frames)
+        should_write = long_enough and contact_enough
+        if should_write:
             write_episode(args.out, ep)
             n_written += 1
             n_success += int(ep["success"])
+        elif not long_enough:
+            n_short += 1
+        else:
+            n_contact_poor += 1
+        status = "[written]" if should_write else ("[skipped-short]" if not long_enough else "[skipped-contact]")
         print(
-            f"  ep {ep_i:03d} cube=({cube_xy[0]:.3f},{cube_xy[1]:.3f}) "
-            f"steps={len(ep['actions'])} success={ep['success']} "
-            f"grasped={ep['ever_grasped']} reached={ep['reached_target']} "
-            f"{'[written]' if len(ep['actions']) >= max(2, cfg.chunk_size) else '[skipped-short]'}",
+            f"  attempt {attempt_i:04d} written={n_written:04d}/{target_written:04d} "
+            f"cube=({cube_xy[0]:.3f},{cube_xy[1]:.3f}) "
+            f"steps={len(ep['actions'])} contact={ep['any_contact_frames']} "
+            f"grasp_frames={ep['strict_grasp_frames']} success={ep['success']} "
+            f"grasped={ep['ever_grasped']} reached={ep['reached_target']} {status}",
             flush=True,
         )
 
@@ -339,7 +366,11 @@ def main() -> None:
     if n_written:
         finalize_dataset(args.out)
     elapsed = time.time() - t0
-    print(f"\n=== DAGGER DONE wrote={n_written}/{args.num_episodes} success={n_success} in {elapsed:.0f}s out={args.out} ===")
+    print(
+        f"\n=== DAGGER DONE wrote={n_written}/{target_written} attempts={attempt_i + 1 if max_attempts else 0}/{max_attempts} "
+        f"success={n_success} skipped_short={n_short} skipped_contact={n_contact_poor} "
+        f"in {elapsed:.0f}s out={args.out} ==="
+    )
 
 
 if __name__ == "__main__":

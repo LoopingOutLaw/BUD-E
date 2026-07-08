@@ -120,6 +120,44 @@ class TrainingControlsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "0 <= lo < hi <= 1"):
             parse_weighted_phase_ranges("0.4:0.2:1")
 
+    def test_select_contact_focused_frames_oversamples_contact_indices(self):
+        import numpy as np
+        from scripts.build_frame_cache import EpisodeInfo, select_cache_frame_indices
+
+        episodes = [EpisodeInfo(ep_idx=0, chunk_idx=0, start=0, length=10, contact_locals=[5])]
+        selected = select_cache_frame_indices(
+            episodes,
+            max_frames=6,
+            rng=np.random.default_rng(0),
+            early_prob=0.0,
+            early_max_frac=0.22,
+            phase_bins=0,
+            phase_ranges=[],
+            contact_prob=1.0,
+            contact_jitter=0,
+        )
+
+        self.assertEqual(selected[0], {5})
+
+    def test_select_contact_focused_frames_falls_back_without_contacts(self):
+        import numpy as np
+        from scripts.build_frame_cache import EpisodeInfo, select_cache_frame_indices
+
+        episodes = [EpisodeInfo(ep_idx=0, chunk_idx=0, start=0, length=10, contact_locals=[])]
+        selected = select_cache_frame_indices(
+            episodes,
+            max_frames=3,
+            rng=np.random.default_rng(1),
+            early_prob=0.0,
+            early_max_frac=0.22,
+            phase_bins=0,
+            phase_ranges=[],
+            contact_prob=1.0,
+            contact_jitter=0,
+        )
+
+        self.assertGreater(len(selected[0]), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
