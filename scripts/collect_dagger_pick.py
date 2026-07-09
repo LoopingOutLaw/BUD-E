@@ -38,6 +38,7 @@ from bude_vla.envs.so101_mjx import (
 from bude_vla.ik import IKController
 from bude_vla.perception import detect_red_centroid
 from bude_vla.scripted_pick_and_place import (
+    ScriptedPickAndPlace,
     FINGER_WIDTH_OFFSET,
     GRASP_Z_OFFSET,
     GRIPPER_CLOSED,
@@ -205,7 +206,8 @@ def next_policy_action(policy, batch, cfg, action_lo, action_hi, *,
 def rollout_episode(model, policy, cfg, action_lo, action_hi, device: str,
                     obs_renderer, cube_xy: tuple[float, float], *,
                     max_steps: int, record_state_dim: int,
-                    exec_first_only: bool) -> dict:
+                    exec_first_only: bool, intervention_mode: bool,
+                    intervention_steps: int, near_trigger_dist: float) -> dict:
     data = mujoco.MjData(model)
     mujoco.mj_resetData(model, data)
     reset_arm(model, data)
@@ -216,7 +218,9 @@ def rollout_episode(model, policy, cfg, action_lo, action_hi, device: str,
     front_top_cam = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "front_top")
     wrist_cam = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_cam")
     text_ids = _tokenize_instruction(INSTRUCTION)
-    expert = DaggerPickExpert(model, data)
+    correction_expert = DaggerPickExpert(model, data)
+    scripted_expert: ScriptedPickAndPlace | None = None
+    scripted_done = False
     img_buffer: list[np.ndarray] = []
     chunk_state: dict = {"chunk": None, "cursor": 0}
 
@@ -224,6 +228,11 @@ def rollout_episode(model, policy, cfg, action_lo, action_hi, device: str,
     proprios: list[np.ndarray] = []
     expert_actions: list[np.ndarray] = []
     ever_grasped = False
+    intervention_until = -1
+    intervention_started = False
+    intervention_frames = 0
+    cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
+    gripper_site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
 
     for step in range(max_steps):
         obs_renderer.update_scene(data, camera=front_top_cam)
@@ -236,16 +245,38 @@ def rollout_episode(model, policy, cfg, action_lo, action_hi, device: str,
 
         record_proprio = build_pick_proprio(model, data, record_state_dim)
         policy_proprio = build_pick_proprio(model, data, cfg.state_dim)
-        expert_action = expert.action()
-
-        images.append(image.copy())
-        proprios.append(record_proprio)
-        expert_actions.append(expert_action)
 
         if is_grasping_from_contacts(model, data) > 0.5:
             ever_grasped = True
 
         batch = build_batch(stacked, policy_proprio, text_ids, device, cfg.n_history_frames)
+        touching = is_touching_cube_from_contacts(model, data) > 0.5
+        cube = data.xpos[cube_id].copy()
+        ee = data.site_xpos[gripper_site].copy()
+        near_cube = (np.linalg.norm(ee[:2] - cube[:2]) <= near_trigger_dist
+                     and abs(float(ee[2] - cube[2])) <= 0.16)
+        if intervention_mode and (touching or near_cube) and step < max_steps - 5:
+            intervention_started = True
+            intervention_until = max(intervention_until, step + intervention_steps)
+            if scripted_expert is None:
+                scripted_expert = ScriptedPickAndPlace(
+                    model, data, cube[:2], max_grasp_retries=1,
+                    recovery_jitter_xy=0.0, recovery_jitter_z=0.0,
+                    nudge_recovery_prob=0.0,
+                )
+
+        if intervention_mode and step <= intervention_until and scripted_expert is not None and not scripted_done:
+            ctrl, _arm_q, scripted_done, _info = scripted_expert.step(model, data)
+            expert_action = np.concatenate([
+                ctrl[:N_ARM_JOINTS], [ctrl[GRIPPER_QPOS_START]]
+            ]).astype(np.float32)
+        else:
+            expert_action = correction_expert.action()
+
+        images.append(image.copy())
+        proprios.append(record_proprio)
+        expert_actions.append(expert_action)
+
         with torch.no_grad():
             policy_action = next_policy_action(
                 policy, batch, cfg, action_lo, action_hi,
@@ -255,8 +286,13 @@ def rollout_episode(model, policy, cfg, action_lo, action_hi, device: str,
 
         if np.any(np.isnan(policy_action)):
             break
-        arm_target = np.clip(policy_action[:N_ARM_JOINTS], -3.5, 3.5)
-        gripper_ctrl = float(np.clip(policy_action[N_ARM_JOINTS], -1.5, 1.5))
+        if intervention_mode and step <= intervention_until and scripted_expert is not None and not scripted_done:
+            exec_action = expert_action
+            intervention_frames += 1
+        else:
+            exec_action = policy_action
+        arm_target = np.clip(exec_action[:N_ARM_JOINTS], -3.5, 3.5)
+        gripper_ctrl = float(np.clip(exec_action[N_ARM_JOINTS], -1.5, 1.5))
         data.ctrl[:N_ARM_JOINTS] = arm_target
         data.ctrl[GRIPPER_QPOS_START] = gripper_ctrl
         for _ in range(SUBSTEPS_PER_FRAME):
@@ -267,7 +303,6 @@ def rollout_episode(model, policy, cfg, action_lo, action_hi, device: str,
         if is_failure(model, data, step, max_steps):
             break
 
-    cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
     target_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
     cube_final = data.xpos[cube_id].copy()
     target_pos = data.xpos[target_id].copy()
@@ -285,6 +320,8 @@ def rollout_episode(model, policy, cfg, action_lo, action_hi, device: str,
         "reached_target": reached_target,
         "any_contact_frames": any_contact_frames,
         "strict_grasp_frames": strict_grasp_frames,
+        "intervention_started": intervention_started,
+        "intervention_frames": intervention_frames,
         "cube_final_xyz": cube_final,
         "target_xyz": target_pos,
     }
@@ -300,6 +337,16 @@ def main() -> None:
                     help="Maximum rollout attempts for contact-filtered collection. Defaults to --num-episodes.")
     ap.add_argument("--min-contact-frames", type=int, default=0,
                     help="Only write episodes with at least this many any-contact frames. 0 keeps all non-short episodes.")
+    ap.add_argument("--min-grasp-frames", type=int, default=0,
+                    help="Only write episodes with at least this many strict two-pad grasp frames.")
+    ap.add_argument("--require-success", action="store_true",
+                    help="Only write episodes where the cube is both grasped and reaches the target zone.")
+    ap.add_argument("--intervention-mode", action="store_true",
+                    help="After policy near/contact trigger, execute expert actions for a recovery window while recording expert labels.")
+    ap.add_argument("--intervention-steps", type=int, default=900,
+                    help="Number of steps to keep expert intervention active after each near/contact trigger.")
+    ap.add_argument("--near-trigger-dist", type=float, default=0.055,
+                    help="XY gripper-to-cube distance that triggers expert intervention, in meters.")
     ap.add_argument("--max-steps", type=int, default=900)
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--img-size", type=int, default=224)
@@ -340,10 +387,16 @@ def main() -> None:
             max_steps=args.max_steps,
             record_state_dim=args.state_dim,
             exec_first_only=args.exec_first_only,
+            intervention_mode=args.intervention_mode,
+            intervention_steps=args.intervention_steps,
+            near_trigger_dist=args.near_trigger_dist,
         )
         long_enough = len(ep["actions"]) >= max(2, cfg.chunk_size)
         contact_enough = int(ep["any_contact_frames"]) >= max(0, args.min_contact_frames)
-        should_write = long_enough and contact_enough
+        grasp_enough = int(ep["strict_grasp_frames"]) >= max(0, args.min_grasp_frames)
+        success_enough = (not args.require_success) or bool(ep["success"])
+        intervention_enough = (not args.intervention_mode) or bool(ep["intervention_started"])
+        should_write = long_enough and contact_enough and grasp_enough and success_enough and intervention_enough
         if should_write:
             write_episode(args.out, ep)
             n_written += 1
@@ -352,12 +405,24 @@ def main() -> None:
             n_short += 1
         else:
             n_contact_poor += 1
-        status = "[written]" if should_write else ("[skipped-short]" if not long_enough else "[skipped-contact]")
+        if should_write:
+            status = "[written]"
+        elif not long_enough:
+            status = "[skipped-short]"
+        elif not intervention_enough:
+            status = "[skipped-no-intervention]"
+        elif not grasp_enough:
+            status = "[skipped-grasp]"
+        elif not success_enough:
+            status = "[skipped-success]"
+        else:
+            status = "[skipped-contact]"
         print(
             f"  attempt {attempt_i:04d} written={n_written:04d}/{target_written:04d} "
             f"cube=({cube_xy[0]:.3f},{cube_xy[1]:.3f}) "
             f"steps={len(ep['actions'])} contact={ep['any_contact_frames']} "
-            f"grasp_frames={ep['strict_grasp_frames']} success={ep['success']} "
+            f"grasp_frames={ep['strict_grasp_frames']} intervention={ep['intervention_frames']} "
+            f"success={ep['success']} "
             f"grasped={ep['ever_grasped']} reached={ep['reached_target']} {status}",
             flush=True,
         )
