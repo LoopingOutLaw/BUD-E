@@ -408,6 +408,9 @@ def train(
     gripper_trigger_label_threshold: float = 0.0,
     gripper_trigger_threshold: float = 0.5,
     gripper_trigger_close_value: float = -1.0,
+    action_space: str = "joint_abs",
+    ee_delta_scale: float = 0.05,
+    allow_action_head_mismatch: bool = False,
     lazy_videos: bool = False,
     lazy_cache_size: int = 8,
     episode_batches: bool = True,
@@ -443,6 +446,8 @@ def train(
     cfg.use_gripper_trigger_head = use_gripper_trigger_head
     cfg.gripper_trigger_threshold = gripper_trigger_threshold
     cfg.gripper_trigger_close_value = gripper_trigger_close_value
+    cfg.action_space = action_space
+    cfg.ee_delta_scale = ee_delta_scale
     # Auto-detect action/state dims from dataset if possible; fall back to 6 (SO-101 5-arm + 1-grip).
     cfg.action_dim = action_dim_override if (action_dim_override := _detect_action_dim(data_roots)) else 6
     cfg.state_dim  = state_dim_override  if (state_dim_override  := _detect_state_dim(data_roots))  else 6
@@ -462,8 +467,10 @@ def train(
             ("use_dinov2", cfg.use_dinov2, saved_cfg.get("use_dinov2")),
             ("dinov2_finetune_blocks", cfg.dinov2_finetune_blocks, saved_cfg.get("dinov2_finetune_blocks")),
             ("use_minilm", cfg.use_minilm, saved_cfg.get("use_minilm")),
-            ("action_dim", cfg.action_dim, saved_cfg.get("action_dim")),
         ]
+        if not allow_action_head_mismatch:
+            _checks.append(("action_dim", cfg.action_dim, saved_cfg.get("action_dim")))
+            _checks.append(("action_space", cfg.action_space, saved_cfg.get("action_space", "joint_abs")))
         saved_state_dim = saved_cfg.get("state_dim")
         if saved_state_dim is not None and saved_state_dim != cfg.state_dim:
             if not (saved_state_dim == 9 and cfg.state_dim == 10):
@@ -478,8 +485,20 @@ def train(
             )
         init_sd = init_ckpt.get("ema_state_dict") or init_ckpt["model_state_dict"]
         init_sd = adapt_state_dict_for_state_dim(init_sd, saved_cfg.get("state_dim"), cfg.state_dim)
+        if allow_action_head_mismatch:
+            current_sd = policy.state_dict()
+            dropped = []
+            filtered = {}
+            for k, v in init_sd.items():
+                if k in current_sd and tuple(current_sd[k].shape) != tuple(v.shape):
+                    dropped.append(k)
+                else:
+                    filtered[k] = v
+            init_sd = filtered
+            if dropped:
+                print(f"  dropped {len(dropped)} shape-mismatched tensors for new action head/action_dim")
         missing, unexpected = policy.load_state_dict(init_sd, strict=False)
-        allowed_prefixes = ("bc_action_head.", "action_cond_proj.", "context_action_head.", "perception_proj.", "gripper_trigger_head.")
+        allowed_prefixes = ("action_head.", "bc_action_head.", "action_cond_proj.", "context_action_head.", "perception_proj.", "gripper_trigger_head.")
         allowed_missing = [k for k in missing if k.startswith(allowed_prefixes)]
         other_missing = [k for k in missing if not k.startswith(allowed_prefixes)]
         if other_missing or unexpected:
@@ -599,6 +618,7 @@ def train(
             ("use_perception", cfg.use_perception, saved_cfg.get("use_perception", False)),
             ("use_perception_action_cond", cfg.use_perception_action_cond, saved_cfg.get("use_perception_action_cond", False)),
             ("use_gripper_trigger_head", cfg.use_gripper_trigger_head, saved_cfg.get("use_gripper_trigger_head", False)),
+            ("action_space", cfg.action_space, saved_cfg.get("action_space", "joint_abs")),
         ]
         _mismatches = [f"{name}: checkpoint={saved!r} vs current CLI={cur!r}"
                        for name, cur, saved in _checks
@@ -775,6 +795,8 @@ def train(
                     "gripper_trigger_label_threshold": gripper_trigger_label_threshold if cfg.use_gripper_trigger_head else None,
                     "gripper_trigger_threshold": cfg.gripper_trigger_threshold if cfg.use_gripper_trigger_head else None,
                     "gripper_trigger_close_value": cfg.gripper_trigger_close_value if cfg.use_gripper_trigger_head else None,
+                    "action_space": cfg.action_space,
+                    "ee_delta_scale": cfg.ee_delta_scale,
                 },
             }, ckpt_path)
             print(f"  saved checkpoint: {ckpt_path}")
@@ -854,6 +876,8 @@ def train(
             "gripper_trigger_label_threshold": gripper_trigger_label_threshold if cfg.use_gripper_trigger_head else None,
             "gripper_trigger_threshold": cfg.gripper_trigger_threshold if cfg.use_gripper_trigger_head else None,
             "gripper_trigger_close_value": cfg.gripper_trigger_close_value if cfg.use_gripper_trigger_head else None,
+            "action_space": cfg.action_space,
+            "ee_delta_scale": cfg.ee_delta_scale,
         },
     }, final_ckpt)
     print(f"Training done in {time.time()-t0:.0f}s. Final checkpoint: {final_ckpt}")
@@ -937,6 +961,12 @@ if __name__ == "__main__":
                         help="Sigmoid probability threshold for forcing close at inference.")
     parser.add_argument("--gripper-trigger-close-value", type=float, default=-1.0,
                         help="Normalized gripper command used when trigger predicts close.")
+    parser.add_argument("--action-space", choices=["joint_abs", "ee_delta"], default="joint_abs",
+                        help="Action representation. ee_delta predicts TCP dx,dy,dz plus gripper and executes via IK.")
+    parser.add_argument("--ee-delta-scale", type=float, default=0.05,
+                        help="Max expected TCP delta magnitude in meters for ee_delta rollouts.")
+    parser.add_argument("--allow-action-head-mismatch", action="store_true",
+                        help="Allow --init-from when action_dim/action heads changed; transfers shared trunk weights and reinitializes mismatched action heads.")
     parser.add_argument("--init-from", default=None,
                         help="Initialize model weights from a checkpoint without loading optimizer/scheduler state. Useful for adding the BC head to an existing flow checkpoint.")
     parser.add_argument("--resume", default=None,
@@ -1027,6 +1057,9 @@ if __name__ == "__main__":
         gripper_trigger_label_threshold=args.gripper_trigger_label_threshold,
         gripper_trigger_threshold=args.gripper_trigger_threshold,
         gripper_trigger_close_value=args.gripper_trigger_close_value,
+        action_space=args.action_space,
+        ee_delta_scale=args.ee_delta_scale,
+        allow_action_head_mismatch=args.allow_action_head_mismatch,
         lazy_videos=args.lazy_videos,
         lazy_cache_size=args.lazy_cache_size,
         episode_batches=not args.no_episode_batches,

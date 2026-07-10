@@ -33,6 +33,7 @@ import numpy as np
 import torch
 from pathlib import Path
 
+from bude_vla.action_space import apply_policy_action, make_ik_controller
 from bude_vla.data.action_normalization import denormalize_actions
 from bude_vla.data.lerobot_v3 import _tokenize_instruction, _domain_from_instruction
 from bude_vla.envs.so101_mjx import (
@@ -73,6 +74,8 @@ def load_policy(ckpt_path: str, img_size: int, device: str):
     cfg.use_gripper_trigger_head = saved_cfg.get("use_gripper_trigger_head", False)
     cfg.gripper_trigger_threshold = saved_cfg.get("gripper_trigger_threshold", 0.5) or 0.5
     cfg.gripper_trigger_close_value = saved_cfg.get("gripper_trigger_close_value", -1.0) or -1.0
+    cfg.action_space = saved_cfg.get("action_space", "joint_abs")
+    cfg.ee_delta_scale = saved_cfg.get("ee_delta_scale", 0.05) or 0.05
 
     action_lo = ckpt.get("action_norm_lo", None)
     action_hi = ckpt.get("action_norm_hi", None)
@@ -97,7 +100,7 @@ def load_policy(ckpt_path: str, img_size: int, device: str):
     loss_hist = ckpt.get("loss_history", [])
     final_loss = loss_hist[-1][1] if loss_hist else float("nan")
     print(f" loaded step={step} ({weight_src} weights), final_loss={final_loss:.6f}, "
-          f"action_dim={cfg.action_dim}, state_dim={cfg.state_dim}")
+          f"action_dim={cfg.action_dim}, state_dim={cfg.state_dim}, action_space={cfg.action_space}")
     return policy, action_lo, action_hi, cfg
 
 
@@ -328,27 +331,21 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
                         a = denormalize_actions(a, action_lo, action_hi)
 
             if not np.any(np.isnan(a)):
-                raw_arm_target = np.asarray(a[:N_ARM_JOINTS], dtype=np.float64)
-                arm_target = np.clip(raw_arm_target, -3.5, 3.5).astype(np.float64)
-                gripper_ctrl = float(np.clip(a[N_ARM_JOINTS], -1.5, 1.5))
-                if contact_close_reflex and step <= close_until:
-                    gripper_ctrl = min(gripper_ctrl, contact_close_value)
+                arm_target, gripper_ctrl = apply_policy_action(
+                    model, data, a, cfg, ik=ik,
+                    contact_close_reflex=contact_close_reflex,
+                    close_active=step <= close_until,
+                    contact_close_value=contact_close_value,
+                )
                 if debug_actions and (step < 20 or step % 50 == 0):
-                    clipped = bool(np.any(np.abs(raw_arm_target - arm_target) > 1e-6))
                     print(
-                        f"    step {step:04d} raw_arm={np.array2string(raw_arm_target, precision=3)} "
-                        f"clip={clipped} grip={gripper_ctrl:+.3f}",
+                        f"    step {step:04d} action={np.array2string(np.asarray(a), precision=3)} "
+                        f"arm={np.array2string(arm_target, precision=3)} grip={gripper_ctrl:+.3f}",
                         flush=True,
                     )
             else:
-                arm_target = np.array([0.0, -0.5, 0.95, np.pi/2, np.pi/2])
-                gripper_ctrl = 0.3
-
-            # Execute: position actuators drive arm smoothly (matches training)
-            # Training uses ctrl[:5] = arm_target (sts3215 position actuator, kp=998.22)
-            # and ctrl[5] = gripper_ctrl. No kinematic teleport.
-            data.ctrl[:N_ARM_JOINTS] = arm_target
-            data.ctrl[N_ARM_JOINTS] = gripper_ctrl
+                data.ctrl[:N_ARM_JOINTS] = np.array([0.0, -0.5, 0.95, np.pi/2, np.pi/2])
+                data.ctrl[N_ARM_JOINTS] = 0.3
 
             for _ in range(SUBSTEPS_PER_FRAME):
                 mujoco.mj_step(model, data)
