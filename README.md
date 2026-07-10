@@ -6,7 +6,9 @@ The learned policy is intentionally not given privileged cube coordinates. Scrip
 
 ## Current Status
 
-The current best line is `pick_v33_intervention_dagger`, trained from v31 with
+The current experimental line is `pick_v35_ee_delta`, which pivots from joint-target actions to end-effector delta actions after v34 showed gripper timing was not the main blocker. Historical v33 intervention DAgger remains documented below.
+
+Previously, the best joint-action line was `pick_v33_intervention_dagger`, trained from v31 with
 scripted-intervention DAgger data. It is not solved yet, but it is the most
 informative run so far: the policy reaches/touches more often, while strict
 two-pad grasp remains the blocker.
@@ -31,6 +33,23 @@ episodes. However, autonomous strict grasp remains 0/150 and fixed 8-position
 eval remains 0/8. The current bottleneck is no longer lack of grasp examples in
 the dataset; it is converting visual/contact approach into stable two-pad grasp
 at runtime.
+
+
+### v35 EE-Delta Pilot
+
+v34 proved that a discrete gripper trigger and contact-close reflex still give
+0% strict grasp: contact is too brief and poorly aligned. v35 keeps the VLA
+observation contract clean, but changes the action representation to
+`[tcp_dx, tcp_dy, tcp_dz, gripper]` and executes TCP deltas through IK at rollout.
+Run the full pipeline with:
+
+```bash
+bash scripts/run_v35_ee_delta.sh
+```
+
+This creates symlinked converted datasets under `data_ee/`, builds storage-aware
+sampled caches, trains `pick_v35_ee_delta`, and runs both random and fixed-set
+evaluation.
 
 Detailed experiment notes and exact reproduction commands are in [`docs/pick_vla_training_notes.md`](docs/pick_vla_training_notes.md).
 

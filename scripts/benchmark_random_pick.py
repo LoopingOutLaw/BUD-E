@@ -15,6 +15,7 @@ import mujoco
 import numpy as np
 import torch
 
+from bude_vla.action_space import apply_policy_action, make_ik_controller
 from bude_vla.data.action_normalization import denormalize_actions
 from bude_vla.data.lerobot_v3 import _tokenize_instruction
 from bude_vla.envs.so101_mjx import (
@@ -111,6 +112,7 @@ def run_one(policy, model, data, renderer, text_ids, action_lo, action_hi, cfg,
     first_touch_step: int | None = None
     first_grasp_step: int | None = None
     close_until = -1
+    ik = make_ik_controller(model, data) if cfg.action_space == "ee_delta" else None
 
     for step in range(max_steps):
         renderer.update_scene(data, camera=front_top_cam)
@@ -149,11 +151,12 @@ def run_one(policy, model, data, renderer, text_ids, action_lo, action_hi, cfg,
 
         if np.any(np.isnan(action)):
             break
-        data.ctrl[:N_ARM_JOINTS] = np.clip(action[:N_ARM_JOINTS], -3.5, 3.5)
-        gripper_ctrl = float(np.clip(action[N_ARM_JOINTS], -1.5, 1.5))
-        if contact_close_reflex and step <= close_until:
-            gripper_ctrl = min(gripper_ctrl, contact_close_value)
-        data.ctrl[GRIPPER_QPOS_START] = gripper_ctrl
+        apply_policy_action(
+            model, data, action, cfg, ik=ik,
+            contact_close_reflex=contact_close_reflex,
+            close_active=step <= close_until,
+            contact_close_value=contact_close_value,
+        )
         for _ in range(SUBSTEPS_PER_FRAME):
             mujoco.mj_step(model, data)
 

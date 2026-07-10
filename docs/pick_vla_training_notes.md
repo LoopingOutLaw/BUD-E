@@ -509,3 +509,62 @@ Interpretation:
 - Keep raw datasets and final checkpoints before deleting caches. Caches are reproducible and can be rebuilt.
 - If a command is accidentally started twice, stop one run and verify which output directory is complete before continuing.
 - If a model reaches the cube but fails to grasp, do not add privileged cube position. Diagnose gripper timing, depth alignment, contact recovery, and DAgger correction data instead.
+
+## v34 Gripper Trigger Pilot and v35 EE-Delta Pivot
+
+v34 tested the hypothesis that the remaining zero-success behavior was mainly a
+sharp gripper-close timing problem. It added a discrete gripper trigger head and
+used corrected short scripted interventions seeded into the local close phase.
+The pilot trained successfully, but the random benchmark remained at zero strict
+grasps:
+
+```text
+checkpoint: checkpoints/pick_v34_gripper_trigger_pilot/pick_v34_gripper_trigger_pilot_final.pt
+episodes: 60
+success episodes: 0/60 (0.000)
+any_contact episodes: 19/60 (0.317)
+strict_grasp episodes: 0/60 (0.000)
+avg any_contact frames/episode: 1.03
+median first_touch_step: 146.0
+```
+
+The same checkpoint with `--contact-close-reflex` also stayed at zero strict
+grasps:
+
+```text
+episodes: 60
+success episodes: 0/60 (0.000)
+any_contact episodes: 19/60 (0.317)
+strict_grasp episodes: 0/60 (0.000)
+avg any_contact frames/episode: 0.78
+median first_touch_step: 146.0
+```
+
+Interpretation: gripper timing alone is not the blocker. The policy contacts the
+cube too briefly and with the wrong geometry, so forcing close after contact does
+not produce a stable two-pad grasp. v35 therefore changes the action
+representation from absolute joint targets to end-effector delta actions:
+
+```text
+old action: [joint0, joint1, joint2, joint3, joint4, gripper]
+new action: [tcp_dx, tcp_dy, tcp_dz, gripper]
+```
+
+The learned policy still does not receive cube coordinates. The converter only
+rewrites expert actions using MuJoCo forward kinematics. At rollout, the policy's
+predicted TCP delta is executed through the existing SO-101 IK controller, with
+wrist joints locked as before. This targets the observed failure mode directly:
+joint-space averaging near the cube creates small offsets; Cartesian deltas give
+the model a simpler local correction target.
+
+The reproducible v35 pipeline is:
+
+```bash
+bash scripts/run_v35_ee_delta.sh
+```
+
+The script converts selected joint-action datasets to symlinked EE-delta
+datasets, builds modest sampled frame caches to fit the laptop storage budget,
+trains `checkpoints/pick_v35_ee_delta/pick_v35_ee_delta_final.pt`, then runs the
+random benchmark and fixed-set video eval.
+
