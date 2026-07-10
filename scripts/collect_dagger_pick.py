@@ -367,8 +367,8 @@ def main() -> None:
                     help="Only write episodes where the cube is both grasped and reaches the target zone.")
     ap.add_argument("--intervention-mode", action="store_true",
                     help="After policy near/contact trigger, execute expert actions for a recovery window while recording expert labels.")
-    ap.add_argument("--intervention-steps", type=int, default=60,
-                    help="Number of steps to keep expert intervention active after each near/contact trigger.")
+    ap.add_argument("--intervention-steps", type=int, default=280,
+                    help="Upper bound on expert intervention window after each trigger. CLOSE needs ~250+ steps to produce strict grasp.")
     ap.add_argument("--intervention-trigger", choices=["touch", "near", "both"], default="touch",
                     help="Trigger expert intervention on strict robot contact, near-cube proximity, or either.")
     ap.add_argument("--max-interventions", type=int, default=1,

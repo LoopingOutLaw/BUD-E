@@ -8,7 +8,12 @@ export MUJOCO_GL=egl
 export PYTHONPATH=src
 mkdir -p logs
 
-echo "=== [1/5] Collect v34 short touch-intervention DAgger pilot ==="
+echo "=== [0/5] Clean stale v34 pilot outputs ==="
+rm -rf \
+  data/pick_v34_touch_close_pilot \
+  checkpoints/pick_v34_gripper_trigger_pilot
+
+echo "=== [1/5] Collect v34 touch-close DAgger pilot ==="
 python scripts/collect_dagger_pick.py \
   --ckpt checkpoints/pick_v33_intervention_dagger/pick_v33_intervention_dagger_final.pt \
   --out data/pick_v34_touch_close_pilot \
@@ -18,9 +23,10 @@ python scripts/collect_dagger_pick.py \
   --state-dim 10 \
   --intervention-mode \
   --intervention-trigger touch \
-  --intervention-steps 60 \
+  --intervention-steps 280 \
   --max-interventions 1 \
-  --min-contact-frames 1 \
+  --min-contact-frames 10 \
+  --min-grasp-frames 20 \
   --exec-first-only \
   --seed 434 2>&1 | tee logs/pick_v34_touch_close_collect.log
 
