@@ -354,6 +354,107 @@ This is a better next step than more generic training on the same old caches,
 because the remaining failure happens after contact, not during the whole
 approach trajectory.
 
+## v33 Scripted-Intervention DAgger
+
+v32 regressed because it collected only 59 useful contact episodes and trained
+on weak contact-only data. v33 changes the collection contract: the learned
+policy controls the rollout until it reaches a near/contact state, then the
+scripted pick expert executes the full recovery/grasp/place sequence while the
+collector records observations and expert actions. This targets the real
+failure state without adding cube position to policy observations.
+
+The collector change is in `scripts/collect_dagger_pick.py`:
+
+- `--intervention-mode` enables expert takeover after any-pad contact or
+  near-cube trigger.
+- `--intervention-steps` controls how long expert execution remains active.
+- `--min-contact-frames`, `--min-grasp-frames`, and `--require-success` filter
+  out weak episodes before training.
+
+Smoke test before the full run wrote a successful episode:
+
+```text
+written=1/1
+steps=741
+contact=412
+grasp_frames=402
+success=True
+```
+
+Full v33 collection summary from `logs/pick_v33_intervention_collect.log`:
+
+```text
+DAGGER DONE wrote=1480/1500 attempts=2500/2500
+success=1480
+skipped_contact=1020
+out=data/pick_v33_intervention_dagger
+```
+
+Dataset QC from `logs/pick_v33_full_pipeline.log`:
+
+```text
+episodes: 1480
+frames: 1108605
+state_dim: 10
+any_contact frames: 602236
+any_contact frac: 0.5432376725704827
+strict_grasp frames: 570369
+strict_grasp frac: 0.514492537919277
+```
+
+Training summary from `logs/pick_v33_intervention_train.log`:
+
+```text
+Training done in 4507s
+Final checkpoint: checkpoints/pick_v33_intervention_dagger/pick_v33_intervention_dagger_final.pt
+step=80000 EMA final_loss=0.013787
+```
+
+Random benchmark from `logs/pick_v33_random_bench.log`:
+
+```text
+episodes: 150
+success episodes: 0/150 (0.000)
+any_contact episodes: 45/150 (0.300)
+strict_grasp episodes: 0/150 (0.000)
+any_contact frames: 146
+strict_grasp frames: 0
+avg any_contact frames/episode: 0.97
+median first_touch_step: 262.0
+```
+
+Fixed 8-position eval from `logs/pick_v33_video.log`:
+
+```text
+EVAL 0/8 success (0%)
+video: demos/videos/eval_pick_v33_intervention_firstonly.mp4
+```
+
+The contact-close reflex added in `scripts/benchmark_random_pick.py` and
+`scripts/eval_pick_ball.py` is an opt-in runtime diagnostic:
+
+```bash
+python scripts/benchmark_random_pick.py \
+  --ckpt checkpoints/pick_v33_intervention_dagger/pick_v33_intervention_dagger_final.pt \
+  --num-episodes 150 \
+  --max-steps 1200 \
+  --exec-first-only \
+  --contact-close-reflex \
+  --contact-close-steps 180 \
+  --contact-close-value -1.0 \
+  --seed 733
+```
+
+The local `logs/pick_v33_random_bench_reflex.log` is incomplete and stops after
+episode 72, so it is not used as a completed result.
+
+Conclusion: v33 improved autonomous contact rate relative to v31/v30, but the
+absence of strict grasps despite a grasp-rich dataset means the next decision
+should be based on the completed contact-close-reflex benchmark. If reflex still
+has zero strict grasp, the next architecture step should move the low-level
+action interface toward visual-servo end-effector deltas plus IK instead of
+continuing to train absolute joint targets.
+
 ## Evaluation
 
 Use fixed cube positions for comparable videos:

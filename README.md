@@ -6,8 +6,10 @@ The learned policy is intentionally not given privileged cube coordinates. Scrip
 
 ## Current Status
 
-The current best line is `pick_v31_dagger_balanced`, which fine-tunes the
-contact-aware v30 policy with contact-filtered DAgger data.
+The current best line is `pick_v33_intervention_dagger`, trained from v31 with
+scripted-intervention DAgger data. It is not solved yet, but it is the most
+informative run so far: the policy reaches/touches more often, while strict
+two-pad grasp remains the blocker.
 
 What is working now:
 
@@ -22,12 +24,13 @@ What is working now:
 - DAgger collection through `scripts/collect_dagger_pick.py`, where the learned policy visits states and an IK expert labels corrective actions.
 - Random-position benchmarking through `scripts/benchmark_random_pick.py`, so progress is measured beyond the old 8 fixed eval positions.
 
-Observed behavior after v31: broad contact improved, but the policy still does
-not reliably convert contact into a grasp. On 100 random positions,
-`pick_v31_dagger_balanced_final.pt` reached any cube contact in 27/100 episodes
-versus 9/100 for v30, but strict grasp and final success remained 0/100. The
-latest fixed 8-position eval also timed out on all episodes; several episodes
-moved or nudged the cube, but none reached a stable grasp/place.
+Observed behavior after v33: the intervention dataset itself is strong
+(1480 successful expert-intervention episodes with about 54% any-contact frames
+and 51% strict-grasp frames), and random rollout contact improved to 45/150
+episodes. However, autonomous strict grasp remains 0/150 and fixed 8-position
+eval remains 0/8. The current bottleneck is no longer lack of grasp examples in
+the dataset; it is converting visual/contact approach into stable two-pad grasp
+at runtime.
 
 Detailed experiment notes and exact reproduction commands are in [`docs/pick_vla_training_notes.md`](docs/pick_vla_training_notes.md).
 
@@ -69,7 +72,9 @@ regressed rollout reaching, so v29 mixes v26, v27, and v28 while initializing
 from the strong v26 base. v30 focuses the cache on descent/contact/close timing.
 v31 adds 10D contact-aware proprio and contact-filtered DAgger: roll out the
 current policy, keep episodes where the policy actually contacts the cube, and
-train on IK expert corrections from those policy-visited states.
+train on IK expert corrections from those policy-visited states. v33 escalates
+that idea by switching to scripted expert intervention after the policy reaches
+near/contact states, then training from those successful recovery trajectories.
 
 Build contact-focused caches:
 
@@ -210,6 +215,44 @@ MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/train.py 
   --late-bc-frac 0.35 \
   --ema-decay 0.999 2>&1 | tee logs/pick_v31_dagger_balanced.log
 ```
+
+## v33 Intervention DAgger
+
+The v33 run uses `scripts/collect_dagger_pick.py --intervention-mode`. The
+policy drives first; once it reaches near/contact with the cube, the proven
+scripted pick expert takes over and demonstrates recovery, grasp, lift, and
+place from that policy-visited state. This keeps cube position out of the
+learned policy input while using simulator state only for expert labeling.
+
+Actual v33 collection/training results from local logs:
+
+```text
+data/pick_v33_intervention_dagger
+wrote: 1480/1500 episodes from 2500 attempts
+successful expert-intervention episodes: 1480
+frames: 1108605
+state_dim: 10
+any_contact frames: 602236 (0.5432)
+strict_grasp frames: 570369 (0.5145)
+training: 80000 steps, final_loss=0.013787
+checkpoint: checkpoints/pick_v33_intervention_dagger/pick_v33_intervention_dagger_final.pt
+```
+
+Autonomous eval after training:
+
+```text
+random benchmark: 0/150 success
+any_contact episodes: 45/150 (0.300)
+strict_grasp episodes: 0/150
+fixed 8-position eval: 0/8 success
+```
+
+Interpretation: v33 proves the dataset can contain stable grasp/place
+corrections, but the autonomous policy still fails to close/alignment precisely
+enough to produce strict two-pad contact. The next diagnostic is the opt-in
+robot-side `--contact-close-reflex` in eval/benchmark. It uses only finger-pad
+contact, not cube coordinates. If that creates strict grasps, close timing is
+the blocker; if not, final millimeter alignment is still the blocker.
 
 ## Evaluation
 
