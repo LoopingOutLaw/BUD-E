@@ -403,6 +403,11 @@ def train(
     late_bc_weight: float = 1.0,
     late_bc_frac: float = 0.35,
     gripper_loss_weight: float = 1.0,
+    use_gripper_trigger_head: bool = False,
+    gripper_trigger_loss_weight: float = 1.0,
+    gripper_trigger_label_threshold: float = 0.0,
+    gripper_trigger_threshold: float = 0.5,
+    gripper_trigger_close_value: float = -1.0,
     lazy_videos: bool = False,
     lazy_cache_size: int = 8,
     episode_batches: bool = True,
@@ -435,6 +440,9 @@ def train(
     cfg.use_perception = use_perception
     cfg.use_perception_action_cond = use_perception_action_cond
     cfg.perception_dim = 3
+    cfg.use_gripper_trigger_head = use_gripper_trigger_head
+    cfg.gripper_trigger_threshold = gripper_trigger_threshold
+    cfg.gripper_trigger_close_value = gripper_trigger_close_value
     # Auto-detect action/state dims from dataset if possible; fall back to 6 (SO-101 5-arm + 1-grip).
     cfg.action_dim = action_dim_override if (action_dim_override := _detect_action_dim(data_roots)) else 6
     cfg.state_dim  = state_dim_override  if (state_dim_override  := _detect_state_dim(data_roots))  else 6
@@ -471,7 +479,7 @@ def train(
         init_sd = init_ckpt.get("ema_state_dict") or init_ckpt["model_state_dict"]
         init_sd = adapt_state_dict_for_state_dim(init_sd, saved_cfg.get("state_dim"), cfg.state_dim)
         missing, unexpected = policy.load_state_dict(init_sd, strict=False)
-        allowed_prefixes = ("bc_action_head.", "action_cond_proj.", "context_action_head.", "perception_proj.")
+        allowed_prefixes = ("bc_action_head.", "action_cond_proj.", "context_action_head.", "perception_proj.", "gripper_trigger_head.")
         allowed_missing = [k for k in missing if k.startswith(allowed_prefixes)]
         other_missing = [k for k in missing if not k.startswith(allowed_prefixes)]
         if other_missing or unexpected:
@@ -556,6 +564,7 @@ def train(
     running_loss = 0.0
     running_flow_loss = 0.0
     running_bc_loss = 0.0
+    running_trigger_loss = 0.0
     grad_norm = torch.tensor(0.0)
     t0 = time.time()
     dl_iter = iter(dl)
@@ -589,6 +598,7 @@ def train(
             ("use_context_action_head", cfg.use_context_action_head, saved_cfg.get("use_context_action_head", False)),
             ("use_perception", cfg.use_perception, saved_cfg.get("use_perception", False)),
             ("use_perception_action_cond", cfg.use_perception_action_cond, saved_cfg.get("use_perception_action_cond", False)),
+            ("use_gripper_trigger_head", cfg.use_gripper_trigger_head, saved_cfg.get("use_gripper_trigger_head", False)),
         ]
         _mismatches = [f"{name}: checkpoint={saved!r} vs current CLI={cur!r}"
                        for name, cur, saved in _checks
@@ -675,6 +685,15 @@ def train(
             else:
                 bc_loss = torch.zeros((), device=device)
                 loss = flow_loss
+            if "gripper_close_logits" in out:
+                close_target = (batch["actions"][..., -1] <= gripper_trigger_label_threshold).to(out["gripper_close_logits"].dtype)
+                trigger_mask = mask.squeeze(-1)
+                trigger_raw = nn.functional.binary_cross_entropy_with_logits(
+                    out["gripper_close_logits"], close_target, reduction="none")
+                trigger_loss = (trigger_raw * trigger_mask).sum() / trigger_mask.sum().clamp_min(1.0)
+                loss = loss + gripper_trigger_loss_weight * trigger_loss
+            else:
+                trigger_loss = torch.zeros((), device=device)
             loss_scaled = loss / grad_accum_steps
 
         scaler.scale(loss_scaled).backward()
@@ -696,22 +715,25 @@ def train(
         running_loss += loss.item()
         running_flow_loss += flow_loss.item()
         running_bc_loss += bc_loss.item()
+        running_trigger_loss += trigger_loss.item()
         step += 1
 
         if step % 100 == 0:
             avg = running_loss / 100
             flow_avg = running_flow_loss / 100
             bc_avg = running_bc_loss / 100
+            trigger_avg = running_trigger_loss / 100
             elapsed = time.time() - t0
             sps = step / elapsed
             loss_history.append((step, avg))
             print(f"step {step:6d} | loss {avg:.6f} | flow {flow_avg:.6f} | "
-                  f"bc {bc_avg:.6f} | grad_norm {float(grad_norm):.3f} | "
+                  f"bc {bc_avg:.6f} | grip_cls {trigger_avg:.6f} | grad_norm {float(grad_norm):.3f} | "
                   f"lr {scheduler.get_last_lr()[0]:.2e} | "
                   f"{sps:.1f} steps/s | epoch {epoch}")
             running_loss = 0.0
             running_flow_loss = 0.0
             running_bc_loss = 0.0
+            running_trigger_loss = 0.0
 
         if step % save_every == 0:
             ckpt_path = ckpt_dir / f"{task_name}_step_{step:06d}.pt"
@@ -748,6 +770,11 @@ def train(
                     "use_perception": cfg.use_perception,
                     "use_perception_action_cond": cfg.use_perception_action_cond,
                     "perception_dim": cfg.perception_dim,
+                    "use_gripper_trigger_head": cfg.use_gripper_trigger_head,
+                    "gripper_trigger_loss_weight": gripper_trigger_loss_weight if cfg.use_gripper_trigger_head else None,
+                    "gripper_trigger_label_threshold": gripper_trigger_label_threshold if cfg.use_gripper_trigger_head else None,
+                    "gripper_trigger_threshold": cfg.gripper_trigger_threshold if cfg.use_gripper_trigger_head else None,
+                    "gripper_trigger_close_value": cfg.gripper_trigger_close_value if cfg.use_gripper_trigger_head else None,
                 },
             }, ckpt_path)
             print(f"  saved checkpoint: {ckpt_path}")
@@ -822,6 +849,11 @@ def train(
             "use_perception": cfg.use_perception,
             "use_perception_action_cond": cfg.use_perception_action_cond,
             "perception_dim": cfg.perception_dim,
+            "use_gripper_trigger_head": cfg.use_gripper_trigger_head,
+            "gripper_trigger_loss_weight": gripper_trigger_loss_weight if cfg.use_gripper_trigger_head else None,
+            "gripper_trigger_label_threshold": gripper_trigger_label_threshold if cfg.use_gripper_trigger_head else None,
+            "gripper_trigger_threshold": cfg.gripper_trigger_threshold if cfg.use_gripper_trigger_head else None,
+            "gripper_trigger_close_value": cfg.gripper_trigger_close_value if cfg.use_gripper_trigger_head else None,
         },
     }, final_ckpt)
     print(f"Training done in {time.time()-t0:.0f}s. Final checkpoint: {final_ckpt}")
@@ -895,6 +927,16 @@ if __name__ == "__main__":
                         help="Episode phase threshold where late-frame BC weighting starts.")
     parser.add_argument("--gripper-loss-weight", type=float, default=1.0,
                         help="BC loss multiplier for the gripper action dimension.")
+    parser.add_argument("--use-gripper-trigger-head", action="store_true",
+                        help="Add a binary BCE head for sharp close-now gripper decisions.")
+    parser.add_argument("--gripper-trigger-loss-weight", type=float, default=1.0,
+                        help="Loss weight for the binary gripper close trigger head.")
+    parser.add_argument("--gripper-trigger-label-threshold", type=float, default=0.0,
+                        help="Normalized action threshold: action gripper <= threshold means close label.")
+    parser.add_argument("--gripper-trigger-threshold", type=float, default=0.5,
+                        help="Sigmoid probability threshold for forcing close at inference.")
+    parser.add_argument("--gripper-trigger-close-value", type=float, default=-1.0,
+                        help="Normalized gripper command used when trigger predicts close.")
     parser.add_argument("--init-from", default=None,
                         help="Initialize model weights from a checkpoint without loading optimizer/scheduler state. Useful for adding the BC head to an existing flow checkpoint.")
     parser.add_argument("--resume", default=None,
@@ -980,6 +1022,11 @@ if __name__ == "__main__":
         late_bc_weight=args.late_bc_weight,
         late_bc_frac=args.late_bc_frac,
         gripper_loss_weight=args.gripper_loss_weight,
+        use_gripper_trigger_head=args.use_gripper_trigger_head,
+        gripper_trigger_loss_weight=args.gripper_trigger_loss_weight,
+        gripper_trigger_label_threshold=args.gripper_trigger_label_threshold,
+        gripper_trigger_threshold=args.gripper_trigger_threshold,
+        gripper_trigger_close_value=args.gripper_trigger_close_value,
         lazy_videos=args.lazy_videos,
         lazy_cache_size=args.lazy_cache_size,
         episode_batches=not args.no_episode_batches,
