@@ -93,7 +93,8 @@ def sample_action(policy, batch, cfg, action_lo, action_hi, *,
 def run_one(policy, model, data, renderer, text_ids, action_lo, action_hi, cfg,
             device: str, cube_xy: tuple[float, float], *, max_steps: int,
             exec_first_only: bool, ensembling: bool, ensembling_k: float,
-            replan_every: int) -> dict:
+            replan_every: int, contact_close_reflex: bool,
+            contact_close_steps: int, contact_close_value: float) -> dict:
     front_top_cam = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "front_top")
     wrist_cam = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_cam")
 
@@ -109,6 +110,7 @@ def run_one(policy, model, data, renderer, text_ids, action_lo, action_hi, cfg,
     grasp_frames = 0
     first_touch_step: int | None = None
     first_grasp_step: int | None = None
+    close_until = -1
 
     for step in range(max_steps):
         renderer.update_scene(data, camera=front_top_cam)
@@ -125,6 +127,8 @@ def run_one(policy, model, data, renderer, text_ids, action_lo, action_hi, cfg,
             touch_frames += 1
             if first_touch_step is None:
                 first_touch_step = step
+            if contact_close_reflex:
+                close_until = max(close_until, step + contact_close_steps)
         if grasping:
             grasp_frames += 1
             if first_grasp_step is None:
@@ -146,7 +150,10 @@ def run_one(policy, model, data, renderer, text_ids, action_lo, action_hi, cfg,
         if np.any(np.isnan(action)):
             break
         data.ctrl[:N_ARM_JOINTS] = np.clip(action[:N_ARM_JOINTS], -3.5, 3.5)
-        data.ctrl[GRIPPER_QPOS_START] = float(np.clip(action[N_ARM_JOINTS], -1.5, 1.5))
+        gripper_ctrl = float(np.clip(action[N_ARM_JOINTS], -1.5, 1.5))
+        if contact_close_reflex and step <= close_until:
+            gripper_ctrl = min(gripper_ctrl, contact_close_value)
+        data.ctrl[GRIPPER_QPOS_START] = gripper_ctrl
         for _ in range(SUBSTEPS_PER_FRAME):
             mujoco.mj_step(model, data)
 
@@ -186,6 +193,10 @@ def main() -> None:
     ap.add_argument("--ensembling", action="store_true")
     ap.add_argument("--ensembling-k", type=float, default=0.55)
     ap.add_argument("--replan-every", type=int, default=1)
+    ap.add_argument("--contact-close-reflex", action="store_true",
+                    help="Robot-side reflex: close/hold gripper briefly after any-pad cube contact.")
+    ap.add_argument("--contact-close-steps", type=int, default=120)
+    ap.add_argument("--contact-close-value", type=float, default=-1.0)
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -212,6 +223,9 @@ def main() -> None:
             ensembling=args.ensembling,
             ensembling_k=args.ensembling_k,
             replan_every=args.replan_every,
+            contact_close_reflex=args.contact_close_reflex,
+            contact_close_steps=args.contact_close_steps,
+            contact_close_value=args.contact_close_value,
         )
         result["cube_xy"] = cube_xy
         results.append(result)

@@ -208,6 +208,9 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
              replan_every: int = 1,
              exec_first_only: bool = False,
              debug_actions: bool = False,
+             contact_close_reflex: bool = False,
+             contact_close_steps: int = 120,
+             contact_close_value: float = -1.0,
              cube_positions: list[tuple[float, float]] | None = None,
              cube_x_range: tuple[float, float] = (0.15, 0.35),
              cube_y_range: tuple[float, float] = (-0.10, 0.10),
@@ -250,6 +253,7 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
         cursor = 0
         action_queue: list = []  # only used when ensembling=True
         ever_grasped = False
+        close_until = -1
         img_buffer = []  # reset per episode
 
         for step in range(max_steps):
@@ -279,7 +283,10 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
             vid_frame = np.asarray(vid_renderer.render()).copy()
 
             # Proprio builder is shared with recording/training to avoid layout drift.
+            is_touching = is_touching_cube_from_contacts(model, data)
             is_grasping = is_grasping_from_contacts(model, data)
+            if is_touching > 0.5 and contact_close_reflex:
+                close_until = max(close_until, step + contact_close_steps)
             if is_grasping > 0.5:
                 ever_grasped = True
             arm_proprio = build_pick_proprio(model, data, cfg.state_dim)
@@ -321,6 +328,8 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
                 raw_arm_target = np.asarray(a[:N_ARM_JOINTS], dtype=np.float64)
                 arm_target = np.clip(raw_arm_target, -3.5, 3.5).astype(np.float64)
                 gripper_ctrl = float(np.clip(a[N_ARM_JOINTS], -1.5, 1.5))
+                if contact_close_reflex and step <= close_until:
+                    gripper_ctrl = min(gripper_ctrl, contact_close_value)
                 if debug_actions and (step < 20 or step % 50 == 0):
                     clipped = bool(np.any(np.abs(raw_arm_target - arm_target) > 1e-6))
                     print(
@@ -404,6 +413,10 @@ def main():
                          "every step. Equivalent to chunk_size=1 without retraining.")
     ap.add_argument("--debug-actions", action="store_true",
                     help="Print pre-clip arm targets during eval to diagnose joint-limit clipping.")
+    ap.add_argument("--contact-close-reflex", action="store_true",
+                    help="Robot-side reflex: close/hold gripper briefly after any-pad cube contact.")
+    ap.add_argument("--contact-close-steps", type=int, default=120)
+    ap.add_argument("--contact-close-value", type=float, default=-1.0)
     ap.add_argument("--cube-positions", default=None,
                     help="Explicit eval cube positions as 'x,y;x,y'. Repeats if "
                          "--num-episodes is larger than the list.")
@@ -444,6 +457,9 @@ def main():
         replan_every=args.replan_every,
         exec_first_only=args.exec_first_only,
         debug_actions=args.debug_actions,
+        contact_close_reflex=args.contact_close_reflex,
+        contact_close_steps=args.contact_close_steps,
+        contact_close_value=args.contact_close_value,
         cube_positions=cube_positions,
         cube_x_range=tuple(args.cube_x_range),
         cube_y_range=tuple(args.cube_y_range),
