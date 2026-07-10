@@ -222,3 +222,27 @@ class ContextActionHead(nn.Module):
             residual = self.cond_residual(cond).view(b, self.chunk_size, self.action_dim)
             logits = logits + residual
         return torch.tanh(logits)
+
+
+class GripperTriggerHead(nn.Module):
+    """Binary close/open trigger head for the gripper dimension.
+
+    The continuous action heads are good for smooth arm targets but can average
+    sharp close transitions. This head predicts a close logit per chunk step so
+    training can use BCE and deployment can snap the gripper closed when needed.
+    """
+
+    def __init__(self, chunk_size: int = 8, d: int = 256, hidden_dim: int = 512):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.net = nn.Sequential(
+            nn.LayerNorm(d),
+            nn.Linear(d, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, chunk_size),
+        )
+
+    def forward(self, cond: torch.Tensor) -> torch.Tensor:
+        return self.net(cond)

@@ -39,6 +39,8 @@ from bude_vla.ik import IKController
 from bude_vla.perception import detect_red_centroid
 from bude_vla.scripted_pick_and_place import (
     ScriptedPickAndPlace,
+    CLOSE,
+    DESCENT,
     FINGER_WIDTH_OFFSET,
     GRASP_Z_OFFSET,
     GRIPPER_CLOSED,
@@ -207,7 +209,9 @@ def rollout_episode(model, policy, cfg, action_lo, action_hi, device: str,
                     obs_renderer, cube_xy: tuple[float, float], *,
                     max_steps: int, record_state_dim: int,
                     exec_first_only: bool, intervention_mode: bool,
-                    intervention_steps: int, near_trigger_dist: float) -> dict:
+                    intervention_steps: int, near_trigger_dist: float,
+                    intervention_trigger: str, max_interventions: int,
+                    allow_retrigger: bool) -> dict:
     data = mujoco.MjData(model)
     mujoco.mj_resetData(model, data)
     reset_arm(model, data)
@@ -231,6 +235,7 @@ def rollout_episode(model, policy, cfg, action_lo, action_hi, device: str,
     intervention_until = -1
     intervention_started = False
     intervention_frames = 0
+    interventions_started = 0
     cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
     gripper_site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
 
@@ -254,16 +259,34 @@ def rollout_episode(model, policy, cfg, action_lo, action_hi, device: str,
         cube = data.xpos[cube_id].copy()
         ee = data.site_xpos[gripper_site].copy()
         near_cube = (np.linalg.norm(ee[:2] - cube[:2]) <= near_trigger_dist
-                     and abs(float(ee[2] - cube[2])) <= 0.16)
-        if intervention_mode and (touching or near_cube) and step < max_steps - 5:
+                     and abs(float(ee[2] - cube[2])) <= 0.10)
+        if intervention_trigger == "touch":
+            trigger_now = touching
+        elif intervention_trigger == "near":
+            trigger_now = near_cube
+        else:
+            trigger_now = touching or near_cube
+        can_start_intervention = (
+            intervention_mode
+            and trigger_now
+            and step < max_steps - 5
+            and interventions_started < max(1, max_interventions)
+            and (allow_retrigger or interventions_started == 0 or step > intervention_until)
+        )
+        if can_start_intervention:
             intervention_started = True
-            intervention_until = max(intervention_until, step + intervention_steps)
-            if scripted_expert is None:
-                scripted_expert = ScriptedPickAndPlace(
-                    model, data, cube[:2], max_grasp_retries=1,
-                    recovery_jitter_xy=0.0, recovery_jitter_z=0.0,
-                    nudge_recovery_prob=0.0,
-                )
+            interventions_started += 1
+            intervention_until = step + intervention_steps
+            scripted_done = False
+            scripted_expert = ScriptedPickAndPlace(
+                model, data, cube[:2], max_grasp_retries=1,
+                recovery_jitter_xy=0.0, recovery_jitter_z=0.0,
+                nudge_recovery_prob=0.0,
+            )
+            # Short DAgger interventions should teach the local correction, not
+            # replay the whole scripted trajectory from APPROACH.
+            scripted_expert.phase = CLOSE if touching else DESCENT
+            scripted_expert.phase_step = 0
 
         if intervention_mode and step <= intervention_until and scripted_expert is not None and not scripted_done:
             ctrl, _arm_q, scripted_done, _info = scripted_expert.step(model, data)
@@ -322,6 +345,7 @@ def rollout_episode(model, policy, cfg, action_lo, action_hi, device: str,
         "strict_grasp_frames": strict_grasp_frames,
         "intervention_started": intervention_started,
         "intervention_frames": intervention_frames,
+        "interventions_started": interventions_started,
         "cube_final_xyz": cube_final,
         "target_xyz": target_pos,
     }
@@ -343,10 +367,16 @@ def main() -> None:
                     help="Only write episodes where the cube is both grasped and reaches the target zone.")
     ap.add_argument("--intervention-mode", action="store_true",
                     help="After policy near/contact trigger, execute expert actions for a recovery window while recording expert labels.")
-    ap.add_argument("--intervention-steps", type=int, default=900,
+    ap.add_argument("--intervention-steps", type=int, default=60,
                     help="Number of steps to keep expert intervention active after each near/contact trigger.")
-    ap.add_argument("--near-trigger-dist", type=float, default=0.055,
-                    help="XY gripper-to-cube distance that triggers expert intervention, in meters.")
+    ap.add_argument("--intervention-trigger", choices=["touch", "near", "both"], default="touch",
+                    help="Trigger expert intervention on strict robot contact, near-cube proximity, or either.")
+    ap.add_argument("--max-interventions", type=int, default=1,
+                    help="Maximum expert intervention windows per episode.")
+    ap.add_argument("--allow-retrigger", action="store_true",
+                    help="Allow a new intervention after the previous window ends.")
+    ap.add_argument("--near-trigger-dist", type=float, default=0.030,
+                    help="XY gripper-to-cube distance that triggers near intervention, in meters.")
     ap.add_argument("--max-steps", type=int, default=900)
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--img-size", type=int, default=224)
@@ -390,6 +420,9 @@ def main() -> None:
             intervention_mode=args.intervention_mode,
             intervention_steps=args.intervention_steps,
             near_trigger_dist=args.near_trigger_dist,
+            intervention_trigger=args.intervention_trigger,
+            max_interventions=args.max_interventions,
+            allow_retrigger=args.allow_retrigger,
         )
         long_enough = len(ep["actions"]) >= max(2, cfg.chunk_size)
         contact_enough = int(ep["any_contact_frames"]) >= max(0, args.min_contact_frames)
@@ -422,6 +455,7 @@ def main() -> None:
             f"cube=({cube_xy[0]:.3f},{cube_xy[1]:.3f}) "
             f"steps={len(ep['actions'])} contact={ep['any_contact_frames']} "
             f"grasp_frames={ep['strict_grasp_frames']} intervention={ep['intervention_frames']} "
+            f"n_interventions={ep['interventions_started']} "
             f"success={ep['success']} "
             f"grasped={ep['ever_grasped']} reached={ep['reached_target']} {status}",
             flush=True,

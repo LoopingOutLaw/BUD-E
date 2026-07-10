@@ -70,6 +70,9 @@ def load_policy(ckpt_path: str, img_size: int, device: str):
     cfg.use_perception = saved_cfg.get("use_perception", False)
     cfg.use_perception_action_cond = saved_cfg.get("use_perception_action_cond", False)
     cfg.perception_dim = saved_cfg.get("perception_dim", 3)
+    cfg.use_gripper_trigger_head = saved_cfg.get("use_gripper_trigger_head", False)
+    cfg.gripper_trigger_threshold = saved_cfg.get("gripper_trigger_threshold", 0.5) or 0.5
+    cfg.gripper_trigger_close_value = saved_cfg.get("gripper_trigger_close_value", -1.0) or -1.0
 
     action_lo = ckpt.get("action_norm_lo", None)
     action_hi = ckpt.get("action_norm_hi", None)

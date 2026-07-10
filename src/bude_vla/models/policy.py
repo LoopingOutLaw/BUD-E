@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from bude_vla.models.action_head import ContextActionHead, DirectActionHead, FlowMatchingActionHead
+from bude_vla.models.action_head import ContextActionHead, DirectActionHead, FlowMatchingActionHead, GripperTriggerHead
 from bude_vla.models.backbone import PolicyTransformer
 from bude_vla.models.proprio import ProprioProjector
 from bude_vla.models.soft_prompts import SoftPrompts
@@ -55,6 +55,9 @@ class BUDEConfig:
     use_perception: bool = False
     use_perception_action_cond: bool = False
     perception_dim: int = 3
+    use_gripper_trigger_head: bool = False
+    gripper_trigger_threshold: float = 0.5
+    gripper_trigger_close_value: float = -1.0
 
 
 class BUDEPolicy(nn.Module):
@@ -173,6 +176,15 @@ class BUDEPolicy(nn.Module):
             )
             if cfg.use_context_action_head else None
         )
+        self.gripper_trigger_cond_dim = context_cond_dim if context_cond_dim > 0 else cfg.d
+        self.gripper_trigger_head = (
+            GripperTriggerHead(
+                chunk_size=cfg.chunk_size,
+                d=self.gripper_trigger_cond_dim,
+                hidden_dim=cfg.action_head_hidden_dim,
+            )
+            if cfg.use_gripper_trigger_head else None
+        )
 
         self.chunk_size = cfg.chunk_size
         self.action_dim = cfg.action_dim
@@ -201,6 +213,12 @@ class BUDEPolicy(nn.Module):
         state_hidden = tokens[:, self.cfg.n_prompts, :]
         perception_emb = self._perception_embedding(batch, tokens)
         return torch.cat([state_hidden, perception_emb], dim=-1)
+
+
+    def _gripper_trigger_cond(self, batch: dict, tokens: torch.Tensor) -> torch.Tensor:
+        if self.cfg.use_perception_action_cond and self.perception_proj is not None:
+            return self._context_action_cond(batch, tokens)
+        return tokens[:, self.cfg.n_prompts, :]
 
     def encode(self, batch: dict) -> torch.Tensor:
         """Build the input token sequence and run the backbone.
@@ -258,10 +276,16 @@ class BUDEPolicy(nn.Module):
         x_t = (1.0 - tau_b) * noise + tau_b * actions
         v_pred = self.action_head(x_t, tau, state_hidden)
         out = {"velocity": v_pred, "tokens": tokens}
+        trigger_cond = None
         if self.context_action_head is not None:
-            out["bc_actions"] = self.context_action_head(tokens, self._context_action_cond(batch, tokens))
+            trigger_cond = self._context_action_cond(batch, tokens)
+            out["bc_actions"] = self.context_action_head(tokens, trigger_cond)
         elif self.bc_action_head is not None:
+            trigger_cond = state_hidden
             out["bc_actions"] = self.bc_action_head(state_hidden)
+        if self.gripper_trigger_head is not None:
+            out["gripper_close_logits"] = self.gripper_trigger_head(
+                self._gripper_trigger_cond(batch, tokens))
         return out
 
     @torch.no_grad()
@@ -269,7 +293,17 @@ class BUDEPolicy(nn.Module):
         """Inference: predict the action chunk via flow matching."""
         tokens = self.encode(batch)
         if self.context_action_head is not None:
-            return self.context_action_head(tokens, self._context_action_cond(batch, tokens))
+            actions = self.context_action_head(tokens, self._context_action_cond(batch, tokens))
+            if self.gripper_trigger_head is not None:
+                logits = self.gripper_trigger_head(self._gripper_trigger_cond(batch, tokens))
+                close = torch.sigmoid(logits) >= self.cfg.gripper_trigger_threshold
+                actions = actions.clone()
+                actions[..., -1] = torch.where(
+                    close,
+                    torch.full_like(actions[..., -1], self.cfg.gripper_trigger_close_value),
+                    actions[..., -1],
+                )
+            return actions
         n_p = self.cfg.n_prompts
         state_hidden = tokens[:, n_p, :]
         if self.action_cond_proj is not None:
@@ -280,8 +314,18 @@ class BUDEPolicy(nn.Module):
             visual_max = patches.max(dim=1).values
             state_hidden = self.action_cond_proj(torch.cat([state_hidden, visual_mean, visual_max], dim=-1))
         if self.bc_action_head is not None:
-            return self.bc_action_head(state_hidden)
-        actions = self.action_head.sample(state_hidden)
+            actions = self.bc_action_head(state_hidden)
+        else:
+            actions = self.action_head.sample(state_hidden)
+        if self.gripper_trigger_head is not None:
+            logits = self.gripper_trigger_head(self._gripper_trigger_cond(batch, tokens))
+            close = torch.sigmoid(logits) >= self.cfg.gripper_trigger_threshold
+            actions = actions.clone()
+            actions[..., -1] = torch.where(
+                close,
+                torch.full_like(actions[..., -1], self.cfg.gripper_trigger_close_value),
+                actions[..., -1],
+            )
         return actions
 
     @torch.no_grad()
@@ -319,5 +363,7 @@ class BUDEPolicy(nn.Module):
             out["context_action_head"] = parts(self.context_action_head)
         if self.perception_proj is not None:
             out["perception_proj"] = parts(self.perception_proj)
+        if self.gripper_trigger_head is not None:
+            out["gripper_trigger_head"] = parts(self.gripper_trigger_head)
         out["total"] = sum(out.values())
         return out
