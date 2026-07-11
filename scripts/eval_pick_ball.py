@@ -41,6 +41,9 @@ from bude_vla.envs.so101_mjx import (
     GRIPPER_QPOS_START, GRIPPER_QPOS_END,
     CUBE_QPOS_START, CUBE_QPOS_END,
     N_ARM_JOINTS,
+    PICK_WORKSPACE_X_RANGE,
+    PICK_WORKSPACE_Y_RANGE,
+    POLICY_CONTROL_SUBSTEPS,
     load_arm_model, CUBE_REST_Z,
     is_grasping_from_contacts,
     is_touching_cube_from_contacts,
@@ -52,7 +55,7 @@ from bude_vla.perception import detect_red_centroid
 SUCCESS_THRESHOLD = 0.05
 INSTRUCTION = "pick up the red cube and place it in the blue target zone"
 MAX_STEPS = 4000
-SUBSTEPS_PER_FRAME = 4  # must match training (record_pick_episodes.py)
+SUBSTEPS_PER_FRAME = POLICY_CONTROL_SUBSTEPS
 
 
 def load_policy(ckpt_path: str, img_size: int, device: str):
@@ -218,8 +221,8 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
              contact_close_steps: int = 120,
              contact_close_value: float = -1.0,
              cube_positions: list[tuple[float, float]] | None = None,
-             cube_x_range: tuple[float, float] = (0.15, 0.35),
-             cube_y_range: tuple[float, float] = (-0.10, 0.10),
+             cube_x_range: tuple[float, float] = PICK_WORKSPACE_X_RANGE,
+             cube_y_range: tuple[float, float] = PICK_WORKSPACE_Y_RANGE,
              max_steps: int = MAX_STEPS):
     rng = np.random.default_rng(seed)
     all_frames = []
@@ -421,10 +424,10 @@ def main():
     ap.add_argument("--cube-positions", default=None,
                     help="Explicit eval cube positions as 'x,y;x,y'. Repeats if "
                          "--num-episodes is larger than the list.")
-    ap.add_argument("--cube-x-range", nargs=2, type=float, default=(0.15, 0.35),
+    ap.add_argument("--cube-x-range", nargs=2, type=float, default=PICK_WORKSPACE_X_RANGE,
                     metavar=("MIN", "MAX"),
                     help="Random eval cube x range used when --cube-positions is unset.")
-    ap.add_argument("--cube-y-range", nargs=2, type=float, default=(-0.10, 0.10),
+    ap.add_argument("--cube-y-range", nargs=2, type=float, default=PICK_WORKSPACE_Y_RANGE,
                     metavar=("MIN", "MAX"),
                     help="Random eval cube y range used when --cube-positions is unset.")
     args = ap.parse_args()

@@ -19,6 +19,26 @@ def ee_delta_scale_from_cfg(cfg) -> float:
     return float(getattr(cfg, "ee_delta_scale", 0.05) or 0.05)
 
 
+def clip_arm_joint_targets(
+    model: mujoco.MjModel, targets: np.ndarray
+) -> np.ndarray:
+    """Clip arm targets to the limits declared by the loaded robot model."""
+    clipped = np.asarray(targets, dtype=np.float64)[:N_ARM_JOINTS].copy()
+    for joint_idx in range(N_ARM_JOINTS):
+        lo, hi = model.jnt_range[joint_idx]
+        if hi > lo:
+            clipped[joint_idx] = np.clip(clipped[joint_idx], lo, hi)
+    return clipped
+
+
+def clip_gripper_control(model: mujoco.MjModel, value: float) -> float:
+    """Clip a persisted gripper target to its MJCF actuator control range."""
+    lo, hi = model.actuator_ctrlrange[GRIPPER_QPOS_START]
+    if hi <= lo:
+        return float(value)
+    return float(np.clip(value, lo, hi))
+
+
 def end_effector_position_for_qpos(model: mujoco.MjModel, data: mujoco.MjData,
                                    arm_qpos: np.ndarray, gripper_qpos: float = 0.3,
                                    site_name: str = "gripperframe") -> np.ndarray:
@@ -59,9 +79,11 @@ def apply_policy_action(model: mujoco.MjModel, data: mujoco.MjData, action: np.n
                         contact_close_value: float = -1.0) -> tuple[np.ndarray, float]:
     """Apply a policy action to MuJoCo controls and return arm_target, gripper_ctrl."""
     action = np.asarray(action, dtype=np.float64)
-    gripper_ctrl = float(np.clip(action[-1], -1.5, 1.5))
+    gripper_ctrl = clip_gripper_control(model, float(action[-1]))
     if contact_close_reflex and close_active:
-        gripper_ctrl = min(gripper_ctrl, contact_close_value)
+        gripper_ctrl = clip_gripper_control(
+            model, min(gripper_ctrl, contact_close_value)
+        )
 
     if action_space_from_cfg(cfg) == "ee_delta":
         if ik is None:
@@ -74,11 +96,11 @@ def apply_policy_action(model: mujoco.MjModel, data: mujoco.MjData, action: np.n
             gain=1.0,
             locked_joints=[3, 4],
         )
-        arm_target = np.clip(ctrl[:N_ARM_JOINTS], -3.5, 3.5).astype(np.float64)
+        arm_target = clip_arm_joint_targets(model, ctrl)
         arm_target[3] = WRIST_FLEX_LOCK
         arm_target[4] = WRIST_ROLL_LOCK
     else:
-        arm_target = np.clip(action[:N_ARM_JOINTS], -3.5, 3.5).astype(np.float64)
+        arm_target = clip_arm_joint_targets(model, action)
 
     data.ctrl[:N_ARM_JOINTS] = arm_target
     data.ctrl[GRIPPER_QPOS_START] = gripper_ctrl

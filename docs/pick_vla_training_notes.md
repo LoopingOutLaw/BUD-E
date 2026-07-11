@@ -1,570 +1,273 @@
-# Pick VLA Training Notes
+# SO-101 Pick VLA: V37 Root-Cause Reset
 
-This note records the current working direction for the SO-101 pick-and-place VLA experiments. It is intentionally practical: what failed, what changed, what is working now, and which commands reproduce the current training path.
+Date: 2026-07-11
 
-## Core Constraint
+This is the authoritative experiment note for the current pipeline. Commands
+for v26-v36 are intentionally not retained here because their camera, feature,
+and action-rate contracts are incompatible with v37.
 
-The policy must not receive cube position as an oracle input. The scripted demonstrator may use simulator state to produce demonstrations, but the learned policy observes only:
+## Non-Negotiable Observation Contract
 
-- dual camera images,
-- robot proprioception,
-- language instruction,
-- contact/proprio signals available to the robot-side policy interface.
+The autonomous policy may use:
 
-This keeps the setup aligned with eventual real-time robot deployment, where the arm will not be handed privileged cube coordinates.
+- top RGB and wrist RGB;
+- robot joint and gripper encoder values;
+- a natural-language instruction;
+- features computed from camera pixels.
 
-## Failure History
+It may not use simulator cube coordinates, a cube-to-gripper vector, episode
+progress, or a simulator-only phase label. Simulator object state is allowed
+for generating expert labels and measuring outcomes, but it is not part of the
+learned policy batch. V37 records `state_dim=6` to enforce this boundary.
 
-Early runs trained for many steps while producing 0 percent closed-loop success. The recurring rollout symptoms were:
+## Why More Old Training Was Not The Answer
 
-- moving to a fixed pose regardless of cube position,
-- touching or hovering near the cube without grasping,
-- closing too early and pushing the cube away,
-- freezing after a near miss.
+The pre-reset random benchmarks were:
 
-Root causes found during debugging:
+| Checkpoint | Any contact | Strict grasp | Success |
+| --- | ---: | ---: | ---: |
+| v26 | 6/100 | 1/100 | 0/100 |
+| v30 | 9/100 | 0/100 | 0/100 |
+| v31 | 27/100 | 0/100 | 0/100 |
+| v32 | 17/150 | 0/150 | 0/150 |
+| v33 | 45/150 | 0/150 | 0/150 |
+| v34 | 19/60 | 0/60 | 0/60 |
+| v35 | 1/150 | 0/150 | 0/150 |
 
-- success-only demonstrations did not teach recovery from small final-centimeter errors,
-- gripper supervision was too weak relative to arm-joint dimensions,
-- progress/time proprio acted as a shortcut and leaked demo timing into inference,
-- v28-style recovery data by itself could fit supervised loss while regressing live reaching,
-- final contact/close timing needed more focused samples than generic phase-balanced caches provided.
+The v33 intervention dataset itself contained 1,480 episodes and more than 50%
+strict-grasp frames, yet the autonomous policy still produced 0/150 strict
+grasps. That contradiction showed that demonstration count and terminal-frame
+weighting were not the primary fault. The observation/action contract had to be
+audited before collecting more data.
 
-## Current Code Path
+## Confirmed Root Causes
 
-Important changes now in the repo:
+### 1. The top camera did not cover the claimed workspace
 
-- DINOv2 vision at 224 px with dual-camera history stacking.
-- Visual/perception-conditioned action decoding.
-- No progress/time shortcut in policy input.
-- Recovery-jitter demonstrations for XY and Z descent errors.
-- Retry demonstrations for missed grasps.
-- Nudge/backoff demonstrations for light cube contact followed by recovery.
-- Mixed cached training support for multiple data roots.
-- Gripper-weighted BC and flow losses.
-- `scripts/build_frame_cache.py --phase-ranges` for contact-focused cache sampling.
-- 10D contact-aware proprio: base6 + target_rel2 + any_pad_contact + strict is_grasping.
-- DAgger collection in `scripts/collect_dagger_pick.py`: policy rollouts labeled by an IK correction expert.
-- Eval debug mode printing raw arm targets, clipping state, and gripper command.
+The old `front_top` camera was pitched toward positive Y. At `y=-0.10`, cube
+placements across different X values produced the same apparent red centroid.
+The learned policy could not infer a unique target from those images.
 
-## Experiment Milestones
+Fix:
 
-### v26 unified
+- true overhead camera at `[0.25, 0.03, 0.80]`;
+- camera axes aligned with the table;
+- 45 degree vertical field of view;
+- validated operational workspace `x=[0.22, 0.34]`, `y=[-0.03, 0.06]`.
 
-`pick_v26_unified` was the first useful base. It removed fixed-pose collapse and made the arm visually reach toward the cube almost every rollout.
+### 2. Red debug geometry was a false cube detector
 
-Useful checkpoint:
+The static fingertip site and pad were rendered bright red/pink. The old
+all-red-pixel average could move toward the arm as the gripper entered view.
+
+Fix:
+
+- fingertip sites made transparent and neutral;
+- contact pads made gray;
+- red segmentation changed to connected components;
+- runtime tracking associates one component through time and rejects large
+  jumps or out-of-workspace detections.
+
+### 3. Demonstration and rollout action rates disagreed
+
+The teacher changed control targets every four 2 ms physics steps, which is
+125 Hz. Videos were marked near 30 FPS, and rollout treated each stored action
+as a new 125 Hz action. This created long runs of almost identical labels and
+made the learned freeze behavior likely.
+
+The same successful trajectories were replayed after decimation:
+
+| Record stride | Effective rate | Replay success |
+| ---: | ---: | ---: |
+| 2 | 62.5 Hz | 29/30 |
+| 4 | 31.25 Hz | 29/30 |
+| 6 | 20.8 Hz | 27/30 |
+
+V37 uses stride 4. The expert still solves IK at 125 Hz and every fourth target
+forms a candidate action plan. That plan is then executed from reset at the
+exact 31.25 Hz deployment rate; images and proprio are recorded from this
+second pass, not from the decimated high-rate states. Any plan that fails the
+policy-rate replay is discarded. A learned action is likewise held for 16
+physics substeps, so stored transitions and rollout now have one contract.
+
+This is consistent with the official OpenVLA warning that unnecessarily
+high-frequency, nearly idle action data can make policies stall, while action
+chunking permits a higher practical command rate than single-action OpenVLA.
+
+### 4. DINOv2 consumed the wrong history frame
+
+With four-frame dual-camera history, the pretrained RGB patch kernel was copied
+to channels 0:3, the oldest top frame. The current top image was near the end of
+the channel stack. The input also skipped the normalization expected by the
+pretrained backbone.
+
+Fix:
+
+- initialize the pretrained patch kernel on the current top RGB group;
+- initialize history/wrist channel weights to zero for learned adaptation;
+- apply ImageNet mean/std normalization independently to every RGB group;
+- reduce active history to two frames to limit RAM and temporal ambiguity.
+
+### 5. The expert encoded invalid recovery transitions
+
+Three state-machine defects polluted recovery data:
+
+- lift/move used the original cube spawn after a retry had displaced it;
+- a one-frame two-pad contact could permanently count as a successful grasp;
+- lift interpolation reached only 75% before switching phase and jumping.
+
+Fix:
+
+- capture the live grasp anchor before lift;
+- require recent sustained contact through tightening;
+- terminate failed close attempts instead of performing an empty place;
+- complete lift interpolation over the configured lift duration;
+- allow camera tracker reacquisition only after backing away for a retry.
+
+### 6. Evaluation retained frames it never used
+
+Closed-loop training eval appended every 224px history stack to the result even
+when no video was requested. Combined with 14 GiB caches, this caused RAM spikes
+and contributed to desktop instability.
+
+Fix:
+
+- non-video eval stores no frames;
+- v37 cache is 6,000 frames with two-history input, about 3.4 GiB;
+- batch size 4, accumulation 8, one worker;
+- free-disk and available-RAM checks before expensive stages;
+- local `TMPDIR` so a full system `/tmp` does not break PyTorch imports.
+
+## Independent System Validation
+
+The new visual-servo benchmark calibrates a fixed top camera using known table
+points, then controls the expert from RGB-derived cube XY. Runtime control does
+not read MuJoCo cube pose; true pose is read only for error/success reporting.
+
+Safe-workspace result, seed 777:
 
 ```text
-checkpoints/pick_v26_unified/pick_v26_unified_final.pt
-checkpoints/pick_v26_unified/pick_v26_unified_step_060000.pt
+episodes: 50
+success episodes: 50/50 (1.000)
+any_contact episodes: 50/50 (1.000)
+strict_grasp episodes: 50/50 (1.000)
+median initial localization error: 0.32 mm
+p95 initial localization error: 0.52 mm
+median pre-grasp tracking error: 0.32 mm
+p95 pre-grasp tracking error: 2.58 mm
 ```
 
-### v27 precision
+This establishes a 100% observed task ceiling for the chosen 50-position sample
+without privileged runtime cube state. It does not establish learned-policy
+success; that is measured separately after training.
 
-`pick_v27_precision` added cleaner precision and depth-recovery data. It improved local fitting but still froze around contact in some videos.
+A fresh 19-episode 224px/state6/stride4 dataset was then read back from disk and
+its persisted controls replayed at 16 substeps per action. Result: 19/19 strict
+grasps and 19/19 successful places.
 
-### v28 depth/nudge recovery
+## V37 Dataset Recipe
 
-`pick_v28_depth_nudge_recovery` fit its own dataset, but v28-only rollout regressed: it could move less reliably toward the cube. The lesson was that recovery-only fine-tuning can overpower the base reaching skill.
+The full recorder runs 4,000 randomized attempts in the validated workspace.
+Only successful episodes are written.
 
-### v29 mixed reach/precision/recovery
+Approximate mixture:
 
-`pick_v29_mixed_reach_precision_recovery` mixed v26, v27, and v28 data while initializing from v26. This restored visual reaching and added retry-like behavior. Observed behavior:
+| Behavior | Probability/configuration |
+| --- | --- |
+| clean strategy | about 70% after independent perturbation probabilities |
+| recoverable XY/Z waypoint error | 20%, max 3 mm XY and 2 mm Z |
+| light nudge then recovery | 5%, max 3 mm XY and 2 mm Z |
+| first-close miss then retry | 8%, max 4 mm XY, one retry |
 
-- reliably moves toward the cube,
-- descends near the cube,
-- sometimes re-attempts after a failed grasp or pushed cube,
-- still fails at terminal close/depth timing.
+These values are intentionally smaller than the old 8-18 mm perturbations.
+The previous curriculum often changed the task distribution more than it taught
+local recovery. V37 preserves a dominant, consistent expert mode and adds only
+recoverable local variation.
 
-The debug eval showed late close timing in one representative case:
+Required gates:
+
+1. Camera-only expert success at least 95% over 100 episodes.
+2. At least 3,200 successful written demonstrations.
+3. Persisted-action replay success at least 95% over 200 random episodes.
+4. Cache files exist and are non-empty before training.
+
+## V37 Training Recipe
+
+V37 starts from DINOv2 visual weights but from no prior BUD-E checkpoint.
 
 ```text
-step 0050 grip=+1.058  open above/near cube
-step 0100 grip=+0.872  still open
-step 0150 grip=+0.064  barely closing
-step 0200 grip=-0.306  finally closing after the cube was disturbed
+image/history:       224px, top+wrist, 2 times
+state:               6D joints/gripper
+action:              6D absolute targets, chunk 16
+sampled cache:       6000 frames, phase-balanced
+batch:               4 x accumulation 8 = effective 32
+training horizon:    25000 microsteps (~3125 optimizer updates)
+new-module LR:       1e-4 cosine schedule
+backbone LR:         1e-6
+BC / flow weight:    8.0 / 0.10
+gripper dimension:   5x
+early / late BC:     4x through 0.25 / from 0.35
+EMA:                 0.999
 ```
 
-### v30 contact timing
+Every 5,000 steps, 12 closed-loop episodes run with deployment-style temporal
+ensembling. The checkpoint with highest success is copied to
+`pick_v37_camera_fixed_best.pt`; evaluation does not blindly assume the final
+loss checkpoint is best.
 
-`pick_v30_contact_timing` is the current focused fine-tune. It starts from v29 and trains on compact contact-focused caches. The goal is not generic extra training; it is to emphasize descend/contact/close/recovery frames.
+## Post-Training Decision Protocol
 
-### v31 contact-filtered DAgger
+Do not decide from training loss or one video. Use the 150-position random
+benchmark and separate the failure stages:
 
-`pick_v31_dagger_balanced` is the latest completed run. It differs from v28-v30 because the failure states are not hand-guessed. The v30 policy is rolled out in simulation, the current observation is recorded, and an IK expert labels the corrective action from that actual policy-visited state. The first unfiltered DAgger attempt was too sparse around contact, so the useful v31 dataset filters for episodes where the policy actually touches the cube.
+| Result | Interpretation | Next action |
+| --- | --- | --- |
+| contact below 50% | visual reach still fails | run image/action sensitivity and inspect top/wrist predictions; do not add grasp data |
+| contact high, grasp 0% | close/alignment transition fails | add a discrete gripper trigger trained on this corrected v37 data, then run a small ablation |
+| grasp high, place low | lift/transport policy fails | rebalance cache toward lift/move without changing perception |
+| success rises with checkpoints | optimization is working | continue from the best checkpoint, not necessarily final |
+| offline fit good, all closed-loop checkpoints 0% | architecture/control mismatch remains | train an official LeRobot ACT baseline on the same replay-validated data |
 
-The contact-filtered dataset is:
+DAgger is not the next automatic step. It becomes useful only after the fresh
+base policy reaches reliably. Old DAgger rounds queried corrections from a
+policy whose camera and time contracts were already wrong, so those datasets
+must not be mixed into v37.
 
-```text
-data/pick_v31_dagger_contact
-episodes: 250
-frames: 224348
-state_dim: 10
-any_contact frames: 4472
-any_contact frac: 0.01993331788114893
-is_grasping frames: 480
-is_grasping frac: 0.0021395332251680425
-```
+ACT is the preferred baseline escalation on this RTX 4060 because LeRobot
+documents it as a lightweight, low-compute action-chunking policy for precise
+manipulation. SmolVLA remains a later language-generalization path, but its
+official base model is much larger and its documentation stresses repeated
+coverage per task variation. Neither baseline removes the replay and camera
+acceptance gates.
 
-The v31 result improved broad contact but did not solve grasping. On a 100-episode random-position benchmark, v30 had 9/100 any-contact episodes and v31 had 27/100. Strict grasp and final success stayed at 0/100. On the fixed 8-position video eval, v31 also timed out in all episodes. Several episodes nudged or displaced the cube, but none produced a stable grasp/place.
+## Commands
 
-## v29 Mixed Training
-
-Use this when rebuilding the current base from v26/v27/v28:
+Full no-time-limit pipeline:
 
 ```bash
 cd /home/aditya/bude_vla
-mkdir -p logs
-
-FRAME_CACHE="data/pick_v26_unified/cache_224_h4_phase12k:data/pick_v27_precision/cache_224_h4_phase12k:data/pick_v28_depth_nudge_recovery/cache_224_h4_phase12k"
-
-MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/train.py \
-  --data-root data/pick_v26_unified \
-  --data-root data/pick_v27_precision \
-  --data-root data/pick_v28_depth_nudge_recovery \
-  --frame-cache "$FRAME_CACHE" \
-  --task pick_v29_mixed_reach_precision_recovery \
-  --init-from checkpoints/pick_v26_unified/pick_v26_unified_final.pt \
-  --use-dinov2 \
-  --img-size 224 \
-  --chunk-size 16 \
-  --n-history-frames 4 \
-  --batch-size 8 \
-  --grad-accum-steps 4 \
-  --num-workers 2 \
-  --n-steps 60000 \
-  --save-every 10000 \
-  --eval-every 0 \
-  --lr 5e-5 \
-  --backbone-lr 2e-6 \
-  --bc-loss-weight 5.0 \
-  --flow-loss-weight 0.15 \
-  --gripper-loss-weight 8.0 \
-  --early-bc-weight 8.0 \
-  --early-bc-frac 0.25 \
-  --late-bc-weight 12.0 \
-  --late-bc-frac 0.42 \
-  --ema-decay 0.999
+bash scripts/run_v37_camera_fixed.sh
 ```
 
-## v30 Contact-Focused Fine-Tune
-
-Build smaller caches biased toward the contact/close region:
+Regression tests:
 
 ```bash
 cd /home/aditya/bude_vla
-PHASE_RANGES="0.06:0.20:0.40,0.20:0.42:0.45,0.42:0.70:0.12,0.70:1.00:0.03"
-
-MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/build_frame_cache.py \
-  --data-root data/pick_v26_unified \
-  --out-dir data/pick_v26_unified/cache_224_h4_contact8k \
-  --max-frames 8000 \
-  --n-history-frames 4 \
-  --phase-ranges "$PHASE_RANGES"
-
-MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/build_frame_cache.py \
-  --data-root data/pick_v27_precision \
-  --out-dir data/pick_v27_precision/cache_224_h4_contact8k \
-  --max-frames 8000 \
-  --n-history-frames 4 \
-  --phase-ranges "$PHASE_RANGES"
-
-MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/build_frame_cache.py \
-  --data-root data/pick_v28_depth_nudge_recovery \
-  --out-dir data/pick_v28_depth_nudge_recovery/cache_224_h4_contact8k \
-  --max-frames 8000 \
-  --n-history-frames 4 \
-  --phase-ranges "$PHASE_RANGES"
+MUJOCO_GL=egl PYTHONPATH=src \
+  /home/aditya/venv-bude/bin/python -m unittest discover -s tests -v
 ```
 
-Train v30 from v29:
-
-```bash
-FRAME_CACHE="data/pick_v26_unified/cache_224_h4_contact8k:data/pick_v27_precision/cache_224_h4_contact8k:data/pick_v28_depth_nudge_recovery/cache_224_h4_contact8k"
-
-MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/train.py \
-  --data-root data/pick_v26_unified \
-  --data-root data/pick_v27_precision \
-  --data-root data/pick_v28_depth_nudge_recovery \
-  --frame-cache "$FRAME_CACHE" \
-  --task pick_v30_contact_timing \
-  --init-from checkpoints/pick_v29_mixed_reach_precision_recovery/pick_v29_mixed_reach_precision_recovery_final.pt \
-  --use-dinov2 \
-  --img-size 224 \
-  --chunk-size 16 \
-  --n-history-frames 4 \
-  --batch-size 8 \
-  --grad-accum-steps 4 \
-  --num-workers 2 \
-  --n-steps 25000 \
-  --save-every 5000 \
-  --eval-every 0 \
-  --lr 2e-5 \
-  --backbone-lr 1e-6 \
-  --bc-loss-weight 7.0 \
-  --flow-loss-weight 0.10 \
-  --gripper-loss-weight 12.0 \
-  --early-bc-weight 3.0 \
-  --early-bc-frac 0.10 \
-  --late-bc-weight 18.0 \
-  --late-bc-frac 0.18 \
-  --ema-decay 0.999
-```
-
-
-## v31 Contact-Filtered DAgger
-
-Collect policy-visited states from v30 and label them with the IK expert. The
-important part is `--min-contact-frames`: without it, most DAgger frames are
-ordinary approach states, which the existing datasets already cover.
+Standalone camera-only gate:
 
 ```bash
 cd /home/aditya/bude_vla
-mkdir -p logs
-
-MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/collect_dagger_pick.py \
-  --ckpt checkpoints/pick_v30_contact_timing/pick_v30_contact_timing_final.pt \
-  --out data/pick_v31_dagger_contact \
-  --num-episodes 250 \
-  --max-attempts 2500 \
-  --max-steps 900 \
-  --state-dim 10 \
-  --min-contact-frames 2 \
-  --exec-first-only \
-  --seed 131 2>&1 | tee logs/pick_v31_dagger_contact.log
+MUJOCO_GL=egl PYTHONPATH=src \
+  /home/aditya/venv-bude/bin/python scripts/benchmark_visual_servo_pick.py \
+  --num-episodes 100 --min-success-rate 0.95 --seed 777
 ```
 
-QC result for the dataset that was actually used:
+## Primary References
 
-```text
-episodes: 250
-frames: 224348
-state_dim: 10
-any_contact frames: 4472
-any_contact frac: 0.01993331788114893
-is_grasping frames: 480
-is_grasping frac: 0.0021395332251680425
-```
-
-Build compact caches. Old 9D roots are retained for reaching stability and
-padded to 10D by the training dataset reader. The DAgger root is native 10D and
-is sampled heavily around contact.
-
-```bash
-cd /home/aditya/bude_vla
-PHASE_RANGES="0.04:0.20:0.35,0.20:0.50:0.45,0.50:1.00:0.20"
-
-for root in pick_v26_unified pick_v27_precision pick_v28_depth_nudge_recovery; do
-  MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/build_frame_cache.py \
-    --data-root data/$root \
-    --out-dir data/$root/cache_224_h4_v31_balanced10k \
-    --max-frames 10000 \
-    --n-history-frames 4 \
-    --phase-ranges "$PHASE_RANGES"
-done
-
-MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/build_frame_cache.py \
-  --data-root data/pick_v31_dagger_contact \
-  --out-dir data/pick_v31_dagger_contact/cache_224_h4_contact24k \
-  --max-frames 24000 \
-  --n-history-frames 4 \
-  --contact-prob 0.75 \
-  --contact-jitter 8
-```
-
-Train the 10D v31 model from the 9D v30 checkpoint. `train.py` adapts the
-proprio input layer by splitting the legacy strict-grasp column across the new
-any-contact and strict-grasp columns.
-
-```bash
-cd /home/aditya/bude_vla
-mkdir -p logs
-
-C1=data/pick_v26_unified/cache_224_h4_v31_balanced10k
-C2=data/pick_v27_precision/cache_224_h4_v31_balanced10k
-C3=data/pick_v28_depth_nudge_recovery/cache_224_h4_v31_balanced10k
-C4=data/pick_v31_dagger_contact/cache_224_h4_contact24k
-FRAME_CACHE="$C1:$C2:$C3:$C4"
-
-MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/train.py \
-  --data-root data/pick_v26_unified \
-  --data-root data/pick_v27_precision \
-  --data-root data/pick_v28_depth_nudge_recovery \
-  --data-root data/pick_v31_dagger_contact \
-  --frame-cache "$FRAME_CACHE" \
-  --task pick_v31_dagger_balanced \
-  --init-from checkpoints/pick_v30_contact_timing/pick_v30_contact_timing_final.pt \
-  --use-dinov2 \
-  --img-size 224 \
-  --chunk-size 16 \
-  --n-history-frames 4 \
-  --batch-size 8 \
-  --grad-accum-steps 4 \
-  --num-workers 2 \
-  --n-steps 60000 \
-  --save-every 10000 \
-  --eval-every 0 \
-  --lr 2e-5 \
-  --backbone-lr 1e-6 \
-  --bc-loss-weight 6.0 \
-  --flow-loss-weight 0.10 \
-  --gripper-loss-weight 12.0 \
-  --early-bc-weight 7.0 \
-  --early-bc-frac 0.24 \
-  --late-bc-weight 10.0 \
-  --late-bc-frac 0.35 \
-  --ema-decay 0.999 2>&1 | tee logs/pick_v31_dagger_balanced.log
-```
-
-### v31 evaluation
-
-Random-position benchmark:
-
-```text
-checkpoint: checkpoints/pick_v31_dagger_balanced/pick_v31_dagger_balanced_final.pt
-episodes: 100
-success episodes: 0/100 (0.000)
-any_contact episodes: 27/100 (0.270)
-strict_grasp episodes: 0/100 (0.000)
-any_contact frames: 65
-strict_grasp frames: 0
-avg any_contact frames/episode: 0.65
-avg strict_grasp frames/episode: 0.00
-median first_touch_step: 130.0
-```
-
-Fixed 8-position eval from 2026-07-09:
-
-```text
-ep 0 cube=(0.25,0.00) failed timeout cube=[0.247,0.038] grasped=False dist=0.142
-ep 1 cube=(0.30,-0.04) failed timeout cube=[0.309,-0.077] grasped=False dist=0.237
-ep 2 cube=(0.30,0.06) failed timeout cube=[0.332,0.005] grasped=False dist=0.156
-ep 3 cube=(0.22,0.05) failed timeout cube=[0.206,0.009] grasped=False dist=0.190
-ep 4 cube=(0.28,-0.08) failed timeout cube=[0.497,-0.040] grasped=False dist=0.267
-ep 5 cube=(0.34,0.03) failed timeout cube=[0.369,0.050] grasped=False dist=0.121
-ep 6 cube=(0.18,-0.04) failed timeout cube=[0.180,-0.032] grasped=False dist=0.238
-ep 7 cube=(0.31,0.08) failed timeout cube=[0.310,0.080] grasped=False dist=0.081
-```
-
-Interpretation: v31 moved the broad-reaching/contact problem in the right
-direction, but it did not teach stable closing and lifting. The next DAgger
-round should start from v31 and collect more contact-to-grasp correction states.
-This is a better next step than more generic training on the same old caches,
-because the remaining failure happens after contact, not during the whole
-approach trajectory.
-
-## v33 Scripted-Intervention DAgger
-
-v32 regressed because it collected only 59 useful contact episodes and trained
-on weak contact-only data. v33 changes the collection contract: the learned
-policy controls the rollout until it reaches a near/contact state, then the
-scripted pick expert executes the full recovery/grasp/place sequence while the
-collector records observations and expert actions. This targets the real
-failure state without adding cube position to policy observations.
-
-The collector change is in `scripts/collect_dagger_pick.py`:
-
-- `--intervention-mode` enables expert takeover after any-pad contact or
-  near-cube trigger.
-- `--intervention-steps` controls how long expert execution remains active.
-- `--min-contact-frames`, `--min-grasp-frames`, and `--require-success` filter
-  out weak episodes before training.
-
-Smoke test before the full run wrote a successful episode:
-
-```text
-written=1/1
-steps=741
-contact=412
-grasp_frames=402
-success=True
-```
-
-Full v33 collection summary from `logs/pick_v33_intervention_collect.log`:
-
-```text
-DAGGER DONE wrote=1480/1500 attempts=2500/2500
-success=1480
-skipped_contact=1020
-out=data/pick_v33_intervention_dagger
-```
-
-Dataset QC from `logs/pick_v33_full_pipeline.log`:
-
-```text
-episodes: 1480
-frames: 1108605
-state_dim: 10
-any_contact frames: 602236
-any_contact frac: 0.5432376725704827
-strict_grasp frames: 570369
-strict_grasp frac: 0.514492537919277
-```
-
-Training summary from `logs/pick_v33_intervention_train.log`:
-
-```text
-Training done in 4507s
-Final checkpoint: checkpoints/pick_v33_intervention_dagger/pick_v33_intervention_dagger_final.pt
-step=80000 EMA final_loss=0.013787
-```
-
-Random benchmark from `logs/pick_v33_random_bench.log`:
-
-```text
-episodes: 150
-success episodes: 0/150 (0.000)
-any_contact episodes: 45/150 (0.300)
-strict_grasp episodes: 0/150 (0.000)
-any_contact frames: 146
-strict_grasp frames: 0
-avg any_contact frames/episode: 0.97
-median first_touch_step: 262.0
-```
-
-Fixed 8-position eval from `logs/pick_v33_video.log`:
-
-```text
-EVAL 0/8 success (0%)
-video: demos/videos/eval_pick_v33_intervention_firstonly.mp4
-```
-
-The contact-close reflex added in `scripts/benchmark_random_pick.py` and
-`scripts/eval_pick_ball.py` is an opt-in runtime diagnostic:
-
-```bash
-python scripts/benchmark_random_pick.py \
-  --ckpt checkpoints/pick_v33_intervention_dagger/pick_v33_intervention_dagger_final.pt \
-  --num-episodes 150 \
-  --max-steps 1200 \
-  --exec-first-only \
-  --contact-close-reflex \
-  --contact-close-steps 180 \
-  --contact-close-value -1.0 \
-  --seed 733
-```
-
-The local `logs/pick_v33_random_bench_reflex.log` is incomplete and stops after
-episode 72, so it is not used as a completed result.
-
-Conclusion: v33 improved autonomous contact rate relative to v31/v30, but the
-absence of strict grasps despite a grasp-rich dataset means the next decision
-should be based on the completed contact-close-reflex benchmark. If reflex still
-has zero strict grasp, the next architecture step should move the low-level
-action interface toward visual-servo end-effector deltas plus IK instead of
-continuing to train absolute joint targets.
-
-## Evaluation
-
-Use fixed cube positions for comparable videos:
-
-```bash
-MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/eval_pick_ball.py \
-  --ckpt checkpoints/pick_v30_contact_timing/pick_v30_contact_timing_final.pt \
-  --num-episodes 8 \
-  --max-steps 1800 \
-  --exec-first-only \
-  --cube-positions '0.25,0.00;0.30,-0.04;0.30,0.06;0.22,0.05;0.28,-0.08;0.34,0.03;0.18,-0.04;0.31,0.08' \
-  --out demos/videos/eval_pick_v30_final_firstonly.mp4
-```
-
-Smoother eval:
-
-```bash
-MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/eval_pick_ball.py \
-  --ckpt checkpoints/pick_v30_contact_timing/pick_v30_contact_timing_final.pt \
-  --num-episodes 8 \
-  --max-steps 1800 \
-  --ensembling \
-  --ensembling-k 0.55 \
-  --replan-every 1 \
-  --cube-positions '0.25,0.00;0.30,-0.04;0.30,0.06;0.22,0.05;0.28,-0.08;0.34,0.03;0.18,-0.04;0.31,0.08' \
-  --out demos/videos/eval_pick_v30_final_ensemble.mp4
-```
-
-One-episode debug eval for close timing:
-
-```bash
-MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python scripts/eval_pick_ball.py \
-  --ckpt checkpoints/pick_v30_contact_timing/pick_v30_contact_timing_final.pt \
-  --num-episodes 1 \
-  --max-steps 1800 \
-  --exec-first-only \
-  --debug-actions \
-  --cube-positions '0.30,0.06' \
-  --out demos/videos/eval_pick_v30_debug_one.mp4 2>&1 | tee logs/eval_pick_v30_debug_one.log
-```
-
-Interpretation:
-
-- `grip` stays positive/open at contact: close timing is late.
-- `grip` goes negative/closed but cube slips: depth/contact alignment is wrong.
-- `clip=True`: the policy is asking for unreachable joint targets. Recent debug runs showed `clip=False`, so the known issue is learned terminal behavior, not joint clipping.
-
-## Operational Notes
-
-- Keep `--eval-every 0` during training on the laptop; integrated eval can spike RAM.
-- Use cached frames for speed; use smaller contact caches when targeting terminal grasp behavior.
-- Keep raw datasets and final checkpoints before deleting caches. Caches are reproducible and can be rebuilt.
-- If a command is accidentally started twice, stop one run and verify which output directory is complete before continuing.
-- If a model reaches the cube but fails to grasp, do not add privileged cube position. Diagnose gripper timing, depth alignment, contact recovery, and DAgger correction data instead.
-
-## v34 Gripper Trigger Pilot and v35 EE-Delta Pivot
-
-v34 tested the hypothesis that the remaining zero-success behavior was mainly a
-sharp gripper-close timing problem. It added a discrete gripper trigger head and
-used corrected short scripted interventions seeded into the local close phase.
-The pilot trained successfully, but the random benchmark remained at zero strict
-grasps:
-
-```text
-checkpoint: checkpoints/pick_v34_gripper_trigger_pilot/pick_v34_gripper_trigger_pilot_final.pt
-episodes: 60
-success episodes: 0/60 (0.000)
-any_contact episodes: 19/60 (0.317)
-strict_grasp episodes: 0/60 (0.000)
-avg any_contact frames/episode: 1.03
-median first_touch_step: 146.0
-```
-
-The same checkpoint with `--contact-close-reflex` also stayed at zero strict
-grasps:
-
-```text
-episodes: 60
-success episodes: 0/60 (0.000)
-any_contact episodes: 19/60 (0.317)
-strict_grasp episodes: 0/60 (0.000)
-avg any_contact frames/episode: 0.78
-median first_touch_step: 146.0
-```
-
-Interpretation: gripper timing alone is not the blocker. The policy contacts the
-cube too briefly and with the wrong geometry, so forcing close after contact does
-not produce a stable two-pad grasp. v35 therefore changes the action
-representation from absolute joint targets to end-effector delta actions:
-
-```text
-old action: [joint0, joint1, joint2, joint3, joint4, gripper]
-new action: [tcp_dx, tcp_dy, tcp_dz, gripper]
-```
-
-The learned policy still does not receive cube coordinates. The converter only
-rewrites expert actions using MuJoCo forward kinematics. At rollout, the policy's
-predicted TCP delta is executed through the existing SO-101 IK controller, with
-wrist joints locked as before. This targets the observed failure mode directly:
-joint-space averaging near the cube creates small offsets; Cartesian deltas give
-the model a simpler local correction target.
-
-The reproducible v35 pipeline is:
-
-```bash
-bash scripts/run_v35_ee_delta.sh
-```
-
-The script converts selected joint-action datasets to symlinked EE-delta
-datasets, builds modest sampled frame caches to fit the laptop storage budget,
-trains `checkpoints/pick_v35_ee_delta/pick_v35_ee_delta_final.pt`, then runs the
-random benchmark and fixed-set video eval.
-
+- [OpenVLA performance troubleshooting](https://github.com/openvla/openvla#vla-performance-troubleshooting)
+- [LeRobot ACT documentation](https://huggingface.co/docs/lerobot/act)
+- [LeRobot SmolVLA documentation](https://huggingface.co/docs/lerobot/smolvla)

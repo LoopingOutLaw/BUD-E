@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bude_vla"
 version = "0.1.0"
-description = "A 22M-parameter soft-prompted flow-matching VLA, re-implemented from scratch"
+description = "A compact dual-camera action-chunking VLA for SO-101 manipulation"
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.11"

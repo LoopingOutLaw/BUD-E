@@ -159,5 +159,91 @@ class TrainingControlsTest(unittest.TestCase):
         self.assertGreater(len(selected[0]), 0)
 
 
+    def test_dinov2_adapter_initializes_current_top_frame(self):
+        from bude_vla.models.vision import current_top_rgb_start
+
+        self.assertEqual(current_top_rgb_start(3), 0)
+        self.assertEqual(current_top_rgb_start(6), 0)
+        self.assertEqual(current_top_rgb_start(12), 6)
+        self.assertEqual(current_top_rgb_start(24), 18)
+        with self.assertRaises(ValueError):
+            current_top_rgb_start(9)
+
+    def test_red_detector_does_not_average_separate_objects(self):
+        import numpy as np
+        from bude_vla.perception import detect_red_candidates, detect_red_centroid
+
+        image = np.zeros((64, 64, 3), dtype=np.uint8)
+        image[8:14, 8:14, 0] = 240
+        image[38:50, 42:54, 0] = 240
+
+        candidates = detect_red_candidates(image)
+        centroid = detect_red_centroid(image)
+
+        self.assertEqual(candidates.shape[0], 2)
+        self.assertAlmostEqual(float(centroid[0]), 2.0 * 47.5 / 63.0 - 1.0, places=2)
+        self.assertAlmostEqual(float(centroid[1]), 2.0 * 43.5 / 63.0 - 1.0, places=2)
+        self.assertEqual(float(centroid[2]), 1.0)
+
+    def test_planar_homography_recovers_projective_mapping(self):
+        import numpy as np
+        from bude_vla.visual_servo import PlanarHomography
+
+        true_h = np.asarray([
+            [0.22, 0.01, 0.27],
+            [-0.02, -0.18, 0.03],
+            [0.04, -0.03, 1.0],
+        ])
+        image = np.asarray([
+            [-0.8, -0.7], [-0.8, 0.7], [0.0, -0.7],
+            [0.0, 0.7], [0.8, -0.7], [0.8, 0.7],
+        ])
+        homogeneous = np.concatenate([image, np.ones((len(image), 1))], axis=1)
+        projected = homogeneous @ true_h.T
+        world = projected[:, :2] / projected[:, 2:3]
+
+        fitted = PlanarHomography.fit(image, world)
+
+        self.assertLess(float(fitted.errors(image, world).max()), 1e-10)
+
+    def test_grasp_contact_requires_recent_contact(self):
+        from bude_vla.scripted_pick_and_place import has_recent_grasp_contact
+
+        self.assertTrue(has_recent_grasp_contact(20, 12, grace_steps=8))
+        self.assertFalse(has_recent_grasp_contact(21, 12, grace_steps=8))
+        self.assertFalse(has_recent_grasp_contact(20, None, grace_steps=8))
+
+    def test_policy_rate_matches_record_decimation(self):
+        from bude_vla.envs.so101_mjx import (
+            EXPERT_CONTROL_SUBSTEPS,
+            POLICY_CONTROL_SUBSTEPS,
+            POLICY_RECORD_STRIDE,
+        )
+
+        self.assertEqual(
+            POLICY_CONTROL_SUBSTEPS,
+            EXPERT_CONTROL_SUBSTEPS * POLICY_RECORD_STRIDE,
+        )
+
+    def test_policy_clipping_uses_loaded_robot_limits(self):
+        import numpy as np
+        from bude_vla.action_space import (
+            clip_arm_joint_targets,
+            clip_gripper_control,
+        )
+        from bude_vla.envs.so101_mjx import load_arm_model
+
+        model = load_arm_model()
+        arm = clip_arm_joint_targets(model, np.full(5, 100.0))
+        for idx, value in enumerate(arm):
+            lo, hi = model.jnt_range[idx]
+            if hi > lo:
+                self.assertLessEqual(float(value), float(hi))
+                self.assertGreaterEqual(float(value), float(lo))
+
+        grip_lo, grip_hi = model.actuator_ctrlrange[5]
+        self.assertEqual(clip_gripper_control(model, 100.0), float(grip_hi))
+        self.assertEqual(clip_gripper_control(model, -100.0), float(grip_lo))
+
 if __name__ == "__main__":
     unittest.main()

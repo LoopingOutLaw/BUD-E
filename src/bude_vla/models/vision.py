@@ -82,18 +82,24 @@ class ViTSmall(nn.Module):
         return x
 
 
+def current_top_rgb_start(in_channels: int) -> int:
+    """Return the channel offset of the current top-camera RGB frame."""
+    if in_channels == 3:
+        return 0
+    if in_channels < 6 or in_channels % 6 != 0:
+        raise ValueError(
+            "DINOv2 input channels must be RGB or history-stacked dual-camera RGB"
+        )
+    return in_channels - 6
+
+
 class DINOv2Tower(nn.Module):
-    """Pretrained DINOv2-small vision tower with 6-channel input adapter.
+    """Pretrained DINOv2-small with history-stacked dual-camera input.
 
-    Copies the 3-channel patch-embed weights into a new 6-channel conv by
-    zero-initializing the extra input channels. This preserves pretrained
-    features for the first 3 channels (overhead cam) while letting the
-    additional 3 channels (wrist cam) be learned from scratch.
-
-    Early transformer blocks are frozen; the last `finetune_blocks` blocks
-    plus the output projection are trainable.
-
-    Output: (B, num_patches, out_dim) — patch tokens only, no CLS token.
+    The pretrained RGB kernel is attached to the current top-camera channels;
+    all history and wrist channels start at zero and are learned during
+    fine-tuning. Every RGB group receives the ImageNet normalization expected
+    by the frozen DINOv2 blocks.
     """
 
     def __init__(
@@ -117,21 +123,33 @@ class DINOv2Tower(nn.Module):
         self._strip_cls_token()
         self._freeze_blocks(finetune_blocks)
 
+        n_rgb_groups = in_channels // 3
+        mean = torch.tensor([0.485, 0.456, 0.406] * n_rgb_groups).view(
+            1, in_channels, 1, 1
+        )
+        std = torch.tensor([0.229, 0.224, 0.225] * n_rgb_groups).view(
+            1, in_channels, 1, 1
+        )
+        self.register_buffer("input_mean", mean, persistent=False)
+        self.register_buffer("input_std", std, persistent=False)
         self.proj = nn.Linear(self.embed_dim, out_dim) if out_dim != self.embed_dim else nn.Identity()
 
     def _adapt_patch_embed(self, in_channels: int) -> None:
         old_proj = self.backbone.patch_embed.proj
         if old_proj.in_channels == in_channels:
             return
+        if old_proj.in_channels != 3:
+            raise ValueError("expected a three-channel pretrained DINOv2 patch embed")
         new_proj = nn.Conv2d(
             in_channels, old_proj.out_channels,
             kernel_size=old_proj.kernel_size,
             stride=old_proj.stride,
             bias=old_proj.bias is not None,
         )
+        current_top = current_top_rgb_start(in_channels)
         with torch.no_grad():
-            new_proj.weight[:, :old_proj.in_channels] = old_proj.weight
-            nn.init.zeros_((new_proj.weight[:, old_proj.in_channels:]))
+            nn.init.zeros_(new_proj.weight)
+            new_proj.weight[:, current_top:current_top + 3] = old_proj.weight
             if old_proj.bias is not None:
                 new_proj.bias.copy_(old_proj.bias)
         self.backbone.patch_embed.proj = new_proj
@@ -148,10 +166,11 @@ class DINOv2Tower(nn.Module):
         if hasattr(self.backbone, "norm"):
             for p in self.backbone.norm.parameters():
                 p.requires_grad = True
-        if hasattr(self.backbone, 'pos_embed') and self.backbone.pos_embed is not None:
+        if hasattr(self.backbone, "pos_embed") and self.backbone.pos_embed is not None:
             self.backbone.pos_embed.requires_grad = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = (x - self.input_mean) / self.input_std
         x = self.backbone.forward_features(x)
         x = x[:, 1:, :]
         x = self.proj(x)

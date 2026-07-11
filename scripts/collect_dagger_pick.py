@@ -17,6 +17,10 @@ import mujoco
 import numpy as np
 import torch
 
+from bude_vla.action_space import (
+    clip_arm_joint_targets,
+    clip_gripper_control,
+)
 from bude_vla.data.action_normalization import denormalize_actions
 from bude_vla.data.lerobot_v3 import finalize_dataset, write_episode
 from bude_vla.data.lerobot_v3 import _tokenize_instruction
@@ -30,6 +34,9 @@ from bude_vla.envs.so101_mjx import (
     CUBE_QPOS_END,
     CUBE_REST_Z,
     N_ARM_JOINTS,
+    PICK_WORKSPACE_X_RANGE,
+    PICK_WORKSPACE_Y_RANGE,
+    POLICY_CONTROL_SUBSTEPS,
     build_pick_proprio,
     is_grasping_from_contacts,
     is_touching_cube_from_contacts,
@@ -51,7 +58,7 @@ from bude_vla.scripted_pick_and_place import (
 )
 from eval_pick_ball import INSTRUCTION, load_policy, parse_cube_positions
 
-SUBSTEPS_PER_FRAME = 4
+SUBSTEPS_PER_FRAME = POLICY_CONTROL_SUBSTEPS
 SUCCESS_THRESHOLD = 0.05
 
 
@@ -314,8 +321,8 @@ def rollout_episode(model, policy, cfg, action_lo, action_hi, device: str,
             intervention_frames += 1
         else:
             exec_action = policy_action
-        arm_target = np.clip(exec_action[:N_ARM_JOINTS], -3.5, 3.5)
-        gripper_ctrl = float(np.clip(exec_action[N_ARM_JOINTS], -1.5, 1.5))
+        arm_target = clip_arm_joint_targets(model, exec_action)
+        gripper_ctrl = clip_gripper_control(model, float(exec_action[N_ARM_JOINTS]))
         data.ctrl[:N_ARM_JOINTS] = arm_target
         data.ctrl[GRIPPER_QPOS_START] = gripper_ctrl
         for _ in range(SUBSTEPS_PER_FRAME):
@@ -411,7 +418,7 @@ def main() -> None:
         if fixed_positions:
             cube_xy = fixed_positions[attempt_i % len(fixed_positions)]
         else:
-            cube_xy = (float(rng.uniform(0.15, 0.35)), float(rng.uniform(-0.10, 0.10)))
+            cube_xy = (float(rng.uniform(*PICK_WORKSPACE_X_RANGE)), float(rng.uniform(*PICK_WORKSPACE_Y_RANGE)))
         ep = rollout_episode(
             model, policy, cfg, action_lo, action_hi, device, obs_renderer, cube_xy,
             max_steps=args.max_steps,

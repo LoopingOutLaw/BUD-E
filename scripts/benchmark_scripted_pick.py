@@ -18,6 +18,9 @@ from bude_vla.envs.so101_mjx import (
     CUBE_QPOS_END,
     CUBE_REST_Z,
     GRIPPER_QPOS_START,
+    EXPERT_CONTROL_SUBSTEPS,
+    PICK_WORKSPACE_X_RANGE,
+    PICK_WORKSPACE_Y_RANGE,
     is_grasping_from_contacts,
     is_touching_cube_from_contacts,
     load_arm_model,
@@ -25,7 +28,7 @@ from bude_vla.envs.so101_mjx import (
 from bude_vla.scripted_pick_and_place import GRIPPER_OPEN, ScriptedPickAndPlace, WRIST_FLEX_LOCK, WRIST_ROLL_LOCK
 from eval_pick_ball import parse_cube_positions
 
-SUBSTEPS_PER_FRAME = 4
+SUBSTEPS_PER_FRAME = EXPERT_CONTROL_SUBSTEPS
 SUCCESS_THRESHOLD = 0.05
 
 
@@ -93,8 +96,10 @@ def main() -> None:
     ap.add_argument("--max-steps", type=int, default=2200)
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--cube-positions", default=None)
-    ap.add_argument("--cube-x-range", default="0.15,0.35")
-    ap.add_argument("--cube-y-range", default="-0.10,0.10")
+    ap.add_argument("--cube-x-range",
+                    default=",".join(str(v) for v in PICK_WORKSPACE_X_RANGE))
+    ap.add_argument("--cube-y-range",
+                    default=",".join(str(v) for v in PICK_WORKSPACE_Y_RANGE))
     args = ap.parse_args()
 
     model = load_arm_model()
