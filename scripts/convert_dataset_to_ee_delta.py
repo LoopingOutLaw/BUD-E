@@ -38,7 +38,7 @@ def _copy_or_link(src: Path, dst: Path, *, copy_videos: bool) -> None:
 
 
 def convert_root(src_root: Path, dst_root: Path, *, overwrite: bool,
-                 max_delta: float, copy_videos: bool) -> None:
+                 max_delta: float, lookahead_steps: int, copy_videos: bool) -> None:
     if dst_root.exists():
         if not overwrite:
             raise FileExistsError(f"{dst_root} exists; pass --overwrite to replace it")
@@ -67,10 +67,16 @@ def convert_root(src_root: Path, dst_root: Path, *, overwrite: bool,
         if states.shape[1] < 6:
             raise ValueError(f"{src_pq} state_dim={states.shape[1]}, expected at least 6")
 
-        ee_actions = np.stack([
-            joint_action_to_ee_delta(model, fk_data, state, action, max_delta=max_delta)
-            for state, action in zip(states, actions)
-        ]).astype(np.float32)
+        ee_rows = []
+        for i, state in enumerate(states):
+            target_i = min(i + max(0, int(lookahead_steps)), len(actions) - 1)
+            ee_action = joint_action_to_ee_delta(
+                model, fk_data, state, actions[target_i], max_delta=max_delta)
+            # Keep gripper timing from the current expert command. Looking ahead
+            # on position is useful; looking ahead on gripper closes too early.
+            ee_action[-1] = actions[i, -1]
+            ee_rows.append(ee_action)
+        ee_actions = np.stack(ee_rows).astype(np.float32)
 
         dst_chunk = dst_root / "data" / f"chunk-{chunk_idx:03d}"
         dst_chunk.mkdir(parents=True, exist_ok=True)
@@ -99,6 +105,7 @@ def convert_root(src_root: Path, dst_root: Path, *, overwrite: bool,
     info["features"] = features
     info["action_space"] = "ee_delta"
     info["ee_delta_max_delta"] = float(max_delta)
+    info["ee_delta_lookahead_steps"] = int(lookahead_steps)
     info.pop("action_normalization", None)
     (dst_root / "meta" / "info.json").write_text(json.dumps(info, indent=2))
     stats = finalize_dataset(dst_root)
@@ -112,12 +119,15 @@ def main() -> None:
     ap.add_argument("--out", required=True, help="Output ee_delta dataset root")
     ap.add_argument("--max-delta", type=float, default=0.08,
                     help="Clip converted TCP deltas to +/- this many meters before normalization")
+    ap.add_argument("--lookahead-steps", type=int, default=12,
+                    help="Use the expert arm target this many frames ahead for dx/dy/dz labels. Gripper remains current-frame.")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--copy-videos", action="store_true",
                     help="Copy MP4s instead of symlinking. Uses much more disk.")
     args = ap.parse_args()
     convert_root(Path(args.src), Path(args.out), overwrite=args.overwrite,
-                 max_delta=args.max_delta, copy_videos=args.copy_videos)
+                 max_delta=args.max_delta, lookahead_steps=args.lookahead_steps,
+                 copy_videos=args.copy_videos)
 
 
 if __name__ == "__main__":

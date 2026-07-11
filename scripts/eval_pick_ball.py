@@ -260,6 +260,7 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
         action_queue: list = []  # only used when ensembling=True
         ever_grasped = False
         close_until = -1
+        ik = make_ik_controller(model, data) if cfg.action_space == "ee_delta" else None
         img_buffer = []  # reset per episode
 
         for step in range(max_steps):
