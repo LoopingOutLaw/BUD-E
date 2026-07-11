@@ -13,6 +13,8 @@ Clean 5-step sequence:
 """
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import numpy as np
 import mujoco
 
@@ -55,6 +57,7 @@ MOVE_STEPS = 300
 RELEASE_STEPS = 100
 BACKOFF_STEPS = 70
 NUDGE_DESCENT_STEPS = 65
+GRASP_CONTACT_GRACE_STEPS = 8
 
 PHASE_NAMES = {
     0: "APPROACH", 1: "DESCENT", 2: "CLOSE", 3: "LIFT",
@@ -82,6 +85,14 @@ def should_retry_close(contact_step: int | None, retries_used: int, max_retries:
     return contact_step is None and retries_used < max(0, max_retries)
 
 
+def has_recent_grasp_contact(
+    phase_step: int,
+    last_contact_step: int | None,
+    grace_steps: int = GRASP_CONTACT_GRACE_STEPS,
+) -> bool:
+    return last_contact_step is not None and phase_step - last_contact_step <= grace_steps
+
+
 class ScriptedPickAndPlace:
     """Physics-only pick-and-place using ggand0/pick-101's proven approach.
 
@@ -99,8 +110,10 @@ class ScriptedPickAndPlace:
                  nudge_recovery_z: float = 0.0,
                  retry_miss_xy: float = 0.0,
                  retry_miss_prob: float = 0.0,
+                 cube_position_provider: Callable[[object], np.ndarray] | None = None,
                  rng: np.random.Generator | None = None):
         self.model = model
+        self._cube_position_provider = cube_position_provider
         self.cube_start_xy = np.asarray(cube_start_xy, dtype=np.float64)
         self.target_xy = np.asarray(target_xy, dtype=np.float64)
         self.phase = APPROACH
@@ -164,16 +177,35 @@ class ScriptedPickAndPlace:
         # Contact tracking
         self._contact_step = None
         self._contact_action = None
+        self._last_grasp_contact_step = None
         self._grasp_action = GRIPPER_CLOSED
         self._grasp_succeeded = False
 
         # Store cube position at start (for approach target)
         self._cube_start_xyz = np.array([cube_start_xy[0], cube_start_xy[1], CUBE_REST_Z])
+        self._grasp_anchor_xyz = self._cube_start_xyz.copy()
 
     # ---- helpers ----
 
     def _cube_xyz(self, data):
+        if self._cube_position_provider is not None:
+            position = np.asarray(self._cube_position_provider(data), dtype=np.float64)
+            if position.shape != (3,) or not np.all(np.isfinite(position)):
+                raise ValueError(
+                    "cube_position_provider must return one finite xyz position"
+                )
+            return position.copy()
         return data.xpos[self.cube_body_id].copy()
+
+    def _capture_grasp_anchor(self, data) -> None:
+        """Remember where the cube was grasped, including retry displacement."""
+        self._grasp_anchor_xyz = self._cube_xyz(data)
+
+    def _reacquire_cube_if_available(self, data) -> None:
+        reacquire = getattr(self._cube_position_provider, "reacquire", None)
+        if callable(reacquire):
+            reacquire(data)
+
 
     def _cube_pad_contacts(self, data) -> set[int]:
         contacts = set()
@@ -212,6 +244,9 @@ class ScriptedPickAndPlace:
         cube = self._cube_xyz(data)
 
         if self.phase == APPROACH:
+            if self._retries_used > 0 and self.phase_step == 35:
+                self._reacquire_cube_if_available(data)
+
             cube_live = self._cube_xyz(data)
             above_pos = cube_live.copy()
             above_pos[2] += GRASP_Z_OFFSET + HEIGHT_OFFSET
@@ -299,45 +334,60 @@ class ScriptedPickAndPlace:
             ctrl[3] = WRIST_FLEX_LOCK
             ctrl[4] = WRIST_ROLL_LOCK
 
-            # Detect contact
-            if self.is_grasping(model, data) and self._contact_step is None:
-                self._contact_step = self.phase_step
-                self._contact_action = gripper
+            # A brief contact flicker is not a grasp. Keep only contact that
+            # persists through the tightening window (with a small physics grace).
+            grasping_now = self.is_grasping(model, data)
+            if grasping_now:
+                self._last_grasp_contact_step = self.phase_step
+                if self._contact_step is None:
+                    self._contact_step = self.phase_step
+                    self._contact_action = gripper
+            elif not has_recent_grasp_contact(
+                self.phase_step, self._last_grasp_contact_step
+            ):
+                self._contact_step = None
+                self._contact_action = None
 
-            # Check if done tightening
+            contact_recent = has_recent_grasp_contact(
+                self.phase_step, self._last_grasp_contact_step
+            )
+
+            # Check if done tightening.
             if self._contact_step is not None:
                 target_action = max(self._contact_action - GRIPPER_TIGHTEN, -1.0)
-                if gripper <= target_action + 0.01:
+                if gripper <= target_action + 0.01 and contact_recent:
                     self._grasp_action = gripper
                     self._grasp_succeeded = True
+                    self._capture_grasp_anchor(data)
                     self.phase = LIFT
                     self.phase_step = 0
 
             if self.phase_step >= CLOSE_STEPS:
-                if self._contact_step is not None:
+                if self._contact_step is not None and contact_recent:
                     self._grasp_action = gripper
                     self._grasp_succeeded = True
+                    self._capture_grasp_anchor(data)
                     self.phase = LIFT
                     self.phase_step = 0
                 elif should_retry_close(self._contact_step, self._retries_used, self.max_grasp_retries):
                     self._retries_used += 1
                     self._contact_step = None
                     self._contact_action = None
+                    self._last_grasp_contact_step = None
                     self.phase = APPROACH
                     self.phase_step = 0
                 else:
-                    self.phase = LIFT
-                    self.phase_step = 0
+                    done = True
 
         elif self.phase == LIFT:
-            grasp_target = self._cube_start_xyz.copy()
+            grasp_target = self._grasp_anchor_xyz.copy()
             grasp_target[2] += GRASP_Z_OFFSET
             grasp_target[1] += FINGER_WIDTH_OFFSET
-            lift_pos = self._cube_start_xyz.copy()
+            lift_pos = self._grasp_anchor_xyz.copy()
             lift_pos[2] += HEIGHT_OFFSET + 0.05
             lift_pos[1] += FINGER_WIDTH_OFFSET
 
-            t = min(self.phase_step / 200, 1.0)
+            t = min(self.phase_step / float(LIFT_STEPS), 1.0)
             target = grasp_target + (lift_pos - grasp_target) * t
 
             ctrl = self.ik.step_toward_target(
@@ -350,7 +400,7 @@ class ScriptedPickAndPlace:
                 self.phase_step = 0
 
         elif self.phase == MOVE:
-            lift_pos = self._cube_start_xyz.copy()
+            lift_pos = self._grasp_anchor_xyz.copy()
             lift_pos[2] += HEIGHT_OFFSET + 0.05
             lift_pos[1] += FINGER_WIDTH_OFFSET
             move_pos = np.array([

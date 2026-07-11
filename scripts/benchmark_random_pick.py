@@ -20,6 +20,8 @@ from bude_vla.data.action_normalization import denormalize_actions
 from bude_vla.data.lerobot_v3 import _tokenize_instruction
 from bude_vla.envs.so101_mjx import (
     GRIPPER_QPOS_START,
+    PICK_WORKSPACE_X_RANGE,
+    PICK_WORKSPACE_Y_RANGE,
     N_ARM_JOINTS,
     build_pick_proprio,
     is_grasping_from_contacts,
@@ -190,8 +192,10 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--img-size", type=int, default=224)
     ap.add_argument("--cube-positions", default=None)
-    ap.add_argument("--cube-x-range", default="0.15,0.35")
-    ap.add_argument("--cube-y-range", default="-0.10,0.10")
+    ap.add_argument("--cube-x-range",
+                    default=",".join(str(v) for v in PICK_WORKSPACE_X_RANGE))
+    ap.add_argument("--cube-y-range",
+                    default=",".join(str(v) for v in PICK_WORKSPACE_Y_RANGE))
     ap.add_argument("--exec-first-only", action="store_true")
     ap.add_argument("--ensembling", action="store_true")
     ap.add_argument("--ensembling-k", type=float, default=0.55)

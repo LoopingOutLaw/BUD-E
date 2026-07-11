@@ -114,9 +114,9 @@
                 <!-- Wrist camera v7: behind gripper, looking down at workspace -->
                 <camera name="wrist_cam" pos="0.0 -0.18 0.10" euler="0.5 0 3.14159" fovy="60"/>
                 <!-- Static fingertip (max mesh-local Z vertices) -->
-                <site group="3" name="static_fingertip" pos="-0.012 0.0 -0.104" rgba="1 0 0 1" size="0.005"/>
+                <site group="3" name="static_fingertip" pos="-0.012 0.0 -0.104" rgba="0.2 0.2 0.2 0" size="0.005"/>
                 <!-- Static finger collision pad (box for stable contact) -->
-                <geom name="static_finger_pad" type="box" size="0.00125 0.00125 0.00125" pos="-0.008875 0.0 -0.100" rgba="1 0.5 0.5 0.8" friction="1 0.05 0.001"/>
+                <geom name="static_finger_pad" type="box" size="0.00125 0.00125 0.00125" pos="-0.008875 0.0 -0.100" rgba="0.2 0.2 0.2 1" friction="1 0.05 0.001"/>
                 <!-- Link moving_jaw_so101_v1 -->
                 <body name="moving_jaw_so101_v1" pos="0.0202 0.0188 -0.0234" quat="0.707107 0.707107 -1.85362e-08 1.85362e-08">
                   <!-- Joint from gripper to moving_jaw_so101_v1 -->
@@ -126,10 +126,10 @@
                   <geom type="mesh" class="visual" pos="-5.55112e-17 -5.55112e-17 0.0189" quat="1 -0 3.00524e-16 -2.00834e-17" mesh="moving_jaw_so101_v1" material="moving_jaw_so101_v1_material"/>
                   <geom type="mesh" class="collision" pos="-5.55112e-17 -5.55112e-17 0.0189" quat="1 -0 3.00524e-16 -2.00834e-17" mesh="moving_jaw_so101_v1" material="moving_jaw_so101_v1_material"/>
                   <!-- Moving fingertip (closest to static fingertip) -->
-                  <site group="3" name="moving_fingertip" pos="-0.011 -0.076 0.019" rgba="0 0 1 1" size="0.005"/>
+                  <site group="3" name="moving_fingertip" pos="-0.011 -0.076 0.019" rgba="0.2 0.2 0.2 0" size="0.005"/>
                   <!-- Moving finger collision pad (box for stable contact) -->
                   <!-- X shifted so +X face protrudes 0.2mm inward -->
-                  <geom name="moving_finger_pad" type="box" size="0.00125 0.00125 0.00125" pos="-0.01136 -0.076 0.019" rgba="0.5 0.5 1 0.8" friction="1 0.05 0.001"/>
+                  <geom name="moving_finger_pad" type="box" size="0.00125 0.00125 0.00125" pos="-0.01136 -0.076 0.019" rgba="0.2 0.2 0.2 1" friction="1 0.05 0.001"/>
                 </body>
               </body>
             </body>

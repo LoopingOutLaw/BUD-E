@@ -19,6 +19,10 @@ import mujoco
 import numpy as np
 import torch
 
+from bude_vla.action_space import (
+    clip_arm_joint_targets,
+    clip_gripper_control,
+)
 from bude_vla.data.action_normalization import (
     DEFAULT_HI,
     DEFAULT_LO,
@@ -32,6 +36,7 @@ from bude_vla.envs.so101_mjx import (
     GRIPPER_QPOS_START, GRIPPER_QPOS_END,
     CUBE_QPOS_START, CUBE_QPOS_END,
     CUBE_REST_Z,
+    POLICY_CONTROL_SUBSTEPS,
     N_ARM_JOINTS,
     is_grasping_from_contacts,
     build_pick_proprio,
@@ -158,7 +163,7 @@ class PolicyRolloutRunner:
                  state_dim: int = 6,
                  ensembling: bool = False,
                  ensembling_k: float = 0.5,
-                 arm_smooth_steps: int = 1,
+                 arm_smooth_steps: int = POLICY_CONTROL_SUBSTEPS,
                  arm_step_frac: float = 1.0):
         self.model = model
         self.img_size = img_size
@@ -177,7 +182,7 @@ class PolicyRolloutRunner:
             model, mujoco.mjtObj.mjOBJ_CAMERA, "portfolio")
         self.text_ids = _pick_token_ids()
         self.ensembling = ensembling
-        self.ensembling_k = ensembling_k  # weight of new chunk vs in-queue action
+        self.ensembling_k = ensembling_k  # weight of the old queued prediction
         self._action_queue: list = []  # pending denormalized actions
         self.arm_smooth_steps = max(1, int(arm_smooth_steps))
         self.arm_step_frac = float(arm_step_frac)
@@ -231,8 +236,8 @@ class PolicyRolloutRunner:
 
         def _smooth_arm_to(target_qpos, try_idx_inner):
             cur = data.qpos[ARM_QPOS_START:ARM_QPOS_END].astype(np.float64).copy()
-            tgt = np.clip(target_qpos, -3.5, 3.5).astype(np.float64)
-            for k in range(ARM_SMOOTH_STEPS):
+            tgt = clip_arm_joint_targets(self.model, target_qpos)
+            for _ in range(ARM_SMOOTH_STEPS):
                 err = tgt - cur
                 cur = cur + err * ARM_STEP_FRAC
                 data.ctrl[ARM_QPOS_START:ARM_QPOS_END] = cur
@@ -240,20 +245,11 @@ class PolicyRolloutRunner:
                 _carry_cube_with(self.model, data)
                 mujoco.mj_step(self.model, data)
                 if record_video_mode and record_camera != "default":
-                    img_obs = self._render(data, camera="default")
-                    self._stacked_view(img_obs)
-                    img_vid = self._render(data, camera=record_camera)
-                    frames.append(img_vid)
-                else:
-                    img_mid = self._render(data, camera=record_camera)
-                    stacked_mid = self._stacked_view(img_mid)
-                    frames.append(stacked_mid)
-                try_labels.append(
-                    f"try {try_idx_inner + 1}/{self.max_tries}")
+                    frames.append(self._render(data, camera=record_camera))
+                    try_labels.append(
+                        f"try {try_idx_inner + 1}/{self.max_tries}")
             data.ctrl[ARM_QPOS_START:ARM_QPOS_END] = tgt
             data.ctrl[GRIPPER_QPOS_START] = gripper_ctrl
-            _carry_cube_with(self.model, data)
-            mujoco.mj_step(self.model, data)
             return tgt
 
         for try_idx in range(self.max_tries):
@@ -273,11 +269,12 @@ class PolicyRolloutRunner:
                 if current_grasp > 0.5:
                     ever_grasped = True
                 arm_proprio = _build_proprio(self.model, data, self.state_dim)
-                if record_video_mode and record_camera != "default":
-                    frames.append(self._render(data, camera=record_camera))
-                else:
-                    frames.append(stacked)
-                try_labels.append(f"try {try_idx + 1}/{self.max_tries}")
+                if record_video_mode:
+                    if record_camera != "default":
+                        frames.append(self._render(data, camera=record_camera))
+                    else:
+                        frames.append(stacked)
+                    try_labels.append(f"try {try_idx + 1}/{self.max_tries}")
 
                 if self.ensembling:
                     # Replan EVERY step (not just when the queue empties) and
@@ -322,20 +319,21 @@ class PolicyRolloutRunner:
                     arm_target = HOME_QPOS[ARM_QPOS_START:ARM_QPOS_END].copy()
                     gripper_ctrl = 0.0
                 else:
-                    arm_target = np.clip(a[:N_ARM_JOINTS], -3.5, 3.5).astype(np.float64)
-                    gripper_ctrl = float(np.clip(a[N_ARM_JOINTS], -1.5, 1.5))
+                    arm_target = clip_arm_joint_targets(self.model, a)
+                    gripper_ctrl = clip_gripper_control(self.model, float(a[N_ARM_JOINTS]))
 
                 _carry_cube_with(self.model, data)
                 _smooth_arm_to(arm_target, try_idx)
 
                 if _is_success(self.model, data) and ever_grasped:
                     success = True
-                    if record_video_mode and record_camera != "default":
-                        frames.append(self._render(data, camera=record_camera))
-                    else:
-                        frames.append(self._stacked_view(self._render(data)))
-                    try_labels.append(
-                        f"try {try_idx + 1}/{self.max_tries} SUCCESS")
+                    if record_video_mode:
+                        if record_camera != "default":
+                            frames.append(self._render(data, camera=record_camera))
+                        else:
+                            frames.append(self._stacked_view(self._render(data)))
+                        try_labels.append(
+                            f"try {try_idx + 1}/{self.max_tries} SUCCESS")
                     break
 
                 if _is_failure(self.model, data, step, self.max_steps_per_try):

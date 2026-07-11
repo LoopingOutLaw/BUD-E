@@ -196,7 +196,7 @@ def _build_composite_spec() -> mujoco.MjSpec:
         for nm, p, xy, f in [
             ("over_shoulder", [-0.05,  0.55, 0.50], [-0.7071, -0.7071, 0,  0.4814, -0.4814,  0.7325], 48),
             ("pov",           [ 0.40, -0.30, 0.65], [ 0.9806,  0.1961, 0, -0.1505,  0.7524,  0.6413], 55),
-            ("front_top",     [ 0.30,  0.00, 0.80], [ 1.0000,  0.0000, 0,  0.0000,  0.9671,  0.2545], 42),
+            ("front_top",     [ 0.25,  0.03, 0.80], [ 1.0000,  0.0000, 0,  0.0000,  1.0000,  0.0000], 45),
             ("portfolio",     [-0.20, -1.00, 0.85], [ 0.9231, -0.3846, 0,  0.2034,  0.4881,  0.8487], 36),
         ]:
             spec.worldbody.add_camera(name=nm, pos=p, xyaxes=xy, fovy=f)
@@ -318,6 +318,15 @@ def build_pick_proprio(model: mujoco.MjModel, data: mujoco.MjData, state_dim: in
 
 
 CUBE_REST_Z = 0.015    # 3cm cube center on floor (floor + half_extent=0.015)
+
+# The scripted teacher runs its IK loop at 125 Hz. We record every fourth
+# teacher step and hold each learned-policy action for 16 physics substeps,
+# yielding a deployable 31.25 Hz observation/action rate.
+EXPERT_CONTROL_SUBSTEPS = 4
+POLICY_RECORD_STRIDE = 4
+POLICY_CONTROL_SUBSTEPS = EXPERT_CONTROL_SUBSTEPS * POLICY_RECORD_STRIDE
+PICK_WORKSPACE_X_RANGE = (0.22, 0.34)
+PICK_WORKSPACE_Y_RANGE = (-0.03, 0.06)
 
 N_ARM_JOINTS = 5
 N_GRIPPER_JOINTS = 1

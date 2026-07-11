@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -20,7 +21,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 import math
 from torch.optim.lr_scheduler import LambdaLR
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 from bude_vla.data.lerobot_v3 import BUDETrainingDataset
 from bude_vla.models.policy import BUDEPolicy, BUDEConfig
@@ -319,7 +320,12 @@ def run_closed_loop_eval(policy, cfg, action_lo, action_hi, device,
     os.environ.setdefault("MUJOCO_GL", "egl")
     import mujoco
     from bude_vla.env_runner import PolicyRolloutRunner
-    from bude_vla.envs.so101_mjx import load_arm_model
+    from bude_vla.envs.so101_mjx import (
+        PICK_WORKSPACE_X_RANGE,
+        PICK_WORKSPACE_Y_RANGE,
+        POLICY_CONTROL_SUBSTEPS,
+        load_arm_model,
+    )
 
     was_training = policy.training
     policy.eval()
@@ -340,6 +346,10 @@ def run_closed_loop_eval(policy, cfg, action_lo, action_hi, device,
             action_hi=action_hi,
             n_history_frames=cfg.n_history_frames,
             state_dim=cfg.state_dim,
+            ensembling=True,
+            ensembling_k=0.25,
+            arm_smooth_steps=POLICY_CONTROL_SUBSTEPS,
+            arm_step_frac=1.0,
         )
 
     runner = eval_state["runner"]
@@ -349,8 +359,8 @@ def run_closed_loop_eval(policy, cfg, action_lo, action_hi, device,
     n_success = 0
     for _ in range(num_episodes):
         cube_xy = np.array([
-            float(rng.uniform(0.15, 0.35)),
-            float(rng.uniform(-0.10, 0.10)),
+            float(rng.uniform(*PICK_WORKSPACE_X_RANGE)),
+            float(rng.uniform(*PICK_WORKSPACE_Y_RANGE)),
         ])
         result = runner.run_one(data, policy, cube_xy)
         n_success += int(result.success)
@@ -367,10 +377,10 @@ def train(
     ckpt_dir: str = "/home/aditya/bude_vla/checkpoints",
     video_dir: str = "/home/aditya/bude_vla/demos/videos",
     n_steps: int = 50000,
-    batch_size: int = 32,
+    batch_size: int = 8,
     grad_accum_steps: int = 1,
-    chunk_size: int = 4,
-    img_size: int = 64,
+    chunk_size: int = 16,
+    img_size: int = 224,
     lr: float = 3e-4,
     backbone_lr: float = 1e-5,
     weight_decay: float = 1e-4,
@@ -563,7 +573,7 @@ def train(
     print(f"  new module params: {sum(p.numel() for p in new_params):,} (lr={lr})")
     print(f"  effective batch size: {batch_size * grad_accum_steps}")
 
-    scaler = GradScaler()
+    scaler = GradScaler("cuda", enabled=(device == "cuda"))
 
     # Scheduler in optimizer-update units (not microbatch units).
     # With grad_accum_steps > 1, scheduler.step() fires once per accumulation
@@ -663,6 +673,9 @@ def train(
         print(f"  resumed from step {step}, lr={scheduler.get_last_lr()[0]:.2e}, "
               f"loss_hist entries={len(loss_history)}")
 
+    best_eval_rate = max(
+        (float(rate) for _eval_step, rate in eval_history), default=-1.0
+    )
 
     while step < n_steps:
         if step % grad_accum_steps == 0:
@@ -678,7 +691,7 @@ def train(
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                  for k, v in batch.items()}
 
-        with autocast():
+        with autocast("cuda", enabled=(device == "cuda")):
             out = policy(batch)
             v_pred = out["velocity"]
             v_target = batch["actions"] - batch["noise"]
@@ -721,16 +734,19 @@ def train(
         if (step + 1) % grad_accum_steps == 0:
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
-            if ema_enabled:
-                with torch.no_grad():
-                    for k, v in policy.state_dict().items():
-                        if torch.is_floating_point(v):
-                            ema_state[k].mul_(ema_decay).add_(v, alpha=1.0 - ema_decay)
-                        else:
-                            ema_state[k].copy_(v)  # non-float buffers (e.g. counters): just copy
+            optimizer_ran = scaler.get_scale() >= scale_before
+            if optimizer_ran:
+                scheduler.step()
+                if ema_enabled:
+                    with torch.no_grad():
+                        for k, v in policy.state_dict().items():
+                            if torch.is_floating_point(v):
+                                ema_state[k].mul_(ema_decay).add_(v, alpha=1.0 - ema_decay)
+                            else:
+                                ema_state[k].copy_(v)  # non-float buffers: copy
 
         running_loss += loss.item()
         running_flow_loss += flow_loss.item()
@@ -821,21 +837,36 @@ def train(
             eval_history.append((step, eval_rate))
             print(f"  [eval{'/ema' if ema_enabled else ''}] step {step:6d} | closed-loop success "
                   f"{eval_n_success}/{eval_n_total} ({eval_rate*100:.0f}%)")
+            if eval_rate > best_eval_rate:
+                best_eval_rate = eval_rate
+                source = ckpt_dir / f"{task_name}_step_{step:06d}.pt"
+                best = ckpt_dir / f"{task_name}_best.pt"
+                if source.exists():
+                    shutil.copy2(source, best)
+                    print(
+                        f"  new best checkpoint: {best} "
+                        f"(closed-loop success {eval_rate * 100:.0f}%)"
+                    )
+                else:
+                    print("  warning: eval improved but matching step checkpoint is missing")
 
     # Flush any remaining accumulated gradients
     if step % grad_accum_steps != 0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+        scale_before = scaler.get_scale()
         scaler.step(optimizer)
         scaler.update()
-        scheduler.step()
-        if ema_enabled:
-            with torch.no_grad():
-                for k, v in policy.state_dict().items():
-                    if torch.is_floating_point(v):
-                        ema_state[k].mul_(ema_decay).add_(v, alpha=1.0 - ema_decay)
-                    else:
-                        ema_state[k].copy_(v)
+        optimizer_ran = scaler.get_scale() >= scale_before
+        if optimizer_ran:
+            scheduler.step()
+            if ema_enabled:
+                with torch.no_grad():
+                    for k, v in policy.state_dict().items():
+                        if torch.is_floating_point(v):
+                            ema_state[k].mul_(ema_decay).add_(v, alpha=1.0 - ema_decay)
+                        else:
+                            ema_state[k].copy_(v)
 
     final_ckpt = ckpt_dir / f"{task_name}_final.pt"
     torch.save({
@@ -891,14 +922,14 @@ def train(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-steps", type=int, default=50000)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--grad-accum-steps", type=int, default=1,
                         help="Gradient accumulation steps. Effective batch = "
                              "batch_size * grad_accum_steps. Use 4 with "
                              "--batch-size 8 to simulate batch 32 on 8GB GPU.")
-    parser.add_argument("--chunk-size", type=int, default=4)
-    parser.add_argument("--img-size", type=int, default=64,
-                        help="Image resolution for ViT input (default 64, use 224 for hi-res)")
+    parser.add_argument("--chunk-size", type=int, default=16)
+    parser.add_argument("--img-size", type=int, default=224,
+                        help="Image resolution for ViT input.")
     parser.add_argument("--lr", type=float, default=3e-4,
                         help="Learning rate for new modules (backbone, action head, etc.)")
     parser.add_argument("--backbone-lr", type=float, default=1e-5,

@@ -1,10 +1,10 @@
 """Per-dim action normalization/denormalization for VLA training.
 
 Recorded actions are heterogeneous:
-- dims 0..5: arm joint angles in radians, un-bounded by the recorder
+- dims 0..4: arm joint targets in radians
   (IK solver internally clips to ±π but training data spans the full reachable
   range, so observed extremes set the scale).
-- dim 6: gripper width, also ranging in [-1, 1].
+- dim 5: gripper actuator target in the MJCF actuator control range.
 
 We compute dataset-wide per-dim min/max at write time (one pass over all
 episodes) and stash them in `meta/info.json` under `action_normalization`.
@@ -13,7 +13,6 @@ with the same `meta` block so recorded/predicted actions live in the same
 mathematical space.
 
 Convention: `a_norm = 2 * (a - lo) / (hi - lo) - 1`, mapping [lo, hi] → [-1, 1].
-For dims that are ALREADY clipped (gripper in [-1, 1]), use the natural range.
 """
 from __future__ import annotations
 

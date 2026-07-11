@@ -175,8 +175,9 @@ def write_episode(root: str | Path, episode: dict) -> Path:
     else:
         raise ValueError(f"images has {images.shape[-1]} channels, expected 3 or 6")
 
+    episode_fps = int(episode.get("fps", META["fps"]))
     for vid_path, vid_frames in [(overhead_path, split_overhead), (wrist_path, split_wrist)]:
-        writer = imageio.get_writer(str(vid_path), fps=META["fps"],
+        writer = imageio.get_writer(str(vid_path), fps=episode_fps,
                                     codec="libx264", quality=8)
         for frame in vid_frames:
             writer.append_data(frame)
@@ -211,6 +212,10 @@ def write_episode(root: str | Path, episode: dict) -> Path:
                                        "dtype": "float32",
                                        "shape": [action_dim],
                                    }}}
+        local_meta["fps"] = episode_fps
+        if "sim_substeps_per_action" in episode:
+            local_meta["sim_substeps_per_action"] = int(
+                episode["sim_substeps_per_action"])
         info_path.write_text(json.dumps(local_meta, indent=2))
 
     ep_meta = {
@@ -218,6 +223,10 @@ def write_episode(root: str | Path, episode: dict) -> Path:
         "tasks": [instruction],
         "length": T,
     }
+    for key in ("cube_start_xy", "record_stride", "sim_substeps_per_action"):
+        if key in episode:
+            value = episode[key]
+            ep_meta[key] = value.tolist() if isinstance(value, np.ndarray) else value
     (episodes_index / f"episode_{episode_idx:06d}.json").write_text(json.dumps(ep_meta, indent=2))
     return pq_path
 
