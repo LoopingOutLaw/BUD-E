@@ -315,6 +315,39 @@ and achieved 25/100 on a fresh random benchmark. Step 45k reached 0.167 rad
 but scored lower at 22/100, so 35k remains selected. A checkpoint that fails
 this gate is not allowed to spend time on the 150-position final benchmark.
 
+## V39 Completed Result
+
+The selected step-35k checkpoint passed the recalibrated 0.14-rad Y-sensitivity
+gate at 0.142 rad. Final results were:
+
+```text
+150-position success:       31/150 (20.7%)
+150-position contact:       79/150 (52.7%)
+150-position strict grasp:  48/150 (32.0%)
+fixed-set video:             3/8 (37.5%)
+```
+
+The successful video trajectories approach from vision, close, lift, rotate
+toward the target on the right, transport, and place. That rightward turn is
+expected task behavior.
+
+Spatial result:
+
+| Region | Contact | Grasp | Success |
+| --- | ---: | ---: | ---: |
+| Y -0.03 to 0.00 | 17% | 9% | 6% |
+| Y 0.00 to 0.03 | 62% | 44% | 32% |
+| Y 0.03 to 0.06 | 75% | 42% | 23% |
+| X 0.22 to 0.25 | 71% | 49% | 34% |
+| X 0.31 to 0.34 | 26% | 17% | 11% |
+
+V39 improved the Y-axis bottleneck but exposed radial under-response. Across
+X=0.22 to 0.34 at fixed Y, the expert shoulder-lift target spans 0.134 rad;
+v39 spans 0.007 rad with the wrong slope and partly substitutes 0.061 rad of
+elbow motion. A future continuation should weight radial shoulder-lift
+precision and preserve the validated shoulder-pan sensitivity. It should not
+resume the unchanged objective for millions of steps.
+
 ## Post-Training Decision Protocol
 
 Do not decide from training loss or one video. Use the 150-position random

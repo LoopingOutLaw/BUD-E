@@ -64,12 +64,21 @@ tail -F \
   logs/pick_v39_random_bench.log
 ```
 
-## V39 Preliminary Result
+## V39 Completed Result
 
-The training evaluator selected step 35k at 9/40. On a fresh 100-position seed,
-that checkpoint achieved 25/100 success, 60/100 contact, and 39/100 strict
-grasp. Step 45k had stronger shoulder sensitivity (0.167 rad) but lower paired
-performance at 22/100 success, so 35k remains the deployment candidate.
+The training evaluator selected step 35k at 9/40. A paired 100-position
+selection diagnostic scored 25/100, ahead of step 45k at 22/100. The final
+independent 150-position benchmark scored 31/150 success (20.7%), 79/150
+contact (52.7%), and 48/150 strict grasp (32.0%). The fixed video scored 3/8
+and showed complete visual approach, grasp, lift, rotation, transport, and
+placement. Rotation toward the right after lift is expected because that is the
+direction of the target zone.
+
+Remaining success by workspace was 6% for negative Y versus 23-32% for positive
+Y, and 11% in the far-X quarter versus 34% in the near-X quarter. Across X, the
+expert shoulder-lift target spans 0.134 rad; v39 spans only 0.007 rad and uses
+elbow motion as an incomplete substitute. Any next iteration should target this
+radial shoulder-lift response rather than extend unchanged training.
 
 ## V38 Result
 
