@@ -319,6 +319,7 @@ def run_closed_loop_eval(policy, cfg, action_lo, action_hi, device,
                           max_steps_per_try: int = 300,
                           max_tries: int = 1,
                           seed: int = 123,
+                          grid_size: int = 0,
                           eval_state: dict | None = None) -> tuple[float, int, int]:
     """Run closed-loop pick rollouts with current policy weights.
 
@@ -363,21 +364,31 @@ def run_closed_loop_eval(policy, cfg, action_lo, action_hi, device,
     runner = eval_state["runner"]
     data = eval_state["data"]
 
-    rng = np.random.default_rng(seed)
+    if grid_size > 1:
+        xs = np.linspace(*PICK_WORKSPACE_X_RANGE, grid_size)
+        ys = np.linspace(*PICK_WORKSPACE_Y_RANGE, grid_size)
+        cube_positions = [np.array([x, y]) for y in ys for x in xs]
+    else:
+        rng = np.random.default_rng(seed)
+        cube_positions = [
+            np.array([
+                float(rng.uniform(*PICK_WORKSPACE_X_RANGE)),
+                float(rng.uniform(*PICK_WORKSPACE_Y_RANGE)),
+            ])
+            for _ in range(num_episodes)
+        ]
+
     n_success = 0
-    for _ in range(num_episodes):
-        cube_xy = np.array([
-            float(rng.uniform(*PICK_WORKSPACE_X_RANGE)),
-            float(rng.uniform(*PICK_WORKSPACE_Y_RANGE)),
-        ])
+    for cube_xy in cube_positions:
         result = runner.run_one(data, policy, cube_xy)
         n_success += int(result.success)
 
     if was_training:
         policy.train()
 
-    rate = n_success / num_episodes if num_episodes > 0 else 0.0
-    return rate, n_success, num_episodes
+    n_total = len(cube_positions)
+    rate = n_success / n_total if n_total > 0 else 0.0
+    return rate, n_success, n_total
 
 
 def train(
@@ -409,6 +420,7 @@ def train(
     eval_max_steps: int = 300,
     eval_max_tries: int = 1,
     eval_seed: int = 123,
+    eval_grid_size: int = 0,
     train_seed: int = 0,
     ema_decay: float = 0.999,
     use_bc_head: bool = True,
@@ -860,6 +872,7 @@ def train(
                 max_steps_per_try=eval_max_steps,
                 max_tries=eval_max_tries,
                 seed=eval_seed,
+                grid_size=eval_grid_size,
                 eval_state=eval_state,
             )
             if ema_enabled:
@@ -1074,8 +1087,9 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0,
                         help="Training model and data-order seed.")
     parser.add_argument("--eval-seed", type=int, default=123,
-                        help="Fixed seed for eval cube positions so success "
-                             "curves are comparable across checkpoints.")
+                        help="Fixed seed for random eval positions.")
+    parser.add_argument("--eval-grid-size", type=int, default=0,
+                        help="If >1, evaluate an NxN deterministic workspace grid instead of random positions.")
     args = parser.parse_args()
 
     roots = args.data_root
@@ -1110,6 +1124,7 @@ if __name__ == "__main__":
         eval_max_steps=args.eval_max_steps,
         eval_max_tries=args.eval_max_tries,
         eval_seed=args.eval_seed,
+        eval_grid_size=args.eval_grid_size,
         train_seed=args.seed,
         ema_decay=args.ema_decay,
         use_bc_head=not args.no_bc_head,

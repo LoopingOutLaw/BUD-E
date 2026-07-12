@@ -362,7 +362,7 @@ shoulder-lift loss weight:  10x
 gripper loss weight:        5x
 BC / flow loss weight:      8.0 / 0.02
 EMA:                        disabled
-eval:                       40 positions every 5000 steps
+eval:                       6x6 deterministic workspace grid every 5000 steps
 Y acceptance gate:          shoulder-pan span >= 0.14 rad
 X acceptance gate:          shoulder-lift span >= 0.06 rad
 ```

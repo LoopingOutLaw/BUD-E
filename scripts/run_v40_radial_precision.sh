@@ -168,6 +168,7 @@ if [[ ! -f "$CKPT_DIR/${TASK}_final.pt" ]]; then
     --eval-max-tries 1 \
     --seed 4002 \
     --eval-seed 4004 \
+    --eval-grid-size 6 \
     --lr 8e-6 \
     --backbone-lr 1e-7 \
     --bc-loss-weight 8.0 \
