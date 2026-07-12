@@ -11,7 +11,13 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 import mujoco
 import numpy as np
 import pyarrow.parquet as pq
+from types import SimpleNamespace
 
+from bude_vla.action_space import (
+    apply_policy_action,
+    make_ik_controller,
+    uses_ik_action_space,
+)
 from bude_vla.envs.so101_mjx import (
     PICK_WORKSPACE_X_RANGE,
     PICK_WORKSPACE_Y_RANGE,
@@ -44,6 +50,7 @@ def replay_one(
     cube_xy: tuple[float, float],
     actions: np.ndarray,
     sim_substeps_per_action: int,
+    action_space: str = "joint_abs",
 ) -> dict:
     mujoco.mj_resetData(model, data)
     reset_arm(model, data)
@@ -52,12 +59,19 @@ def replay_one(
         mujoco.mj_step(model, data)
 
     ever_grasped = False
+    cfg = SimpleNamespace(action_space=action_space, ee_delta_scale=0.05)
+    ik = make_ik_controller(model, data) if uses_ik_action_space(cfg) else None
+    expected_dim = 4 if uses_ik_action_space(cfg) else model.nu
     for action in actions:
-        if action.shape[0] != model.nu:
+        if action.shape[0] != expected_dim:
             raise ValueError(
-                f"joint replay requires {model.nu}D controls, got {action.shape[0]}"
+                f"{action_space} replay requires {expected_dim}D controls, "
+                f"got {action.shape[0]}"
             )
-        data.ctrl[:] = action
+        if uses_ik_action_space(cfg):
+            apply_policy_action(model, data, action, cfg, ik=ik)
+        else:
+            data.ctrl[:] = action
         for _ in range(sim_substeps_per_action):
             mujoco.mj_step(model, data)
             ever_grasped = ever_grasped or (
@@ -82,6 +96,7 @@ def main() -> None:
     root = Path(args.data_root)
     info = json.loads((root / "meta" / "info.json").read_text())
     default_substeps = int(info.get("sim_substeps_per_action", 16))
+    action_space = str(info.get("action_space", "joint_abs"))
     episode_files = sorted((root / "meta" / "episodes_index").glob("*.json"))
     if len(episode_files) > args.num_episodes:
         rng = np.random.default_rng(args.seed)
@@ -114,6 +129,7 @@ def main() -> None:
             cube_xy,
             actions,
             int(meta.get("sim_substeps_per_action", default_substeps)),
+            action_space=action_space,
         )
         n_grasp += int(result["grasped"])
         n_success += int(result["success"])

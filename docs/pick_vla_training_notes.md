@@ -348,31 +348,96 @@ elbow motion. A future continuation should weight radial shoulder-lift
 precision and preserve the validated shoulder-pan sensitivity. It should not
 resume the unchanged objective for millions of steps.
 
-## V40 Radial-Precision Recipe
+## V40 Completed Result and Corrected Diagnosis
 
-V40 initializes from `pick_v39_shoulder_precision_best.pt` and preserves the
-camera-only state6/action6/chunk16 architecture.
+V40 continued from v39 with 10x shoulder-pan and 10x shoulder-lift loss
+weights. Its deterministic 6x6 workspace evaluations were:
 
-```text
-training horizon:           60000 microsteps
-new-module LR:              8e-6
-backbone LR:                1e-7
-shoulder-pan loss weight:   10x
-shoulder-lift loss weight:  10x
-gripper loss weight:        5x
-BC / flow loss weight:      8.0 / 0.02
-EMA:                        disabled
-eval:                       6x6 deterministic workspace grid every 5000 steps
-Y acceptance gate:          shoulder-pan span >= 0.14 rad
-X acceptance gate:          shoulder-lift span >= 0.06 rad
-```
+    step  5000: 4/36
+    step 10000: 1/36
+    step 15000: 4/36
+    step 20000: 4/36
+    step 25000: 5/36
+    step 30000: 6/36
+    step 35000: 5/36
+    step 40000: 1/36
+    step 45000: 8/36  selected
+    step 50000: 4/36
+    step 55000: 6/36
+    step 60000: 2/36
 
-The dual gate prevents radial improvement from erasing v39 lateral sensitivity.
-Both must pass before the final 150-position benchmark and fixed-set video.
+The selected step-45k checkpoint reached 0.182 rad shoulder-pan span but only
+0.008 rad shoulder-lift span. The old lift gate rejected it. Forward kinematics
+then showed why individual-joint matching is the wrong acceptance condition:
+the policy can substitute elbow motion for shoulder motion. What matters is TCP
+position. Across a workspace corner grid, v40 first actions differ from expert
+TCP targets by 15.8 mm median, 22.5 mm p95, and 23.5 mm maximum. Those errors
+are large relative to the 30 mm cube and explain the remaining reach misses.
+
+The conclusion is not to increase shoulder weight again. Joint-space BC asks
+the small policy to learn both visual localization and nonlinear SO-101 inverse
+kinematics. V40 weighting changed joint allocation without reducing task-space
+error or materially improving success.
+
+## V41 Absolute Task-Space Action Pipeline
+
+V41 changes the output representation, not the deployable observation contract.
+The VLA receives top/wrist RGB, language, and six measured joint/gripper
+positions. It predicts four values per action:
+
+    [target TCP x, target TCP y, target TCP z, gripper target]
+
+The shared damped-least-squares IK controller converts each predicted TCP target
+to legal SO-101 joint targets. Simulator cube coordinates are never policy
+inputs. Source joint actions are converted offline to TCP labels with forward
+kinematics; at runtime the TCP targets must still be inferred from camera
+observations.
+
+The representation was validated before any GPU training:
+
+    camera-only expert benchmark:      100/100
+    source joint-action replay:         200/200
+    in-memory ee_abs oracle replay:      98/100
+    production ee_abs replay gate:      199/200 (99.5%)
+    converted episodes:                   3784
+    converted dataset disk use:          96 MiB
+
+The converted root symlinks the existing videos, and training reuses the
+existing 64k, 36 GiB memory-mapped image cache. This avoids another large data
+copy.
+
+V41 recipe:
+
+    initialization:             v40 best raw shared trunk
+    action outputs:             fresh 4D-compatible output tensors
+    training horizon:           120000 microsteps
+    new-module LR:              3e-5
+    DINO backbone LR:           1e-7
+    BC loss weight:             8.0
+    flow loss weight:           0.0
+    gripper loss weight:        5.0
+    early / late sample weight: 6.0 / 4.0
+    history / chunk:            2 / 16
+    effective batch:            32
+    EMA:                        disabled
+    selection:                  6x6 deterministic workspace every 5000 steps
+    execution mode:               paired native-vs-first-action 36-position test
+    final acceptance:           at least 80% on 200 random positions
+
+A first-action task-space diagnostic now reports TCP median, p95, and maximum
+error. It replaces the invalid rule that one chosen joint must match the
+experts IK decomposition. The final random closed-loop benchmark remains the
+actual acceptance test.
+
+The action-space change is consistent with open generalist-policy work that
+supports end-effector control and adaptation to new action spaces. The
+hierarchical split also follows the principle that high-level visual-language
+reasoning and low-level execution can be separated while retaining visual
+context throughout the policy.
 
 ## Post-Training Decision Protocol
 
-Do not decide from training loss or one video. Use the 150-position random
+Do not decide from training loss or one video. Use the 200-position random
 benchmark and separate the failure stages:
 
 | Result | Interpretation | Next action |
@@ -401,7 +466,7 @@ Full no-time-limit pipeline:
 
 ```bash
 cd /home/aditya/bude_vla
-bash scripts/run_v40_radial_precision.sh
+bash scripts/run_v41_ee_abs.sh
 ```
 
 Regression tests:
@@ -426,3 +491,6 @@ MUJOCO_GL=egl PYTHONPATH=src \
 - [OpenVLA performance troubleshooting](https://github.com/openvla/openvla#vla-performance-troubleshooting)
 - [LeRobot ACT documentation](https://huggingface.co/docs/lerobot/act)
 - [LeRobot SmolVLA documentation](https://huggingface.co/docs/lerobot/smolvla)
+- [Octo generalist robot policy](https://octo-models.github.io/)
+- [RT-H action hierarchies](https://rt-hierarchy.github.io/)
+- [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/)

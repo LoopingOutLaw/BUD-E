@@ -1,7 +1,7 @@
-"""Convert joint-target pick datasets to TCP-delta action datasets.
+"""Convert joint-target pick datasets to task-space action datasets.
 
 The learned policy must not receive cube coordinates. This script only rewrites
-expert actions from absolute joint targets into observable end-effector motion
+expert actions from absolute joint targets into end-effector targets
 commands: [dx, dy, dz, gripper]. Images and proprio are preserved, videos are
 symlinked by default to avoid duplicating tens of GB of MP4 data.
 """
@@ -18,7 +18,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from bude_vla.action_space import joint_action_to_ee_delta
+from bude_vla.action_space import joint_action_to_ee_abs, joint_action_to_ee_delta
 from bude_vla.data.lerobot_v3 import finalize_dataset
 from bude_vla.envs.so101_mjx import load_arm_model
 
@@ -38,7 +38,8 @@ def _copy_or_link(src: Path, dst: Path, *, copy_videos: bool) -> None:
 
 
 def convert_root(src_root: Path, dst_root: Path, *, overwrite: bool,
-                 max_delta: float, lookahead_steps: int, copy_videos: bool) -> None:
+                 action_space: str, max_delta: float,
+                 lookahead_steps: int, copy_videos: bool) -> None:
     if dst_root.exists():
         if not overwrite:
             raise FileExistsError(f"{dst_root} exists; pass --overwrite to replace it")
@@ -70,8 +71,13 @@ def convert_root(src_root: Path, dst_root: Path, *, overwrite: bool,
         ee_rows = []
         for i, state in enumerate(states):
             target_i = min(i + max(0, int(lookahead_steps)), len(actions) - 1)
-            ee_action = joint_action_to_ee_delta(
-                model, fk_data, state, actions[target_i], max_delta=max_delta)
+            if action_space == "ee_abs":
+                ee_action = joint_action_to_ee_abs(
+                    model, fk_data, actions[target_i])
+            else:
+                ee_action = joint_action_to_ee_delta(
+                    model, fk_data, state, actions[target_i],
+                    max_delta=max_delta)
             # Keep gripper timing from the current expert command. Looking ahead
             # on position is useful; looking ahead on gripper closes too early.
             ee_action[-1] = actions[i, -1]
@@ -103,9 +109,13 @@ def convert_root(src_root: Path, dst_root: Path, *, overwrite: bool,
     features = dict(info.get("features", {}))
     features["action"] = {"dtype": "float32", "shape": [4]}
     info["features"] = features
-    info["action_space"] = "ee_delta"
-    info["ee_delta_max_delta"] = float(max_delta)
-    info["ee_delta_lookahead_steps"] = int(lookahead_steps)
+    info["action_space"] = action_space
+    info["ee_delta_max_delta"] = float(max_delta) if action_space == "ee_delta" else 0.0
+    info["task_space_lookahead_steps"] = int(lookahead_steps)
+    if action_space == "ee_delta":
+        info["ee_delta_lookahead_steps"] = int(lookahead_steps)
+    else:
+        info.pop("ee_delta_lookahead_steps", None)
     info.pop("action_normalization", None)
     (dst_root / "meta" / "info.json").write_text(json.dumps(info, indent=2))
     stats = finalize_dataset(dst_root)
@@ -116,18 +126,23 @@ def convert_root(src_root: Path, dst_root: Path, *, overwrite: bool,
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True, help="Source joint-action dataset root")
-    ap.add_argument("--out", required=True, help="Output ee_delta dataset root")
+    ap.add_argument("--out", required=True, help="Output task-space dataset root")
+    ap.add_argument("--action-space", choices=["ee_delta", "ee_abs"],
+                    default="ee_delta",
+                    help="Task-space representation written to the output dataset.")
     ap.add_argument("--max-delta", type=float, default=0.08,
                     help="Clip converted TCP deltas to +/- this many meters before normalization")
-    ap.add_argument("--lookahead-steps", type=int, default=12,
-                    help="Use the expert arm target this many frames ahead for dx/dy/dz labels. Gripper remains current-frame.")
+    ap.add_argument("--lookahead-steps", type=int, default=0,
+                    help="Use the expert arm target this many frames ahead. Zero preserves the demonstrated control-time contract.")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--copy-videos", action="store_true",
                     help="Copy MP4s instead of symlinking. Uses much more disk.")
     args = ap.parse_args()
-    convert_root(Path(args.src), Path(args.out), overwrite=args.overwrite,
-                 max_delta=args.max_delta, lookahead_steps=args.lookahead_steps,
-                 copy_videos=args.copy_videos)
+    convert_root(
+        Path(args.src), Path(args.out), overwrite=args.overwrite,
+        action_space=args.action_space, max_delta=args.max_delta,
+        lookahead_steps=args.lookahead_steps, copy_videos=args.copy_videos,
+    )
 
 
 if __name__ == "__main__":

@@ -68,8 +68,25 @@ def joint_action_to_ee_delta(model: mujoco.MjModel, fk_data: mujoco.MjData,
     return np.asarray([delta[0], delta[1], delta[2], gripper], dtype=np.float32)
 
 
+def joint_action_to_ee_abs(model: mujoco.MjModel, fk_data: mujoco.MjData,
+                           action: np.ndarray) -> np.ndarray:
+    """Convert [5 joint targets + gripper] into [TCP x, y, z + gripper]."""
+    action = np.asarray(action, dtype=np.float64)
+    target_pos = end_effector_position_for_qpos(
+        model, fk_data, action[:N_ARM_JOINTS], float(action[N_ARM_JOINTS])
+    )
+    return np.asarray([
+        target_pos[0], target_pos[1], target_pos[2], action[N_ARM_JOINTS]
+    ], dtype=np.float32)
+
+
+def uses_ik_action_space(cfg) -> bool:
+    return action_space_from_cfg(cfg) in {"ee_delta", "ee_abs"}
+
+
 def make_ik_controller(model: mujoco.MjModel, data: mujoco.MjData) -> IKController:
-    return IKController(model, data, end_effector_site="gripperframe", damping=0.08, max_dq=0.35)
+    # Match the controller used by the successful scripted demonstrator.
+    return IKController(model, data, end_effector_site="gripperframe", damping=0.1, max_dq=0.5)
 
 
 def apply_policy_action(model: mujoco.MjModel, data: mujoco.MjData, action: np.ndarray,
@@ -85,11 +102,20 @@ def apply_policy_action(model: mujoco.MjModel, data: mujoco.MjData, action: np.n
             model, min(gripper_ctrl, contact_close_value)
         )
 
-    if action_space_from_cfg(cfg) == "ee_delta":
+    action_space = action_space_from_cfg(cfg)
+    if action_space == "ee_delta":
         if ik is None:
             raise ValueError("ee_delta action execution requires an IKController")
         delta = np.clip(action[:3], -ee_delta_scale_from_cfg(cfg), ee_delta_scale_from_cfg(cfg))
         target_pos = ik.get_ee_position() + delta
+    elif action_space == "ee_abs":
+        if ik is None:
+            raise ValueError("ee_abs action execution requires an IKController")
+        target_pos = action[:3]
+    else:
+        target_pos = None
+
+    if target_pos is not None:
         ctrl = ik.step_toward_target(
             target_pos,
             gripper_action=0.0,

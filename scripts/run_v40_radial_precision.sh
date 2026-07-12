@@ -18,7 +18,7 @@ export OMP_NUM_THREADS=8
 export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-mkdir -p "$LOG_DIR" "$VIDEO_DIR" "$TMPDIR" "$ROOT/data" "$ROOT/checkpoints"
+mkdir -p "$LOG_DIR" "$VIDEO_DIR" "$TMPDIR" "$ROOT/data" "$ROOT/checkpoints" "$CKPT_DIR"
 cd "$ROOT"
 
 stage() {
@@ -147,21 +147,30 @@ require_available_ram_gb 5
 
 stage 5/8 "v40 radial-precision continuation with native closed-loop selection"
 if [[ ! -f "$CKPT_DIR/${TASK}_final.pt" ]]; then
+  TRAIN_START_ARGS=(
+    --init-from "$ROOT/checkpoints/pick_v39_shoulder_precision/pick_v39_shoulder_precision_best.pt"
+    --init-from-raw
+  )
+  LATEST_STEP_CKPT=$(find "$CKPT_DIR" -maxdepth 1 -type f -name "${TASK}_step_*.pt" -print 2>/dev/null | sort -V | tail -n 1)
+  if [[ -n "$LATEST_STEP_CKPT" ]]; then
+    echo "resuming interrupted v40 run from $LATEST_STEP_CKPT"
+    TRAIN_START_ARGS=(--resume "$LATEST_STEP_CKPT")
+  fi
+
   "$PYTHON" scripts/train.py \
     --data-root "$DATA_ROOT" \
     --frame-cache "$CACHE_DIR" \
     --task "$TASK" \
-    --init-from "$ROOT/checkpoints/pick_v39_shoulder_precision/pick_v39_shoulder_precision_best.pt" \
-    --init-from-raw \
+    "${TRAIN_START_ARGS[@]}" \
     --use-dinov2 \
     --img-size 224 \
     --chunk-size 16 \
     --n-history-frames 2 \
     --batch-size 4 \
     --grad-accum-steps 8 \
-    --num-workers 1 \
+    --num-workers 0 \
     --n-steps 60000 \
-    --save-every 5000 \
+    --save-every 2500 \
     --eval-every 5000 \
     --eval-episodes 40 \
     --eval-max-steps 450 \
