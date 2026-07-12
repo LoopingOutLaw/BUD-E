@@ -133,6 +133,8 @@ def main() -> None:
     ap.add_argument("--raw", action="store_true", help="Print normalized actions instead of denormalized controls.")
     ap.add_argument("--min-shoulder-span", type=float, default=0.0,
                     help="Exit nonzero unless denormalized shoulder-pan span reaches this value.")
+    ap.add_argument("--min-shoulder-lift-span", type=float, default=0.0,
+                    help="Exit nonzero unless denormalized shoulder-lift span reaches this value.")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -182,11 +184,21 @@ def main() -> None:
         if float(span.max()) < 0.01:
             print("WARNING: first actions are still nearly identical across cube positions.")
         shoulder_span = float(span[0])
+        shoulder_lift_span = float(span[1]) if len(span) > 1 else 0.0
         renderer.close()
         if args.min_shoulder_span > 0.0 and shoulder_span < args.min_shoulder_span:
             print(
                 f"ERROR: shoulder-pan span {shoulder_span:.6f} is below "
                 f"required {args.min_shoulder_span:.6f}"
+            )
+            raise SystemExit(2)
+        if (
+            args.min_shoulder_lift_span > 0.0
+            and shoulder_lift_span < args.min_shoulder_lift_span
+        ):
+            print(
+                f"ERROR: shoulder-lift span {shoulder_lift_span:.6f} is below "
+                f"required {args.min_shoulder_lift_span:.6f}"
             )
             raise SystemExit(2)
     else:

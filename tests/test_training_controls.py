@@ -24,11 +24,12 @@ class TrainingControlsTest(unittest.TestCase):
             late_bc_weight=5.0,
             gripper_loss_weight=7.0,
             shoulder_pan_loss_weight=3.0,
+            shoulder_lift_loss_weight=7.0,
         )
 
         self.assertEqual(sample_w[:, 0, 0].tolist(), [2.0, 5.0, 5.0])
-        self.assertEqual(dim_w.tolist(), [3.0, 1.0, 1.0, 1.0, 1.0, 7.0])
-        self.assertAlmostEqual(denom.item(), (2.0 + 5.0 + 5.0) * 4 * 14.0)
+        self.assertEqual(dim_w.tolist(), [3.0, 7.0, 1.0, 1.0, 1.0, 7.0])
+        self.assertAlmostEqual(denom.item(), (2.0 + 5.0 + 5.0) * 4 * 20.0)
 
 
     def test_recovery_offset_decays_before_final_grasp(self):
@@ -94,10 +95,10 @@ class TrainingControlsTest(unittest.TestCase):
         from scripts.train import build_action_dim_weights
 
         w = build_action_dim_weights(
-            6, torch.device("cpu"), torch.float32, 5.0, 9.0
+            6, torch.device("cpu"), torch.float32, 5.0, 9.0, 8.0
         )
 
-        self.assertEqual(w.tolist(), [9.0, 1.0, 1.0, 1.0, 1.0, 5.0])
+        self.assertEqual(w.tolist(), [9.0, 8.0, 1.0, 1.0, 1.0, 5.0])
 
     def test_parse_cube_positions_accepts_explicit_reachable_eval_set(self):
         from scripts.eval_pick_ball import parse_cube_positions
