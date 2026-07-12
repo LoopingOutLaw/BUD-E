@@ -34,7 +34,7 @@ bash scripts/run_v40_radial_precision.sh
 
 The runner reuses the verified v37 dataset and 64k cache, initializes from the
 v39 step-35k raw checkpoint, and trains for 60,000 microsteps with 10x weights
-on both shoulder-pan and shoulder-lift, 5x gripper weight, and no EMA. Before
+on both shoulder-pan and shoulder-lift, 5x gripper weight, and no EMA. Checkpoint selection uses a deterministic 6x6 workspace grid, so hard negative-Y and far-X cells cannot be skipped. Before
 the 150-position benchmark it requires:
 
 - shoulder-pan span at least 0.14 rad across Y, preserving the v39 gain;
