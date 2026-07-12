@@ -11,67 +11,73 @@ post-rollout metrics.
 
 ## Current Status
 
-The corrected v37 run is complete. Its original pipeline summary of 0% was an
-evaluation error, not the true final-policy result:
+V38 completed successfully, but its two final evaluations measured different
+samples:
 
-- `pick_v37_camera_fixed_best.pt` was the 5,000-step checkpoint because all
-  ensemble-mode evals tied at zero and ties never advanced the best file.
-- Evaluation loaded EMA weights even though the final raw weights were better.
-- Temporal ensembling or replanning before all 16 trained actions were executed
-  sharply reduced contact.
+- 150 random positions: 21/150 success (14%), 64/150 contact, 36/150 strict
+  grasp;
+- the legacy fixed eight-position video: 0/8 success.
 
-With the final 25,000-step raw weights and native 16-action chunk execution, a
-fresh 50-position random benchmark produced 5/50 successful grasp-and-place
-rollouts, 23/50 contact episodes, and 7/50 strict grasps. This is the first
-controlled proof that the corrected camera/action pipeline learned the task,
-but 10% success is not the target.
+The 0/8 video is not the global result. It is a small hard slice. Spatial
+analysis of the 150-position benchmark found the actual remaining defect:
+negative-Y cube placements had 0% success and only 13% contact, while the two
+positive-Y thirds reached 20% and 23% success.
 
-The remaining data bottleneck is also measured: the 6,000-row v37 cache covered
-only 2,986 of 3,784 demonstrations. Exactly 798 randomized cube placements had
-no training observation in the cache. The active experiment is therefore
-`pick_v38_broad_cache`, which continues from the successful raw v37 weights on
-a 64,000-row cache with guaranteed coverage of every demonstration.
+This is not a dataset-quantity problem. The exact 64k cache contains 18,323
+early sampled observations with an expert cube-Y/shoulder-pan correlation of
+-0.989. Across the Y workspace the expert changes shoulder-pan by 0.305 rad,
+but v38 changes it by only 0.072 rad. The action head sees the cube move but
+under-reacts by about 4.2x. Sensitivity peaked at 70k and then declined, so five
+million repetitions of the same objective would amplify overfitting rather
+than fix the compressed response.
 
-The learned policy is still never given simulator cube coordinates, contact,
-grasp state, or an episode clock. Its runtime inputs remain RGB, joint encoders,
-and language.
+The active experiment is `pick_v39_shoulder_precision`. It keeps the same
+camera-only policy contract and verified data, but explicitly weights
+shoulder-pan error and reduces the unused flow-head objective.
 
-## Run V38
-
-Run the guarded continuation from the repository root:
+## Run V39
 
 ```bash
 cd /home/aditya/bude_vla
-bash scripts/run_v38_broad_cache.sh
+bash scripts/run_v39_shoulder_precision.sh
 ```
 
-There is no timeout. The runner:
+The no-time-limit runner:
 
-1. Rechecks the camera-only expert and persisted-action replay gates.
-2. Reuses the verified 3,784-episode v37 dataset.
-3. Builds 64,000 history-stacked rows with at least 12 phase-stratified rows
-   from every episode.
-4. Initializes from the v37 raw `model_state_dict`, never its lagging EMA.
-5. Trains for 100,000 microsteps with a lower continuation learning rate.
-6. Runs 30 native-chunk closed-loop episodes every 10,000 steps and preserves
-   the best checkpoint, including later checkpoints when scores tie.
-7. Runs a 150-position random benchmark and an 8-position video evaluation.
+1. Reuses the verified 3,784 episodes and complete 64k cache.
+2. Initializes from the v38 90k raw checkpoint that scored 21/150.
+3. Trains 60,000 microsteps with 10x shoulder-pan loss, 5x gripper loss, and
+   flow weight reduced from 0.10 to 0.02.
+4. Evaluates 40 random positions every 5,000 steps using native 16-action
+   chunks and no EMA.
+5. Refuses the final benchmark unless shoulder-pan span reaches 0.18 rad across
+   the Y workspace; the expert reference is 0.305 rad and v38 is 0.072 rad.
+6. Runs a fresh 150-position benchmark and fixed-set video only after the gate.
 
-Watch it from another terminal:
+Watch progress:
 
 ```bash
 cd /home/aditya/bude_vla
 tail -F \
-  logs/pick_v38_visual_expert_bench.log \
-  logs/pick_v38_replay.log \
-  logs/pick_v38_cache.log \
-  logs/pick_v38_train.log \
-  logs/pick_v38_random_bench.log
+  logs/pick_v39_train.log \
+  logs/pick_v39_sensitivity.log \
+  logs/pick_v39_random_bench.log
 ```
 
-The selected checkpoint is written to
-`logs/pick_v38_selected_checkpoint.txt`; the video is
-`demos/videos/eval_pick_v38_broad_cache.mp4`.
+## V38 Result
+
+Training-time success on the fixed 30-position seed rose from 0/30 at 10k to
+5/30 at both 70k and 90k, then fell to 3/30 at 100k. The runner correctly
+selected the raw 90k checkpoint. Its independent 150-position result was:
+
+```text
+success:       21/150 (14.0%)
+contact:       64/150 (42.7%)
+strict grasp:  36/150 (24.0%)
+```
+
+The fixed video had strict grasps in two episodes but no completed placements,
+which is why it printed 0/8 despite the broader benchmark succeeding.
 
 ## Corrected V37 Result
 
@@ -180,7 +186,8 @@ retain eval frames unless video recording is explicitly enabled.
 ## Repository Map
 
 ```text
-scripts/run_v38_broad_cache.sh        Active broad-cache raw-weight continuation
+scripts/run_v39_shoulder_precision.sh Active shoulder-pan precision continuation
+scripts/run_v38_broad_cache.sh        Completed broad-cache baseline
 scripts/run_v37_camera_fixed.sh       Reproducible fresh v37 baseline pipeline
 scripts/benchmark_visual_servo_pick.py Camera-only perception/mechanics gate
 scripts/record_pick_episodes.py        Fresh demonstration recorder
