@@ -159,6 +159,30 @@ class TrainingControlsTest(unittest.TestCase):
         self.assertGreater(len(selected[0]), 0)
 
 
+    def test_cache_min_frames_covers_every_episode(self):
+        import numpy as np
+        from scripts.build_frame_cache import EpisodeInfo, select_cache_frame_indices
+
+        episodes = [
+            EpisodeInfo(ep_idx=i, chunk_idx=0, start=i * 100, length=100, contact_locals=[])
+            for i in range(3)
+        ]
+        selected = select_cache_frame_indices(
+            episodes,
+            max_frames=12,
+            rng=np.random.default_rng(7),
+            early_prob=0.0,
+            early_max_frac=0.22,
+            phase_bins=0,
+            phase_ranges=[],
+            contact_prob=0.0,
+            contact_jitter=0,
+            min_frames_per_episode=3,
+        )
+
+        self.assertTrue(all(len(selected[i]) >= 3 for i in range(3)))
+        self.assertLessEqual(sum(map(len, selected.values())), 12)
+
     def test_dinov2_adapter_initializes_current_top_frame(self):
         from bude_vla.models.vision import current_top_rgb_start
 

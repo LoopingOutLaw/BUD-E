@@ -58,6 +58,7 @@ def stack_observation(buffer: list[np.ndarray], n_history_frames: int) -> np.nda
 def sample_action(policy, batch, cfg, action_lo, action_hi, *,
                   exec_first_only: bool, ensembling: bool,
                   ensembling_k: float, replan_every: int,
+                  execute_horizon: int,
                   state: dict, step: int) -> np.ndarray:
     if ensembling:
         action_queue = state.setdefault("action_queue", [])
@@ -83,7 +84,10 @@ def sample_action(policy, batch, cfg, action_lo, action_hi, *,
             action = denormalize_actions(action, action_lo, action_hi)
         return action
 
-    if state.get("chunk") is None or state.get("cursor", 0) >= cfg.chunk_size:
+    horizon = cfg.chunk_size if execute_horizon <= 0 else min(
+        cfg.chunk_size, execute_horizon
+    )
+    if state.get("chunk") is None or state.get("cursor", 0) >= horizon:
         state["chunk"] = policy.sample(batch)[0].detach().cpu().numpy()
         state["cursor"] = 0
     action = state["chunk"][state["cursor"]]
@@ -96,7 +100,8 @@ def sample_action(policy, batch, cfg, action_lo, action_hi, *,
 def run_one(policy, model, data, renderer, text_ids, action_lo, action_hi, cfg,
             device: str, cube_xy: tuple[float, float], *, max_steps: int,
             exec_first_only: bool, ensembling: bool, ensembling_k: float,
-            replan_every: int, contact_close_reflex: bool,
+            replan_every: int, execute_horizon: int,
+            contact_close_reflex: bool,
             contact_close_steps: int, contact_close_value: float) -> dict:
     front_top_cam = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "front_top")
     wrist_cam = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_cam")
@@ -147,6 +152,7 @@ def run_one(policy, model, data, renderer, text_ids, action_lo, action_hi, cfg,
                 ensembling=ensembling,
                 ensembling_k=ensembling_k,
                 replan_every=replan_every,
+                execute_horizon=execute_horizon,
                 state=action_state,
                 step=step,
             )
@@ -187,6 +193,8 @@ def run_one(policy, model, data, renderer, text_ids, action_lo, action_hi, cfg,
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--raw-weights", action="store_true",
+                    help="Evaluate model_state_dict instead of EMA weights.")
     ap.add_argument("--num-episodes", type=int, default=100)
     ap.add_argument("--max-steps", type=int, default=900)
     ap.add_argument("--seed", type=int, default=123)
@@ -200,6 +208,11 @@ def main() -> None:
     ap.add_argument("--ensembling", action="store_true")
     ap.add_argument("--ensembling-k", type=float, default=0.55)
     ap.add_argument("--replan-every", type=int, default=1)
+    ap.add_argument(
+        "--execute-horizon", type=int, default=0,
+        help=("For non-ensembled chunk execution, replan after this many "
+              "actions; 0 executes the full trained chunk."),
+    )
     ap.add_argument("--contact-close-reflex", action="store_true",
                     help="Robot-side reflex: close/hold gripper briefly after any-pad cube contact.")
     ap.add_argument("--contact-close-steps", type=int, default=120)
@@ -207,7 +220,9 @@ def main() -> None:
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    policy, action_lo, action_hi, cfg = load_policy(args.ckpt, args.img_size, device)
+    policy, action_lo, action_hi, cfg = load_policy(
+        args.ckpt, args.img_size, device, use_ema=not args.raw_weights
+    )
     model = load_arm_model()
     data = mujoco.MjData(model)
     renderer = mujoco.Renderer(model, height=cfg.img_size, width=cfg.img_size)
@@ -219,6 +234,9 @@ def main() -> None:
 
     results = []
     for ep in range(args.num_episodes):
+        torch.manual_seed(args.seed + ep)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed + ep)
         if fixed_positions:
             cube_xy = fixed_positions[ep % len(fixed_positions)]
         else:
@@ -230,6 +248,7 @@ def main() -> None:
             ensembling=args.ensembling,
             ensembling_k=args.ensembling_k,
             replan_every=args.replan_every,
+            execute_horizon=args.execute_horizon,
             contact_close_reflex=args.contact_close_reflex,
             contact_close_steps=args.contact_close_steps,
             contact_close_value=args.contact_close_value,

@@ -83,6 +83,7 @@ def select_cache_frame_indices(
     phase_ranges: list[tuple[float, float, float]],
     contact_prob: float,
     contact_jitter: int,
+    min_frames_per_episode: int = 0,
 ) -> dict[int, set[int]]:
     selected_by_ep: dict[int, set[int]] = {e.ep_idx: set() for e in episodes}
     if not episodes or max_frames <= 0:
@@ -102,6 +103,17 @@ def select_cache_frame_indices(
         ep = episodes[ep_i]
         local = min(max(int(local), 0), ep.length - 1)
         selected_by_ep[ep.ep_idx].add(local)
+
+    coverage_per_ep = min(
+        max(0, int(min_frames_per_episode)),
+        max_frames // n_eps,
+    )
+    if coverage_per_ep > 0:
+        for ep_i, ep in enumerate(episodes):
+            for bin_i in range(coverage_per_ep):
+                phase = (bin_i + float(rng.random())) / coverage_per_ep
+                local = int(round(phase * max(0, ep.length - 1)))
+                add_local(ep_i, local)
 
     if phase_bins > 0 and not phase_ranges and not contact_refs:
         per_bin = int(np.ceil(max_frames / phase_bins))
@@ -152,6 +164,8 @@ def main() -> None:
                     help='Probability of sampling from frames where observation.state[8] any_contact is true, if present.')
     ap.add_argument('--contact-jitter', type=int, default=6,
                     help='Local frame jitter around sampled contact frames.')
+    ap.add_argument('--min-frames-per-episode', type=int, default=0,
+                    help='Guarantee this many phase-stratified cache rows per episode before random sampling.')
     args = ap.parse_args()
 
     root = Path(args.data_root)
@@ -192,6 +206,7 @@ def main() -> None:
         phase_ranges=phase_ranges,
         contact_prob=max(0.0, min(1.0, args.contact_prob)),
         contact_jitter=max(0, args.contact_jitter),
+        min_frames_per_episode=max(0, args.min_frames_per_episode),
     )
     if args.contact_prob > 0.0:
         print(f'contact-aware sampling: contact_frames={n_contact_frames} contact_prob={args.contact_prob:.2f}', flush=True)
@@ -246,6 +261,7 @@ def main() -> None:
         'contact_prob': float(args.contact_prob),
         'contact_jitter': int(args.contact_jitter),
         'contact_frames_available': int(n_contact_frames),
+        'min_frames_per_episode': int(args.min_frames_per_episode),
     }
     (out / 'meta.json').write_text(json.dumps(meta, indent=2))
     print(f'done: {out} frames={total_sel} shape={(total_sel, H, W, channels)}')

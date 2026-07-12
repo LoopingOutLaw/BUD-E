@@ -50,6 +50,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="checkpoints/pick_v12_dinov2/pick_v12_dinov2_step_250000.pt")
     ap.add_argument("--data-root", default="data/pick_v12")
+    ap.add_argument("--frame-cache", default=None,
+                    help="Bounded frame-cache directory used by the training run.")
     ap.add_argument("--episodes", type=int, default=4)
     ap.add_argument("--samples-per-episode", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
@@ -66,42 +68,60 @@ def main() -> None:
         n_history_frames=cfg.n_history_frames,
         lazy_videos=True,
         normalize=True,
+        frame_cache=args.frame_cache,
     ).read()
     rng = np.random.default_rng(args.seed)
 
-    rows = []
-    max_ep = min(args.episodes, len(ds._episodes))
-    with torch.no_grad():
+    sample_points: list[tuple[int, int, int]] = []
+    if ds._cache_global_indices is not None:
+        n_samples = min(
+            len(ds), max(1, args.episodes * args.samples_per_episode)
+        )
+        cache_rows = np.sort(rng.choice(len(ds), size=n_samples, replace=False))
+        cum_frames = np.asarray(ds._cum_frames, dtype=np.int64)
+        for cache_row in cache_rows:
+            global_idx = int(ds._cache_global_indices[int(cache_row)])
+            ep_i = int(np.searchsorted(cum_frames, global_idx, side="right") - 1)
+            frame_in_ep = global_idx - int(cum_frames[ep_i])
+            sample_points.append((ep_i, frame_in_ep, int(cache_row)))
+    else:
+        max_ep = min(args.episodes, len(ds._episodes))
         for ep_i in range(max_ep):
             ep = ds._episodes[ep_i]
             length = ep["length"]
             if length <= 1:
                 continue
-            frame_ids = np.linspace(0, length - 1, args.samples_per_episode, dtype=int)
-            # Add a little randomness but keep early/mid/late coverage.
+            frame_ids = np.linspace(
+                0, length - 1, args.samples_per_episode, dtype=int
+            )
             jitter = rng.integers(-3, 4, size=frame_ids.shape)
             frame_ids = np.clip(frame_ids + jitter, 0, length - 1)
-            for frame_in_ep in frame_ids:
-                idx = ds._cum_frames[ep_i] + int(frame_in_ep)
-                item = ds[idx]
-                batch = {
-                    "images": item["images"].unsqueeze(0).to(device),
-                    "text_ids": item["text_ids"].unsqueeze(0).to(device),
-                    "instruction": [item["instruction"]],
-                    "proprio": item["proprio"].unsqueeze(0).to(device),
-                    "perception": item["perception"].unsqueeze(0).to(device),
-                    "domain_id": item["domain_id"].view(1).to(device),
-                }
-                pred_norm = policy.sample(batch)[0].detach().cpu().numpy()
-                pred = denormalize_actions(pred_norm, lo, hi)
-                gt_norm = item["actions"].detach().cpu().numpy()
-                gt = denormalize_actions(gt_norm, lo, hi)
-                mask = item["mask"].detach().cpu().numpy().astype(bool)
-                err = np.abs(pred[mask] - gt[mask])
-                rows.append((ep_i, int(frame_in_ep), float(err.mean()),
-                             float(err[:, :5].mean()), float(err[:, 5].mean()),
-                             pred[0], gt[0]))
+            sample_points.extend(
+                (ep_i, int(frame), ds._cum_frames[ep_i] + int(frame))
+                for frame in frame_ids
+            )
 
+    rows = []
+    with torch.no_grad():
+        for ep_i, frame_in_ep, item_idx in sample_points:
+            item = ds[item_idx]
+            batch = {
+                "images": item["images"].unsqueeze(0).to(device),
+                "text_ids": item["text_ids"].unsqueeze(0).to(device),
+                "instruction": [item["instruction"]],
+                "proprio": item["proprio"].unsqueeze(0).to(device),
+                "perception": item["perception"].unsqueeze(0).to(device),
+                "domain_id": item["domain_id"].view(1).to(device),
+            }
+            pred_norm = policy.sample(batch)[0].detach().cpu().numpy()
+            pred = denormalize_actions(pred_norm, lo, hi)
+            gt_norm = item["actions"].detach().cpu().numpy()
+            gt = denormalize_actions(gt_norm, lo, hi)
+            mask = item["mask"].detach().cpu().numpy().astype(bool)
+            err = np.abs(pred[mask] - gt[mask])
+            rows.append((ep_i, frame_in_ep, float(err.mean()),
+                         float(err[:, :5].mean()), float(err[:, 5].mean()),
+                         pred[0], gt[0]))
     if not rows:
         raise RuntimeError("no rows sampled")
 
