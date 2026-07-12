@@ -11,46 +11,60 @@ post-rollout metrics.
 
 ## Current Status
 
-V39 is the current validated checkpoint. Its final independent benchmark
-reached 31/150 success (20.7%), 52.7% contact, and 32.0% strict grasp; the fixed
-video reached 3/8 and showed complete visual pick, lift, transport, and place.
+V39 remains the strongest completed learned joint-space policy: 31/150 success
+(20.7%), 52.7% contact, and 32.0% strict grasp. V40 did not solve the remaining
+failure. Its deterministic 6x6 workspace evaluation peaked at 8/36 (22%) at
+step 45k and ended at 2/36 (6%) at step 60k.
 
-The remaining error is radial. In the far-X quarter, success is 11% versus 34%
-in the near-X quarter. Across the X workspace, the expert changes shoulder-lift
-by 0.134 rad while v39 changes it by only 0.007 rad with the wrong slope. The
-policy partially substitutes elbow motion, but that does not reach far cubes
-reliably.
+V40 did pass the shoulder-pan span check, but its shoulder-lift span was only
+0.008 rad. Forward-kinematics analysis then exposed a flaw in that diagnostic:
+the arm may trade shoulder-lift against elbow, so requiring one expert joint
+trajectory is not a valid task-level gate. The correct measurement is the
+predicted gripper target. V40 has 15.8 mm median and 22.5 mm p95 first-action
+TCP error, which is large relative to a 30 mm cube.
 
-The active experiment is `pick_v40_radial_precision`. It retains v39 shoulder-
-pan sensitivity and adds explicit shoulder-lift precision weighting. Runtime
-inputs remain camera pixels, joint encoders, and language only.
+The active experiment is **pick_v41_ee_abs**. It removes inverse kinematics from
+what the network must learn: the VLA predicts absolute TCP x/y/z plus gripper,
+and the shared IK controller converts that prediction to SO-101 joint targets.
+Runtime inputs remain top/wrist RGB, language, and six measured joint/gripper
+positions. No simulator cube coordinates, progress clock, or contact flags are
+policy inputs.
 
-## Run V40
+The representation was accepted before training:
 
-```bash
-cd /home/aditya/bude_vla
-bash scripts/run_v40_radial_precision.sh
-```
+    camera-only visual-servo expert: 100/100 success
+    original joint-action replay:    200/200 success
+    ee_abs in-memory replay:           98/100 success
+    ee_abs production replay:         199/200 success (99.5%)
+    v40 first-action TCP error:       15.8 mm median, 22.5 mm p95
 
-The runner reuses the verified v37 dataset and 64k cache, initializes from the
-v39 step-35k raw checkpoint, and trains for 60,000 microsteps with 10x weights
-on both shoulder-pan and shoulder-lift, 5x gripper weight, and no EMA. Checkpoint selection uses a deterministic 6x6 workspace grid, so hard negative-Y and far-X cells cannot be skipped. Before
-the 150-position benchmark it requires:
+The **ee_abs** replay uses the exact production conversion and IK execution path.
+This establishes a 99.5% control/data ceiling; v41 training measures whether the
+VLA can infer those task-space targets from its deployable observations.
 
-- shoulder-pan span at least 0.14 rad across Y, preserving the v39 gain;
-- shoulder-lift span at least 0.06 rad across X, versus v39 at 0.007 and the
-  expert reference at 0.134 rad.
+## Run V41
+
+    cd /home/aditya/bude_vla
+    bash scripts/run_v41_ee_abs.sh
+
+The launcher reuses the 3,784 verified v37 episodes and the 64k memory-mapped
+image cache. Relabeling changes only action coordinates and symlinks videos, so
+it adds about 100 MiB rather than duplicating the 42 GiB source dataset.
+
+V41 initializes the shared visual-language trunk from v40 raw weights, rebuilds
+the incompatible 4D action outputs, trains for up to 120,000 microsteps, and
+selects checkpoints on a deterministic 6x6 workspace grid. It then compares native chunks with first-action replanning on the same 36 positions. The final decision
+is a 200-position random benchmark. The script exits nonzero below 80%, writes
+a fixed-set video either way, preserves step checkpoints on failure, and prunes
+them only after the 80% gate passes.
 
 Watch progress:
 
-```bash
-cd /home/aditya/bude_vla
-tail -F \
-  logs/pick_v40_train.log \
-  logs/pick_v40_pan_sensitivity.log \
-  logs/pick_v40_lift_sensitivity.log \
-  logs/pick_v40_random_bench.log
-```
+    cd /home/aditya/bude_vla
+    tail -F \
+      logs/pick_v41_train.log \
+      logs/pick_v41_task_space_sensitivity.log \
+      logs/pick_v41_random_bench.log
 
 ## V39 Completed Result
 
@@ -181,8 +195,8 @@ The v38 cache is approximately 36 GiB:
 64000 frames * 224 * 224 * (2 histories * 6 RGB channels) * 1 byte
 ```
 
-Training uses batch size 4, gradient accumulation 8, and one worker. The
-effective batch is 32 while the 36 GiB cache remains memory-mapped instead of
+Training uses batch size 4, gradient accumulation 8, and in-process data
+loading with zero workers. The effective batch is 32 while the 36 GiB cache remains memory-mapped instead of
 being copied into RAM. The runner checks free disk and available RAM before
 expensive stages, sets a repository-local temporary directory, and does not
 retain eval frames unless video recording is explicitly enabled.
@@ -190,7 +204,8 @@ retain eval frames unless video recording is explicitly enabled.
 ## Repository Map
 
 ```text
-scripts/run_v40_radial_precision.sh   Active radial shoulder-lift continuation
+scripts/run_v41_ee_abs.sh             Active task-space VLA pipeline
+scripts/run_v40_radial_precision.sh Completed joint-space radial experiment
 scripts/run_v39_shoulder_precision.sh Completed shoulder-pan precision run
 scripts/run_v38_broad_cache.sh        Completed broad-cache baseline
 scripts/run_v37_camera_fixed.sh       Reproducible fresh v37 baseline pipeline
@@ -198,6 +213,7 @@ scripts/benchmark_visual_servo_pick.py Camera-only perception/mechanics gate
 scripts/record_pick_episodes.py        Fresh demonstration recorder
 scripts/validate_dataset_replay.py     Persisted-action contract gate
 scripts/build_frame_cache.py           Bounded frame/history cache builder
+scripts/convert_dataset_to_ee_delta.py Task-space action relabeler
 scripts/train.py                       VLA training and best-checkpoint eval
 scripts/benchmark_random_pick.py       Random-position learned-policy benchmark
 scripts/eval_pick_ball.py              Closed-loop video evaluation

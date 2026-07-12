@@ -20,8 +20,10 @@ import numpy as np
 import torch
 
 from bude_vla.action_space import (
+    apply_policy_action,
     clip_arm_joint_targets,
-    clip_gripper_control,
+    make_ik_controller,
+    uses_ik_action_space,
 )
 from bude_vla.data.action_normalization import (
     DEFAULT_HI,
@@ -261,6 +263,10 @@ class PolicyRolloutRunner:
             self._frame_buffer = []
             self._action_queue = []
             ever_grasped = False
+            ik = (
+                make_ik_controller(self.model, data)
+                if uses_ik_action_space(policy.cfg) else None
+            )
 
             for step in range(self.max_steps_per_try):
                 img = self._render(data)
@@ -319,8 +325,9 @@ class PolicyRolloutRunner:
                     arm_target = HOME_QPOS[ARM_QPOS_START:ARM_QPOS_END].copy()
                     gripper_ctrl = 0.0
                 else:
-                    arm_target = clip_arm_joint_targets(self.model, a)
-                    gripper_ctrl = clip_gripper_control(self.model, float(a[N_ARM_JOINTS]))
+                    arm_target, gripper_ctrl = apply_policy_action(
+                        self.model, data, a, policy.cfg, ik=ik
+                    )
 
                 _carry_cube_with(self.model, data)
                 _smooth_arm_to(arm_target, try_idx)

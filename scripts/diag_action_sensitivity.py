@@ -16,6 +16,7 @@ import mujoco
 import numpy as np
 import torch
 
+from bude_vla.action_space import end_effector_position_for_qpos
 from bude_vla.data.action_normalization import denormalize_actions
 from bude_vla.data.lerobot_v3 import _domain_from_instruction, _tokenize_instruction
 from bude_vla.envs.so101_mjx import (
@@ -32,6 +33,7 @@ from bude_vla.envs.so101_mjx import (
 )
 from bude_vla.models.policy import BUDEConfig, BUDEPolicy
 from bude_vla.perception import detect_red_centroid
+from bude_vla.scripted_pick_and_place import ScriptedPickAndPlace
 
 INSTRUCTION = "pick up the red cube and place it in the blue target zone"
 
@@ -54,6 +56,8 @@ def load_policy(path: str, device: str):
     cfg.use_perception = saved.get("use_perception", False)
     cfg.use_perception_action_cond = saved.get("use_perception_action_cond", False)
     cfg.perception_dim = saved.get("perception_dim", 3)
+    cfg.action_space = saved.get("action_space", "joint_abs")
+    cfg.ee_delta_scale = saved.get("ee_delta_scale", 0.05) or 0.05
     cfg.patch_size = 16
 
     policy = BUDEPolicy(cfg).to(device)
@@ -135,6 +139,8 @@ def main() -> None:
                     help="Exit nonzero unless denormalized shoulder-pan span reaches this value.")
     ap.add_argument("--min-shoulder-lift-span", type=float, default=0.0,
                     help="Exit nonzero unless denormalized shoulder-lift span reaches this value.")
+    ap.add_argument("--max-task-space-p95-mm", type=float, default=0.0,
+                    help="Exit nonzero if first-action TCP p95 error exceeds this value.")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -154,6 +160,8 @@ def main() -> None:
     text_ids = _tokenize_instruction(INSTRUCTION)
 
     rows = []
+    task_errors_m = []
+    fk_data = mujoco.MjData(model)
     with torch.no_grad():
         for cx, cy in parse_xy(args.cube):
             mujoco.mj_resetData(model, data)
@@ -172,6 +180,28 @@ def main() -> None:
             chunk_norm = policy.sample(batch)[0].detach().cpu().numpy()
             first = chunk_norm[0] if args.raw or lo is None else denormalize_actions(chunk_norm[:1], lo, hi)[0]
             rows.append(first)
+            if not args.raw and lo is not None:
+                expert = ScriptedPickAndPlace(
+                    model, data, np.asarray([cx, cy], dtype=np.float64)
+                )
+                expert_ctrl, _arm_q, _done, _info = expert.step(model, data)
+                expert_xyz = end_effector_position_for_qpos(
+                    model, fk_data, expert_ctrl[:5], expert_ctrl[5]
+                )
+                if cfg.action_space == "ee_abs":
+                    predicted_xyz = np.asarray(first[:3], dtype=np.float64)
+                elif cfg.action_space == "ee_delta":
+                    site_id = mujoco.mj_name2id(
+                        model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe"
+                    )
+                    predicted_xyz = data.site_xpos[site_id] + first[:3]
+                else:
+                    predicted_xyz = end_effector_position_for_qpos(
+                        model, fk_data, first[:5], first[5]
+                    )
+                task_errors_m.append(
+                    float(np.linalg.norm(predicted_xyz - expert_xyz))
+                )
             print(
                 f"cube=({cx:+.3f},{cy:+.3f}) perception=[{perception[0]:+.3f},{perception[1]:+.3f},{perception[2]:.0f}] "
                 f"first_action={np.array2string(first, precision=4, suppress_small=False)}"
@@ -185,6 +215,17 @@ def main() -> None:
             print("WARNING: first actions are still nearly identical across cube positions.")
         shoulder_span = float(span[0])
         shoulder_lift_span = float(span[1]) if len(span) > 1 else 0.0
+        task_p95_mm = (
+            float(np.percentile(task_errors_m, 95) * 1000.0)
+            if task_errors_m else float("nan")
+        )
+        if task_errors_m:
+            print(
+                "task_space_error_mm "
+                f"median={np.median(task_errors_m) * 1000.0:.3f} "
+                f"p95={task_p95_mm:.3f} "
+                f"max={np.max(task_errors_m) * 1000.0:.3f}"
+            )
         renderer.close()
         if args.min_shoulder_span > 0.0 and shoulder_span < args.min_shoulder_span:
             print(
@@ -199,6 +240,18 @@ def main() -> None:
             print(
                 f"ERROR: shoulder-lift span {shoulder_lift_span:.6f} is below "
                 f"required {args.min_shoulder_lift_span:.6f}"
+            )
+            raise SystemExit(2)
+        if (
+            args.max_task_space_p95_mm > 0.0
+            and (
+                not np.isfinite(task_p95_mm)
+                or task_p95_mm > args.max_task_space_p95_mm
+            )
+        ):
+            print(
+                f"ERROR: task-space p95 error {task_p95_mm:.3f}mm exceeds "
+                f"required {args.max_task_space_p95_mm:.3f}mm"
             )
             raise SystemExit(2)
     else:

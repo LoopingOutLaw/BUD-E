@@ -58,7 +58,7 @@ class BUDEConfig:
     use_gripper_trigger_head: bool = False
     gripper_trigger_threshold: float = 0.5
     gripper_trigger_close_value: float = -1.0
-    action_space: str = "joint_abs"  # joint_abs or ee_delta
+    action_space: str = "joint_abs"  # joint_abs, ee_delta, or ee_abs
     ee_delta_scale: float = 0.05
 
 

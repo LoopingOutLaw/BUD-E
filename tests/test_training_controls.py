@@ -273,5 +273,39 @@ class TrainingControlsTest(unittest.TestCase):
         self.assertEqual(clip_gripper_control(model, 100.0), float(grip_hi))
         self.assertEqual(clip_gripper_control(model, -100.0), float(grip_lo))
 
+    def test_joint_action_to_ee_abs_preserves_tcp_target_and_gripper(self):
+        import numpy as np
+        import mujoco
+        from bude_vla.action_space import (
+            end_effector_position_for_qpos,
+            joint_action_to_ee_abs,
+        )
+        from bude_vla.envs.so101_mjx import load_arm_model
+
+        model = load_arm_model()
+        fk_data = mujoco.MjData(model)
+        action = np.asarray(
+            [0.12, -0.63, 0.71, np.pi / 2, np.pi / 2, -0.4],
+            dtype=np.float64,
+        )
+
+        converted = joint_action_to_ee_abs(model, fk_data, action)
+        expected_xyz = end_effector_position_for_qpos(
+            model, fk_data, action[:5], action[5]
+        )
+
+        np.testing.assert_allclose(converted[:3], expected_xyz, atol=1e-6)
+        self.assertAlmostEqual(float(converted[3]), float(action[5]), places=6)
+
+
+    def test_ee_abs_is_an_ik_action_space(self):
+        from types import SimpleNamespace
+        from bude_vla.action_space import uses_ik_action_space
+
+        self.assertTrue(uses_ik_action_space(SimpleNamespace(action_space="ee_abs")))
+        self.assertTrue(uses_ik_action_space(SimpleNamespace(action_space="ee_delta")))
+        self.assertFalse(uses_ik_action_space(SimpleNamespace(action_space="joint_abs")))
+
+
 if __name__ == "__main__":
     unittest.main()

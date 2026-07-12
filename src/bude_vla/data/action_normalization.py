@@ -90,7 +90,7 @@ def write_action_stats(meta_path: Path, lo: np.ndarray, hi: np.ndarray) -> None:
     meta["action_normalization"] = {
         "lo": lo.astype(float).tolist(),
         "hi": hi.astype(float).tolist(),
-        "note": ("Per-dim linear map [-pi_s..pi_s, -1..1] -> [-1, 1]. "
+        "note": ("Per-dimension linear map from dataset action bounds to [-1, 1]. "
                  "Compute dataset-wide min/max at recording time."),
     }
     meta_path.parent.mkdir(parents=True, exist_ok=True)

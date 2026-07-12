@@ -15,7 +15,7 @@ import mujoco
 import numpy as np
 import torch
 
-from bude_vla.action_space import apply_policy_action, make_ik_controller
+from bude_vla.action_space import apply_policy_action, make_ik_controller, uses_ik_action_space
 from bude_vla.data.action_normalization import denormalize_actions
 from bude_vla.data.lerobot_v3 import _tokenize_instruction
 from bude_vla.envs.so101_mjx import (
@@ -119,7 +119,7 @@ def run_one(policy, model, data, renderer, text_ids, action_lo, action_hi, cfg,
     first_touch_step: int | None = None
     first_grasp_step: int | None = None
     close_until = -1
-    ik = make_ik_controller(model, data) if cfg.action_space == "ee_delta" else None
+    ik = make_ik_controller(model, data) if uses_ik_action_space(cfg) else None
 
     for step in range(max_steps):
         renderer.update_scene(data, camera=front_top_cam)
@@ -217,6 +217,8 @@ def main() -> None:
                     help="Robot-side reflex: close/hold gripper briefly after any-pad cube contact.")
     ap.add_argument("--contact-close-steps", type=int, default=120)
     ap.add_argument("--contact-close-value", type=float, default=-1.0)
+    ap.add_argument("--min-success-rate", type=float, default=0.0,
+                    help="Exit nonzero when final success is below this fraction.")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -285,6 +287,13 @@ def main() -> None:
         print(f"median first_touch_step: {float(np.median(first_touch)):.1f}")
     else:
         print("median first_touch_step: NA")
+
+    success_rate = successes / max(1, n)
+    if success_rate < args.min_success_rate:
+        raise SystemExit(
+            f"success {success_rate:.3f} is below required "
+            f"{args.min_success_rate:.3f}"
+        )
 
 
 if __name__ == "__main__":

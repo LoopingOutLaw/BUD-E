@@ -1043,8 +1043,8 @@ if __name__ == "__main__":
                         help="Sigmoid probability threshold for forcing close at inference.")
     parser.add_argument("--gripper-trigger-close-value", type=float, default=-1.0,
                         help="Normalized gripper command used when trigger predicts close.")
-    parser.add_argument("--action-space", choices=["joint_abs", "ee_delta"], default="joint_abs",
-                        help="Action representation. ee_delta predicts TCP dx,dy,dz plus gripper and executes via IK.")
+    parser.add_argument("--action-space", choices=["joint_abs", "ee_delta", "ee_abs"], default="joint_abs",
+                        help="Action representation. ee_delta predicts TCP offsets; ee_abs predicts absolute TCP targets. Both execute through IK.")
     parser.add_argument("--ee-delta-scale", type=float, default=0.05,
                         help="Max expected TCP delta magnitude in meters for ee_delta rollouts.")
     parser.add_argument("--allow-action-head-mismatch", action="store_true",

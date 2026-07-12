@@ -33,7 +33,7 @@ import numpy as np
 import torch
 from pathlib import Path
 
-from bude_vla.action_space import apply_policy_action, make_ik_controller
+from bude_vla.action_space import apply_policy_action, make_ik_controller, uses_ik_action_space
 from bude_vla.data.action_normalization import denormalize_actions
 from bude_vla.data.lerobot_v3 import _tokenize_instruction, _domain_from_instruction
 from bude_vla.envs.so101_mjx import (
@@ -264,7 +264,7 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
         action_queue: list = []  # only used when ensembling=True
         ever_grasped = False
         close_until = -1
-        ik = make_ik_controller(model, data) if cfg.action_space == "ee_delta" else None
+        ik = make_ik_controller(model, data) if uses_ik_action_space(cfg) else None
         img_buffer = []  # reset per episode
 
         for step in range(max_steps):
