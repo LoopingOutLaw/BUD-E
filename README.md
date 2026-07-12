@@ -11,57 +11,45 @@ post-rollout metrics.
 
 ## Current Status
 
-V38 completed successfully, but its two final evaluations measured different
-samples:
+V39 is the current validated checkpoint. Its final independent benchmark
+reached 31/150 success (20.7%), 52.7% contact, and 32.0% strict grasp; the fixed
+video reached 3/8 and showed complete visual pick, lift, transport, and place.
 
-- 150 random positions: 21/150 success (14%), 64/150 contact, 36/150 strict
-  grasp;
-- the legacy fixed eight-position video: 0/8 success.
+The remaining error is radial. In the far-X quarter, success is 11% versus 34%
+in the near-X quarter. Across the X workspace, the expert changes shoulder-lift
+by 0.134 rad while v39 changes it by only 0.007 rad with the wrong slope. The
+policy partially substitutes elbow motion, but that does not reach far cubes
+reliably.
 
-The 0/8 video is not the global result. It is a small hard slice. Spatial
-analysis of the 150-position benchmark found the actual remaining defect:
-negative-Y cube placements had 0% success and only 13% contact, while the two
-positive-Y thirds reached 20% and 23% success.
+The active experiment is `pick_v40_radial_precision`. It retains v39 shoulder-
+pan sensitivity and adds explicit shoulder-lift precision weighting. Runtime
+inputs remain camera pixels, joint encoders, and language only.
 
-This is not a dataset-quantity problem. The exact 64k cache contains 18,323
-early sampled observations with an expert cube-Y/shoulder-pan correlation of
--0.989. Across the Y workspace the expert changes shoulder-pan by 0.305 rad,
-but v38 changes it by only 0.072 rad. The action head sees the cube move but
-under-reacts by about 4.2x. Sensitivity peaked at 70k and then declined, so five
-million repetitions of the same objective would amplify overfitting rather
-than fix the compressed response.
-
-The active experiment is `pick_v39_shoulder_precision`. It keeps the same
-camera-only policy contract and verified data, but explicitly weights
-shoulder-pan error and reduces the unused flow-head objective.
-
-## Run V39
+## Run V40
 
 ```bash
 cd /home/aditya/bude_vla
-bash scripts/run_v39_shoulder_precision.sh
+bash scripts/run_v40_radial_precision.sh
 ```
 
-The no-time-limit runner:
+The runner reuses the verified v37 dataset and 64k cache, initializes from the
+v39 step-35k raw checkpoint, and trains for 60,000 microsteps with 10x weights
+on both shoulder-pan and shoulder-lift, 5x gripper weight, and no EMA. Before
+the 150-position benchmark it requires:
 
-1. Reuses the verified 3,784 episodes and complete 64k cache.
-2. Initializes from the v38 90k raw checkpoint that scored 21/150.
-3. Trains 60,000 microsteps with 10x shoulder-pan loss, 5x gripper loss, and
-   flow weight reduced from 0.10 to 0.02.
-4. Evaluates 40 random positions every 5,000 steps using native 16-action
-   chunks and no EMA.
-5. Refuses the final benchmark unless shoulder-pan span reaches 0.14 rad across
-   the Y workspace; the expert reference is 0.305 rad and v38 is 0.072 rad.
-6. Runs a fresh 150-position benchmark and fixed-set video only after the gate.
+- shoulder-pan span at least 0.14 rad across Y, preserving the v39 gain;
+- shoulder-lift span at least 0.06 rad across X, versus v39 at 0.007 and the
+  expert reference at 0.134 rad.
 
 Watch progress:
 
 ```bash
 cd /home/aditya/bude_vla
 tail -F \
-  logs/pick_v39_train.log \
-  logs/pick_v39_sensitivity.log \
-  logs/pick_v39_random_bench.log
+  logs/pick_v40_train.log \
+  logs/pick_v40_pan_sensitivity.log \
+  logs/pick_v40_lift_sensitivity.log \
+  logs/pick_v40_random_bench.log
 ```
 
 ## V39 Completed Result
@@ -202,7 +190,8 @@ retain eval frames unless video recording is explicitly enabled.
 ## Repository Map
 
 ```text
-scripts/run_v39_shoulder_precision.sh Active shoulder-pan precision continuation
+scripts/run_v40_radial_precision.sh   Active radial shoulder-lift continuation
+scripts/run_v39_shoulder_precision.sh Completed shoulder-pan precision run
 scripts/run_v38_broad_cache.sh        Completed broad-cache baseline
 scripts/run_v37_camera_fixed.sh       Reproducible fresh v37 baseline pipeline
 scripts/benchmark_visual_servo_pick.py Camera-only perception/mechanics gate

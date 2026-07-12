@@ -46,10 +46,13 @@ def build_action_dim_weights(
     dtype: torch.dtype,
     gripper_loss_weight: float,
     shoulder_pan_loss_weight: float = 1.0,
+    shoulder_lift_loss_weight: float = 1.0,
 ) -> torch.Tensor:
     dim_w = torch.ones(action_dim, device=device, dtype=dtype)
     if action_dim > 0:
         dim_w[0] = shoulder_pan_loss_weight
+    if action_dim > 1:
+        dim_w[1] = shoulder_lift_loss_weight
     if action_dim > 0:
         dim_w[-1] = gripper_loss_weight
     return dim_w
@@ -65,6 +68,7 @@ def build_bc_loss_weights(
     late_bc_weight: float,
     gripper_loss_weight: float,
     shoulder_pan_loss_weight: float = 1.0,
+    shoulder_lift_loss_weight: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return sample/dimension weights and denominator for weighted BC loss."""
     if phase is None:
@@ -88,7 +92,7 @@ def build_bc_loss_weights(
 
     dim_w = build_action_dim_weights(
         action_dim, mask.device, mask.dtype, gripper_loss_weight,
-        shoulder_pan_loss_weight)
+        shoulder_pan_loss_weight, shoulder_lift_loss_weight)
     dim_w_view = dim_w.view(1, 1, action_dim)
     denom = (mask.unsqueeze(-1) * sample_w * dim_w_view).sum().clamp_min(1.0)
     return sample_w, dim_w, denom
@@ -420,6 +424,7 @@ def train(
     late_bc_frac: float = 0.35,
     gripper_loss_weight: float = 1.0,
     shoulder_pan_loss_weight: float = 1.0,
+    shoulder_lift_loss_weight: float = 1.0,
     use_gripper_trigger_head: bool = False,
     gripper_trigger_loss_weight: float = 1.0,
     gripper_trigger_label_threshold: float = 0.0,
@@ -716,7 +721,7 @@ def train(
             mask = batch["mask"].unsqueeze(-1)  # (B, chunk_size, 1)
             flow_dim_w = build_action_dim_weights(
                 v_pred.shape[-1], mask.device, mask.dtype, gripper_loss_weight,
-                shoulder_pan_loss_weight)
+                shoulder_pan_loss_weight, shoulder_lift_loss_weight)
             flow_dim_w_view = flow_dim_w.view(1, 1, -1)
             flow_denom = (mask * flow_dim_w_view).sum().clamp_min(1.0)
             flow_loss = (((v_pred - v_target) ** 2) * mask * flow_dim_w_view).sum() / flow_denom
@@ -732,6 +737,7 @@ def train(
                     late_bc_weight=late_bc_weight,
                     gripper_loss_weight=gripper_loss_weight,
                     shoulder_pan_loss_weight=shoulder_pan_loss_weight,
+                    shoulder_lift_loss_weight=shoulder_lift_loss_weight,
                 )
                 bc_loss = (bc_err * sample_w * dim_w.view(1, 1, -1)).sum() / bc_denom
                 loss = flow_loss_weight * flow_loss + bc_loss_weight * bc_loss
@@ -824,6 +830,7 @@ def train(
                     "late_bc_frac": late_bc_frac if cfg.use_bc_head else None,
                     "gripper_loss_weight": gripper_loss_weight if cfg.use_bc_head else None,
                     "shoulder_pan_loss_weight": shoulder_pan_loss_weight if cfg.use_bc_head else None,
+                    "shoulder_lift_loss_weight": shoulder_lift_loss_weight if cfg.use_bc_head else None,
                     "use_visual_action_cond": cfg.use_visual_action_cond,
                     "use_context_action_head": cfg.use_context_action_head,
                     "use_perception": cfg.use_perception,
@@ -923,6 +930,7 @@ def train(
             "late_bc_frac": late_bc_frac if cfg.use_bc_head else None,
             "gripper_loss_weight": gripper_loss_weight if cfg.use_bc_head else None,
             "shoulder_pan_loss_weight": shoulder_pan_loss_weight if cfg.use_bc_head else None,
+            "shoulder_lift_loss_weight": shoulder_lift_loss_weight if cfg.use_bc_head else None,
             "use_visual_action_cond": cfg.use_visual_action_cond,
             "use_context_action_head": cfg.use_context_action_head,
             "use_perception": cfg.use_perception,
@@ -1010,6 +1018,8 @@ if __name__ == "__main__":
                         help="BC loss multiplier for the gripper action dimension.")
     parser.add_argument("--shoulder-pan-loss-weight", type=float, default=1.0,
                         help="Flow and BC loss multiplier for shoulder-pan precision.")
+    parser.add_argument("--shoulder-lift-loss-weight", type=float, default=1.0,
+                        help="Flow and BC loss multiplier for shoulder-lift precision.")
     parser.add_argument("--use-gripper-trigger-head", action="store_true",
                         help="Add a binary BCE head for sharp close-now gripper decisions.")
     parser.add_argument("--gripper-trigger-loss-weight", type=float, default=1.0,
@@ -1115,6 +1125,7 @@ if __name__ == "__main__":
         late_bc_frac=args.late_bc_frac,
         gripper_loss_weight=args.gripper_loss_weight,
         shoulder_pan_loss_weight=args.shoulder_pan_loss_weight,
+        shoulder_lift_loss_weight=args.shoulder_lift_loss_weight,
         use_gripper_trigger_head=args.use_gripper_trigger_head,
         gripper_trigger_loss_weight=args.gripper_trigger_loss_weight,
         gripper_trigger_label_threshold=args.gripper_trigger_label_threshold,

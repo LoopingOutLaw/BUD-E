@@ -348,6 +348,28 @@ elbow motion. A future continuation should weight radial shoulder-lift
 precision and preserve the validated shoulder-pan sensitivity. It should not
 resume the unchanged objective for millions of steps.
 
+## V40 Radial-Precision Recipe
+
+V40 initializes from `pick_v39_shoulder_precision_best.pt` and preserves the
+camera-only state6/action6/chunk16 architecture.
+
+```text
+training horizon:           60000 microsteps
+new-module LR:              8e-6
+backbone LR:                1e-7
+shoulder-pan loss weight:   10x
+shoulder-lift loss weight:  10x
+gripper loss weight:        5x
+BC / flow loss weight:      8.0 / 0.02
+EMA:                        disabled
+eval:                       40 positions every 5000 steps
+Y acceptance gate:          shoulder-pan span >= 0.14 rad
+X acceptance gate:          shoulder-lift span >= 0.06 rad
+```
+
+The dual gate prevents radial improvement from erasing v39 lateral sensitivity.
+Both must pass before the final 150-position benchmark and fixed-set video.
+
 ## Post-Training Decision Protocol
 
 Do not decide from training loss or one video. Use the 150-position random
@@ -379,7 +401,7 @@ Full no-time-limit pipeline:
 
 ```bash
 cd /home/aditya/bude_vla
-bash scripts/run_v39_shoulder_precision.sh
+bash scripts/run_v40_radial_precision.sh
 ```
 
 Regression tests:
