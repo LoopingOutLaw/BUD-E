@@ -11,64 +11,83 @@ post-rollout metrics.
 
 ## Current Status
 
-The active experiment is the clean `pick_v37_camera_fixed` reset. Do not mix
-v26-v36 data, caches, or checkpoints into this run: those artifacts were made
-with a different camera geometry and control-rate contract and have been
-removed locally.
+The corrected v37 run is complete. Its original pipeline summary of 0% was an
+evaluation error, not the true final-policy result:
 
-Verified on 2026-07-11 before training:
+- `pick_v37_camera_fixed_best.pt` was the 5,000-step checkpoint because all
+  ensemble-mode evals tied at zero and ties never advanced the best file.
+- Evaluation loaded EMA weights even though the final raw weights were better.
+- Temporal ensembling or replanning before all 16 trained actions were executed
+  sharply reduced contact.
 
-- Camera-only calibration: 0.32 mm median initial cube-localization error.
-- Camera-only scripted expert: 50/50 strict grasps and 50/50 successful places.
-- Fresh disk replay smoke test: 19/19 strict grasps and 19/19 successful places.
-- Test suite: 22/22 passing.
-- Free disk after obsolete-artifact cleanup: about 89 GiB.
+With the final 25,000-step raw weights and native 16-action chunk execution, a
+fresh 50-position random benchmark produced 5/50 successful grasp-and-place
+rollouts, 23/50 contact episodes, and 7/50 strict grasps. This is the first
+controlled proof that the corrected camera/action pipeline learned the task,
+but 10% success is not the target.
 
-The 50/50 result validates perception, mechanics, workspace, IK, and task
-success logic. It is not a claim that the learned v37 checkpoint already has
-100% success. The pipeline below trains that checkpoint from fresh compatible
-data and measures it on 150 random positions.
+The remaining data bottleneck is also measured: the 6,000-row v37 cache covered
+only 2,986 of 3,784 demonstrations. Exactly 798 randomized cube placements had
+no training observation in the cache. The active experiment is therefore
+`pick_v38_broad_cache`, which continues from the successful raw v37 weights on
+a 64,000-row cache with guaranteed coverage of every demonstration.
 
-## Run V37
+The learned policy is still never given simulator cube coordinates, contact,
+grasp state, or an episode clock. Its runtime inputs remain RGB, joint encoders,
+and language.
 
-Run one guarded pipeline from the repository root:
+## Run V38
+
+Run the guarded continuation from the repository root:
 
 ```bash
 cd /home/aditya/bude_vla
-bash scripts/run_v37_camera_fixed.sh
+bash scripts/run_v38_broad_cache.sh
 ```
 
-There is no timeout. The script runs these stages in order:
+There is no timeout. The runner:
 
-1. Require at least 95% camera-only expert success over 100 random episodes.
-2. Record 4,000 fresh 224px attempts at the corrected 31.25 Hz policy rate.
-3. Require at least 3,200 successful demonstrations.
-4. Replay 200 persisted action sequences and require at least 95% success.
-5. Build one 6,000-frame, two-history cache sized for a 16 GB RAM laptop.
-6. Train from scratch for 25,000 steps and evaluate every 5,000 steps.
-7. Preserve the checkpoint with the best closed-loop success, then run a
-   150-position benchmark and render an 8-position diagnostic video.
+1. Rechecks the camera-only expert and persisted-action replay gates.
+2. Reuses the verified 3,784-episode v37 dataset.
+3. Builds 64,000 history-stacked rows with at least 12 phase-stratified rows
+   from every episode.
+4. Initializes from the v37 raw `model_state_dict`, never its lagging EMA.
+5. Trains for 100,000 microsteps with a lower continuation learning rate.
+6. Runs 30 native-chunk closed-loop episodes every 10,000 steps and preserves
+   the best checkpoint, including later checkpoints when scores tie.
+7. Runs a 150-position random benchmark and an 8-position video evaluation.
 
-The runner is restart-aware for completed recording/cache/training stages. It
-refuses to reuse a partial dataset or cache because silently mixing partial
-artifacts is more costly than failing early.
-
-Watch progress from another terminal:
+Watch it from another terminal:
 
 ```bash
 cd /home/aditya/bude_vla
 tail -F \
-  logs/pick_v37_visual_expert_bench.log \
-  logs/pick_v37_record.log \
-  logs/pick_v37_replay.log \
-  logs/pick_v37_cache.log \
-  logs/pick_v37_train.log \
-  logs/pick_v37_random_bench.log
+  logs/pick_v38_visual_expert_bench.log \
+  logs/pick_v38_replay.log \
+  logs/pick_v38_cache.log \
+  logs/pick_v38_train.log \
+  logs/pick_v38_random_bench.log
 ```
 
-The selected checkpoint path is written to
-`logs/pick_v37_selected_checkpoint.txt`. The final video is
-`demos/videos/eval_pick_v37_camera_fixed.mp4`.
+The selected checkpoint is written to
+`logs/pick_v38_selected_checkpoint.txt`; the video is
+`demos/videos/eval_pick_v38_broad_cache.mp4`.
+
+## Corrected V37 Result
+
+Paired diagnostics on seed 3710 established the inference contract:
+
+| Policy / execution | Success | Contact | Strict grasp |
+| --- | ---: | ---: | ---: |
+| v37 raw 25k, native chunk, 50 positions | 5/50 | 23/50 | 7/50 |
+| v37 raw 20k, native chunk, first 30 positions | 0/30 | 13/30 | 2/30 |
+| v37 raw 25k, horizon 8, first 20 positions | 0/20 | 2/20 | 1/20 |
+| v37 raw 25k, contact reflex, first 30 positions | 4/30 | 15/30 | 8/30 |
+
+The 20k-to-25k improvement shows optimization was still helping. The horizon-8
+collapse shows this model must execute the full chunk it was trained to emit.
+The simulator-only contact reflex improved grasp count but not completed place
+success, so it is diagnostic only and is not part of the deployable policy.
 
 ## What Was Actually Broken
 
@@ -111,7 +130,9 @@ Outputs:
 - Sixteen future actions per prediction.
 - One executed action every 16 MuJoCo substeps, matching the recorded
   31.25 Hz stream.
-- Closed-loop temporal ensembling replans every action during evaluation.
+- Native rollout executes all sixteen predicted actions before replanning.
+  Temporal ensembling is disabled because paired benchmarks showed it was
+  harmful for this checkpoint.
 
 The policy receives no episode-progress clock, cube pose, target-relative cube
 vector, simulator contact bit, or strict-grasp bit. This keeps the active input
@@ -137,29 +158,30 @@ These checks follow the official OpenVLA troubleshooting advice to replay
 demonstrations, verify the inference/data contract, avoid excessive idle
 actions, and ensure coverage of test variation:
 [OpenVLA troubleshooting](https://github.com/openvla/openvla#vla-performance-troubleshooting).
-The use of action chunks and temporal ensembling is also aligned with
+The use of action chunks is aligned with
 [LeRobot's ACT guidance](https://huggingface.co/docs/lerobot/act), while the
 repeated random-position coverage follows
 [LeRobot's SmolVLA data guidance](https://huggingface.co/docs/lerobot/smolvla).
 
 ## Memory And Storage
 
-The v37 cache is approximately 3.4 GiB:
+The v38 cache is approximately 36 GiB:
 
 ```text
-6000 frames * 224 * 224 * (2 histories * 6 RGB channels) * 1 byte
+64000 frames * 224 * 224 * (2 histories * 6 RGB channels) * 1 byte
 ```
 
 Training uses batch size 4, gradient accumulation 8, and one worker. The
-effective batch is 32 without loading a 14 GiB cache or several worker copies
-into RAM. The runner checks free disk and available RAM before expensive
-stages, sets a repository-local temporary directory, and does not retain eval
-frames unless video recording is explicitly enabled.
+effective batch is 32 while the 36 GiB cache remains memory-mapped instead of
+being copied into RAM. The runner checks free disk and available RAM before
+expensive stages, sets a repository-local temporary directory, and does not
+retain eval frames unless video recording is explicitly enabled.
 
 ## Repository Map
 
 ```text
-scripts/run_v37_camera_fixed.sh       Guarded end-to-end v37 pipeline
+scripts/run_v38_broad_cache.sh        Active broad-cache raw-weight continuation
+scripts/run_v37_camera_fixed.sh       Reproducible fresh v37 baseline pipeline
 scripts/benchmark_visual_servo_pick.py Camera-only perception/mechanics gate
 scripts/record_pick_episodes.py        Fresh demonstration recorder
 scripts/validate_dataset_replay.py     Persisted-action contract gate

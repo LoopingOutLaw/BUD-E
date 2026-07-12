@@ -58,7 +58,8 @@ MAX_STEPS = 4000
 SUBSTEPS_PER_FRAME = POLICY_CONTROL_SUBSTEPS
 
 
-def load_policy(ckpt_path: str, img_size: int, device: str):
+def load_policy(ckpt_path: str, img_size: int, device: str, *,
+                use_ema: bool = True):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = BUDEConfig()
 
@@ -91,7 +92,7 @@ def load_policy(ckpt_path: str, img_size: int, device: str):
     cfg.patch_size = 16
     policy = BUDEPolicy(cfg).to(device)
     ema_sd = ckpt.get("ema_state_dict")
-    if ema_sd is not None:
+    if use_ema and ema_sd is not None:
         policy.load_state_dict(ema_sd)
         weight_src = "EMA"
     else:
@@ -393,6 +394,8 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--raw-weights", action="store_true",
+                    help="Evaluate model_state_dict instead of EMA weights.")
     ap.add_argument("--num-episodes", type=int, default=20)
     ap.add_argument("--img-size", type=int, default=224)
     ap.add_argument("--video-size", type=int, default=224)
@@ -435,7 +438,8 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device={device}")
 
-    policy, action_lo, action_hi, cfg = load_policy(args.ckpt, args.img_size, device)
+    policy, action_lo, action_hi, cfg = load_policy(args.ckpt, args.img_size, device,
+                                                     use_ema=not args.raw_weights)
     if cfg.img_size != args.img_size:
         print(f" WARNING: --img-size {args.img_size} does not match checkpoint's "
               f"training resolution cfg.img_size={cfg.img_size}. Overriding to "

@@ -1,6 +1,6 @@
-# SO-101 Pick VLA: V37 Root-Cause Reset
+# SO-101 Pick VLA: V37 Reset and V38 Continuation
 
-Date: 2026-07-11
+Date: 2026-07-12
 
 This is the authoritative experiment note for the current pipeline. Commands
 for v26-v36 are intentionally not retained here because their camera, feature,
@@ -210,10 +210,57 @@ early / late BC:     4x through 0.25 / from 0.35
 EMA:                 0.999
 ```
 
-Every 5,000 steps, 12 closed-loop episodes run with deployment-style temporal
-ensembling. The checkpoint with highest success is copied to
-`pick_v37_camera_fixed_best.pt`; evaluation does not blindly assume the final
-loss checkpoint is best.
+The original runner evaluated 12 episodes every 5,000 steps with temporal
+ensembling and EMA weights. That evaluation mode was later proven incorrect for
+this checkpoint; all scores tied at zero, so the old strict-greater comparison
+left the 5,000-step file as `best.pt`.
+
+## V37 Evaluation Audit
+
+The completed dataset contains 3,784 replay-verified successful episodes. The
+first cache contained 6,000 rows but represented only 2,986 episodes (78.9%);
+798 randomized initial cube placements were absent.
+
+The original pipeline benchmark selected the 5,000-step EMA checkpoint and
+used temporal ensembling. Its 0/150 result was therefore not a valid measure of
+the final model. Controlled native-chunk tests gave:
+
+| Policy / execution | Success | Contact | Strict grasp |
+| --- | ---: | ---: | ---: |
+| raw 25k, native chunk, 50 positions | 5/50 | 23/50 | 7/50 |
+| raw 20k, native chunk, first 30 | 0/30 | 13/30 | 2/30 |
+| raw 25k, horizon 8, first 20 | 0/20 | 2/20 | 1/20 |
+| raw 25k plus simulator contact reflex, first 30 | 4/30 | 15/30 | 8/30 |
+
+Consequences:
+
+- v37 learned a real camera-conditioned policy; it is not a 0% checkpoint;
+- optimization was still improving between 20k and 25k;
+- EMA decay 0.999 lagged the useful raw weights;
+- replanning at horizon 1 or 8 broke the coherent 16-action trajectory;
+- contact-triggered closure alone did not improve end-to-end placement.
+
+## V38 Continuation Recipe
+
+V38 changes coverage and evaluation, not the deployable observation contract:
+
+```text
+source weights:       v37 final raw model_state_dict
+sampled cache:        64000 frames
+coverage floor:       12 phase-stratified rows from every episode
+training horizon:     100000 microsteps
+new-module LR:        2e-5 cosine schedule
+backbone LR:          2e-7
+EMA:                  disabled
+train seed:           3802
+eval:                 30 random episodes every 10000 steps
+execution:            native full 16-action chunks
+final benchmark:      150 random positions
+```
+
+The cache dry run produced exactly 64,000 unique rows with a minimum of 12,
+median of 17, and maximum of 28 rows per episode. The runner requires 70 GiB
+free before building the approximately 36 GiB memory-mapped cache.
 
 ## Post-Training Decision Protocol
 
@@ -246,7 +293,7 @@ Full no-time-limit pipeline:
 
 ```bash
 cd /home/aditya/bude_vla
-bash scripts/run_v37_camera_fixed.sh
+bash scripts/run_v38_broad_cache.sh
 ```
 
 Regression tests:

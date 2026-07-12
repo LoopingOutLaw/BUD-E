@@ -346,8 +346,7 @@ def run_closed_loop_eval(policy, cfg, action_lo, action_hi, device,
             action_hi=action_hi,
             n_history_frames=cfg.n_history_frames,
             state_dim=cfg.state_dim,
-            ensembling=True,
-            ensembling_k=0.25,
+            ensembling=False,
             arm_smooth_steps=POLICY_CONTROL_SUBSTEPS,
             arm_step_frac=1.0,
         )
@@ -390,6 +389,7 @@ def train(
     task_name: str = "policy",
     resume: str | None = None,
     init_from: str | None = None,
+    init_from_raw: bool = False,
     num_workers: int = 0,
     use_dinov2: bool = False,
     dinov2_finetune_blocks: int = 4,
@@ -400,6 +400,7 @@ def train(
     eval_max_steps: int = 300,
     eval_max_tries: int = 1,
     eval_seed: int = 123,
+    train_seed: int = 0,
     ema_decay: float = 0.999,
     use_bc_head: bool = True,
     bc_loss_weight: float = 1.0,
@@ -431,6 +432,11 @@ def train(
             "Must specify --data-root. Default reach+push data is not "
             "appropriate for pick-and-place training."
         )
+    torch.manual_seed(train_seed)
+    np.random.seed(train_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(train_seed)
+
     ckpt_dir = Path(ckpt_dir) / task_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     video_dir = Path(video_dir)
@@ -466,6 +472,8 @@ def train(
 
     if init_from is not None and resume is not None:
         raise ValueError("Use either --init-from for weight initialization or --resume for exact continuation, not both.")
+    if init_from_raw and init_from is None:
+        raise ValueError("--init-from-raw requires --init-from.")
 
     if init_from is not None:
         init_ckpt = torch.load(init_from, map_location=device, weights_only=False)
@@ -493,7 +501,11 @@ def train(
                 "Refusing --init-from: architecture/data flags do not match.\n  "
                 + "\n  ".join(_mismatches)
             )
-        init_sd = init_ckpt.get("ema_state_dict") or init_ckpt["model_state_dict"]
+        if init_from_raw:
+            init_sd = init_ckpt["model_state_dict"]
+            print("  using raw model_state_dict for initialization")
+        else:
+            init_sd = init_ckpt.get("ema_state_dict") or init_ckpt["model_state_dict"]
         init_sd = adapt_state_dict_for_state_dim(init_sd, saved_cfg.get("state_dim"), cfg.state_dim)
         if allow_action_head_mismatch:
             current_sd = policy.state_dict()
@@ -793,6 +805,8 @@ def train(
                     "action_dim": cfg.action_dim,
                     "state_dim": cfg.state_dim,
                     "ema_decay": ema_decay if ema_enabled else None,
+                    "train_seed": train_seed,
+                    "eval_seed": eval_seed,
                     "use_bc_head": cfg.use_bc_head,
                     "bc_loss_weight": bc_loss_weight if cfg.use_bc_head else None,
                     "flow_loss_weight": flow_loss_weight,
@@ -837,7 +851,7 @@ def train(
             eval_history.append((step, eval_rate))
             print(f"  [eval{'/ema' if ema_enabled else ''}] step {step:6d} | closed-loop success "
                   f"{eval_n_success}/{eval_n_total} ({eval_rate*100:.0f}%)")
-            if eval_rate > best_eval_rate:
+            if eval_rate >= best_eval_rate:
                 best_eval_rate = eval_rate
                 source = ckpt_dir / f"{task_name}_step_{step:06d}.pt"
                 best = ckpt_dir / f"{task_name}_best.pt"
@@ -889,6 +903,8 @@ def train(
             "action_dim": cfg.action_dim,
             "state_dim": cfg.state_dim,
             "ema_decay": ema_decay if ema_enabled else None,
+            "train_seed": train_seed,
+            "eval_seed": eval_seed,
             "use_bc_head": cfg.use_bc_head,
             "bc_loss_weight": bc_loss_weight if cfg.use_bc_head else None,
             "flow_loss_weight": flow_loss_weight,
@@ -1000,6 +1016,8 @@ if __name__ == "__main__":
                         help="Allow --init-from when action_dim/action heads changed; transfers shared trunk weights and reinitializes mismatched action heads.")
     parser.add_argument("--init-from", default=None,
                         help="Initialize model weights from a checkpoint without loading optimizer/scheduler state. Useful for adding the BC head to an existing flow checkpoint.")
+    parser.add_argument("--init-from-raw", action="store_true",
+                        help="With --init-from, initialize from model_state_dict instead of EMA weights.")
     parser.add_argument("--resume", default=None,
                         help="Path to a checkpoint to resume training from. "
                              "Restores model, optimizer, step counter, and "
@@ -1028,12 +1046,11 @@ if __name__ == "__main__":
     parser.add_argument("--eval-max-tries", type=int, default=1,
                         help="Retries per eval episode. 1 = single-shot.")
     parser.add_argument("--ema-decay", type=float, default=0.999,
-                        help="EMA decay for a shadow copy of the weights "
-                             "(0 disables). EMA weights are used for "
-                             "closed-loop --eval-every checks and are saved "
-                             "alongside raw weights in every checkpoint as "
-                             "ema_state_dict. Prefer loading ema_state_dict "
-                             "over model_state_dict at eval/deploy time.")
+                        help="EMA decay for a shadow copy of the weights (0 disables). "
+                             "EMA weights are used for closed-loop eval when enabled; "
+                             "benchmark raw and EMA explicitly before deployment.")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Training model and data-order seed.")
     parser.add_argument("--eval-seed", type=int, default=123,
                         help="Fixed seed for eval cube positions so success "
                              "curves are comparable across checkpoints.")
@@ -1059,6 +1076,7 @@ if __name__ == "__main__":
         augment=args.augment,
         resume=args.resume,
         init_from=args.init_from,
+        init_from_raw=args.init_from_raw,
         task_name=args.task,
         num_workers=args.num_workers,
         use_dinov2=args.use_dinov2,
@@ -1070,6 +1088,7 @@ if __name__ == "__main__":
         eval_max_steps=args.eval_max_steps,
         eval_max_tries=args.eval_max_tries,
         eval_seed=args.eval_seed,
+        train_seed=args.seed,
         ema_decay=args.ema_decay,
         use_bc_head=not args.no_bc_head,
         bc_loss_weight=args.bc_loss_weight,
