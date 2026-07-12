@@ -262,6 +262,57 @@ The cache dry run produced exactly 64,000 unique rows with a minimum of 12,
 median of 17, and maximum of 28 rows per episode. The runner requires 70 GiB
 free before building the approximately 36 GiB memory-mapped cache.
 
+## V38 Completed Result and V39 Diagnosis
+
+V38 training-time evaluation peaked at 5/30 on both 70k and 90k, then declined
+to 3/30 at 100k. The selected raw 90k checkpoint produced 21/150 success,
+64/150 contact, and 36/150 strict grasp on seed 3805. The separate fixed eight
+positions produced 0/8, so that video was not representative of global success.
+
+Spatial bins from the 150-position benchmark:
+
+| Cube Y | Episodes | Contact | Grasp | Success |
+| --- | ---: | ---: | ---: | ---: |
+| -0.03 to 0.00 | 53 | 13% | 2% | 0% |
+| 0.00 to 0.03 | 40 | 45% | 25% | 20% |
+| 0.03 to 0.06 | 57 | 68% | 44% | 23% |
+
+The failure is a compressed visual-to-action slope, not missing data. For a
+cube at X=0.28 moved across the full Y range:
+
+```text
+expert shoulder-pan span: 0.305 rad
+v37 final span:           0.024 rad
+v38 70k span:             0.080 rad
+v38 90k span:             0.072 rad
+v38 100k span:            0.073 rad
+```
+
+The 64k cache contains 18,323 early-phase rows with shoulder-pan slope -4.13
+rad per meter of cube Y and correlation -0.989. The model has enough balanced
+labels but its shared loss underweights this deployment-critical dimension.
+The sensitivity improvement peaked and regressed before 100k, ruling out a
+five-million-step continuation on the unchanged objective.
+
+V39 initializes from v38 best raw weights and changes only optimization:
+
+```text
+training horizon:          60000 microsteps
+new-module LR:             1e-5
+backbone LR:               1e-7
+shoulder-pan loss weight:  10x
+gripper loss weight:       5x
+BC loss weight:            8.0
+flow loss weight:          0.02
+EMA:                       disabled
+eval:                      40 positions every 5000 steps
+acceptance gate:           shoulder-pan span >= 0.18 rad
+```
+
+The 0.18-rad gate is deliberately below the 0.305-rad expert reference but 2.5x
+higher than v38. A checkpoint that fails this gate is not allowed to spend time
+on the 150-position final benchmark.
+
 ## Post-Training Decision Protocol
 
 Do not decide from training loss or one video. Use the 150-position random
@@ -293,7 +344,7 @@ Full no-time-limit pipeline:
 
 ```bash
 cd /home/aditya/bude_vla
-bash scripts/run_v38_broad_cache.sh
+bash scripts/run_v39_shoulder_precision.sh
 ```
 
 Regression tests:
