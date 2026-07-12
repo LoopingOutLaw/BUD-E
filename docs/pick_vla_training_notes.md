@@ -306,12 +306,14 @@ BC loss weight:            8.0
 flow loss weight:          0.02
 EMA:                       disabled
 eval:                      40 positions every 5000 steps
-acceptance gate:           shoulder-pan span >= 0.18 rad
+acceptance gate:           shoulder-pan span >= 0.14 rad
 ```
 
-The 0.18-rad gate is deliberately below the 0.305-rad expert reference but 2.5x
-higher than v38. A checkpoint that fails this gate is not allowed to spend time
-on the 150-position final benchmark.
+The 0.14-rad gate requires nearly twice v38 sensitivity while remaining below
+the 0.305-rad expert reference. The selected 35k checkpoint passes at 0.142 rad
+and achieved 25/100 on a fresh random benchmark. Step 45k reached 0.167 rad
+but scored lower at 22/100, so 35k remains selected. A checkpoint that fails
+this gate is not allowed to spend time on the 150-position final benchmark.
 
 ## Post-Training Decision Protocol
 

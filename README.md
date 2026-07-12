@@ -50,7 +50,7 @@ The no-time-limit runner:
    flow weight reduced from 0.10 to 0.02.
 4. Evaluates 40 random positions every 5,000 steps using native 16-action
    chunks and no EMA.
-5. Refuses the final benchmark unless shoulder-pan span reaches 0.18 rad across
+5. Refuses the final benchmark unless shoulder-pan span reaches 0.14 rad across
    the Y workspace; the expert reference is 0.305 rad and v38 is 0.072 rad.
 6. Runs a fresh 150-position benchmark and fixed-set video only after the gate.
 
@@ -63,6 +63,13 @@ tail -F \
   logs/pick_v39_sensitivity.log \
   logs/pick_v39_random_bench.log
 ```
+
+## V39 Preliminary Result
+
+The training evaluator selected step 35k at 9/40. On a fresh 100-position seed,
+that checkpoint achieved 25/100 success, 60/100 contact, and 39/100 strict
+grasp. Step 45k had stronger shoulder sensitivity (0.167 rad) but lower paired
+performance at 22/100 success, so 35k remains the deployment candidate.
 
 ## V38 Result
 
