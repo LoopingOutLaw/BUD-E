@@ -200,7 +200,7 @@ stage 6/8 "Shoulder-pan visual sensitivity gate"
   --cube 0.28,0.00 \
   --cube 0.28,0.03 \
   --cube 0.28,0.06 \
-  --min-shoulder-span 0.18 2>&1 | tee "$LOG_DIR/pick_v39_sensitivity.log"
+  --min-shoulder-span 0.14 2>&1 | tee "$LOG_DIR/pick_v39_sensitivity.log"
 
 stage 7/8 "150-position learned-policy benchmark"
 "$PYTHON" scripts/benchmark_random_pick.py \
