@@ -16,7 +16,7 @@ import mujoco
 import numpy as np
 import torch
 
-from bude_vla.action_space import end_effector_position_for_qpos
+from bude_vla.action_space import joint_action_to_ee_abs
 from bude_vla.data.action_normalization import denormalize_actions
 from bude_vla.data.lerobot_v3 import _domain_from_instruction, _tokenize_instruction
 from bude_vla.envs.so101_mjx import (
@@ -27,43 +27,32 @@ from bude_vla.envs.so101_mjx import (
     CUBE_QPOS_START,
     CUBE_QPOS_END,
     CUBE_REST_Z,
+    EXPERT_CONTROL_SUBSTEPS,
+    POLICY_RECORD_STRIDE,
     load_arm_model,
     is_grasping_from_contacts,
     build_pick_proprio,
 )
-from bude_vla.models.policy import BUDEConfig, BUDEPolicy
+from bude_vla.models.policy import BUDEConfig, BUDEPolicy, apply_saved_config
 from bude_vla.perception import detect_red_centroid
 from bude_vla.scripted_pick_and_place import ScriptedPickAndPlace
 
 INSTRUCTION = "pick up the red cube and place it in the blue target zone"
 
 
-def load_policy(path: str, device: str):
+def load_policy(path: str, device: str, *, use_ema: bool = True):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     saved = ckpt.get("config", {})
     cfg = BUDEConfig()
-    cfg.use_dinov2 = saved.get("use_dinov2", False)
-    cfg.use_minilm = saved.get("use_minilm", False)
-    cfg.dinov2_finetune_blocks = saved.get("dinov2_finetune_blocks", 4)
-    cfg.n_history_frames = saved.get("n_history_frames", 1)
-    cfg.chunk_size = saved.get("chunk_size", 4)
-    cfg.img_size = saved.get("img_size", 224)
-    cfg.action_dim = saved.get("action_dim", 6)
-    cfg.state_dim = saved.get("state_dim", 6)
-    cfg.use_bc_head = saved.get("use_bc_head", False)
-    cfg.use_visual_action_cond = saved.get("use_visual_action_cond", False)
-    cfg.use_context_action_head = saved.get("use_context_action_head", False)
-    cfg.use_perception = saved.get("use_perception", False)
-    cfg.use_perception_action_cond = saved.get("use_perception_action_cond", False)
-    cfg.use_direct_proprio_action_cond = saved.get("use_direct_proprio_action_cond", False)
-    cfg.perception_dim = saved.get("perception_dim", 3)
-    cfg.input_feature_norm = saved.get("input_feature_norm", "layernorm")
-    cfg.action_space = saved.get("action_space", "joint_abs")
-    cfg.ee_delta_scale = saved.get("ee_delta_scale", 0.05) or 0.05
+    cfg.chunk_size = 4
+    apply_saved_config(cfg, saved)
     cfg.patch_size = 16
 
     policy = BUDEPolicy(cfg).to(device)
-    state_dict = ckpt.get("ema_state_dict") or ckpt["model_state_dict"]
+    state_dict = (
+        ckpt.get("ema_state_dict") or ckpt["model_state_dict"]
+        if use_ema else ckpt["model_state_dict"]
+    )
     policy.load_state_dict(state_dict)
     policy.eval()
 
@@ -72,6 +61,27 @@ def load_policy(path: str, device: str):
     lo = np.asarray(lo, dtype=np.float32) if lo is not None else None
     hi = np.asarray(hi, dtype=np.float32) if hi is not None else None
     return policy, cfg, lo, hi, ckpt
+
+
+def expert_initial_chunk(model, data, cube_xy, chunk_size: int) -> np.ndarray:
+    """Generate the same policy-rate expert controls used by the recorder."""
+    expert = ScriptedPickAndPlace(
+        model, data, np.asarray(cube_xy, dtype=np.float64)
+    )
+    fk_data = mujoco.MjData(model)
+    actions = []
+    max_expert_steps = (chunk_size - 1) * POLICY_RECORD_STRIDE + 1
+    for expert_step in range(max_expert_steps):
+        ctrl, _arm_q, _done, _info = expert.step(model, data)
+        if expert_step % POLICY_RECORD_STRIDE == 0:
+            joint_action = np.concatenate([ctrl[:5], [ctrl[5]]])
+            actions.append(joint_action_to_ee_abs(
+                model, fk_data, joint_action
+            ))
+        data.ctrl[:] = ctrl
+        for _ in range(EXPERT_CONTROL_SUBSTEPS):
+            mujoco.mj_step(model, data)
+    return np.asarray(actions, dtype=np.float32)
 
 
 def reset_arm(model, data):
@@ -136,22 +146,29 @@ def main() -> None:
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--cube", action="append", default=[],
                     help="Cube xy as x,y. May be repeated. Defaults to three positions.")
-    ap.add_argument("--raw", action="store_true", help="Print normalized actions instead of denormalized controls.")
+    ap.add_argument("--raw", "--normalized-actions", dest="normalized_actions",
+                    action="store_true",
+                    help="Print normalized actions instead of denormalized controls.")
+    ap.add_argument("--raw-weights", action="store_true",
+                    help="Evaluate model_state_dict instead of EMA weights.")
     ap.add_argument("--min-shoulder-span", type=float, default=0.0,
                     help="Exit nonzero unless denormalized shoulder-pan span reaches this value.")
     ap.add_argument("--min-shoulder-lift-span", type=float, default=0.0,
                     help="Exit nonzero unless denormalized shoulder-lift span reaches this value.")
     ap.add_argument("--max-task-space-p95-mm", type=float, default=0.0,
-                    help="Exit nonzero if first-action TCP p95 error exceeds this value.")
+                    help="Exit nonzero if chunk-endpoint TCP p95 error exceeds this value.")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    policy, cfg, lo, hi, ckpt = load_policy(args.ckpt, device)
+    policy, cfg, lo, hi, ckpt = load_policy(
+        args.ckpt, device, use_ema=not args.raw_weights
+    )
     print(
         f"checkpoint step={ckpt.get('step')} img={cfg.img_size} chunk={cfg.chunk_size} "
         f"history={cfg.n_history_frames} state={cfg.state_dim} "
         f"bc={cfg.use_bc_head} context={cfg.use_context_action_head} "
-        f"perception={cfg.use_perception}"
+        f"perception={cfg.use_perception} "
+        f"weights={'raw' if args.raw_weights else 'ema'}"
     )
 
     model = load_arm_model()
@@ -161,9 +178,10 @@ def main() -> None:
     wrist_cam = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_cam")
     text_ids = _tokenize_instruction(INSTRUCTION)
 
-    rows = []
-    task_errors_m = []
-    fk_data = mujoco.MjData(model)
+    first_rows = []
+    endpoint_rows = []
+    endpoint_errors_m = []
+    cube_rows = []
     with torch.no_grad():
         for cx, cy in parse_xy(args.cube):
             mujoco.mj_resetData(model, data)
@@ -180,53 +198,66 @@ def main() -> None:
             proprio = build_proprio(model, data, cfg.state_dim)
             batch, perception = build_batch(image, proprio, text_ids, cfg, device)
             chunk_norm = policy.sample(batch)[0].detach().cpu().numpy()
-            first = chunk_norm[0] if args.raw or lo is None else denormalize_actions(chunk_norm[:1], lo, hi)[0]
-            rows.append(first)
-            if not args.raw and lo is not None:
-                expert = ScriptedPickAndPlace(
-                    model, data, np.asarray([cx, cy], dtype=np.float64)
+            chunk = (
+                chunk_norm if args.normalized_actions or lo is None
+                else denormalize_actions(chunk_norm, lo, hi)
+            )
+            first = chunk[0]
+            endpoint = chunk[-1]
+            first_rows.append(first)
+            endpoint_rows.append(endpoint)
+            cube_rows.append([cx, cy])
+            expert_endpoint = None
+            if not args.normalized_actions and lo is not None:
+                expert_chunk = expert_initial_chunk(
+                    model, data, (cx, cy), cfg.chunk_size
                 )
-                expert_ctrl, _arm_q, _done, _info = expert.step(model, data)
-                expert_xyz = end_effector_position_for_qpos(
-                    model, fk_data, expert_ctrl[:5], expert_ctrl[5]
-                )
-                if cfg.action_space == "ee_abs":
-                    predicted_xyz = np.asarray(first[:3], dtype=np.float64)
-                elif cfg.action_space == "ee_delta":
-                    site_id = mujoco.mj_name2id(
-                        model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe"
-                    )
-                    predicted_xyz = data.site_xpos[site_id] + first[:3]
-                else:
-                    predicted_xyz = end_effector_position_for_qpos(
-                        model, fk_data, first[:5], first[5]
-                    )
-                task_errors_m.append(
-                    float(np.linalg.norm(predicted_xyz - expert_xyz))
-                )
+                expert_endpoint = expert_chunk[-1]
+                endpoint_errors_m.append(float(np.linalg.norm(
+                    endpoint[:3] - expert_endpoint[:3]
+                )))
             print(
                 f"cube=({cx:+.3f},{cy:+.3f}) perception=[{perception[0]:+.3f},{perception[1]:+.3f},{perception[2]:.0f}] "
-                f"first_action={np.array2string(first, precision=4, suppress_small=False)}"
+                f"first={np.array2string(first, precision=4, suppress_small=False)} "
+                f"endpoint={np.array2string(endpoint, precision=4, suppress_small=False)}"
             )
+            if expert_endpoint is not None:
+                print(
+                    "  expert_endpoint="
+                    f"{np.array2string(expert_endpoint, precision=4, suppress_small=False)}"
+                )
 
-    if len(rows) >= 2:
-        rows = np.stack(rows, axis=0)
-        span = rows.max(axis=0) - rows.min(axis=0)
-        print(f"action_span={np.array2string(span, precision=5)} max_span={float(span.max()):.6f}")
-        if float(span.max()) < 0.01:
-            print("WARNING: first actions are still nearly identical across cube positions.")
-        shoulder_span = float(span[0])
-        shoulder_lift_span = float(span[1]) if len(span) > 1 else 0.0
+    if len(first_rows) >= 2:
+        first_rows = np.stack(first_rows, axis=0)
+        endpoint_rows = np.stack(endpoint_rows, axis=0)
+        cube_rows = np.asarray(cube_rows, dtype=np.float64)
+        first_span = np.ptp(first_rows, axis=0)
+        endpoint_span = np.ptp(endpoint_rows, axis=0)
+        print(f"first_action_span={np.array2string(first_span, precision=5)}")
+        print(f"chunk_endpoint_span={np.array2string(endpoint_span, precision=5)}")
+        if cfg.action_space == "ee_abs" and not args.normalized_actions:
+            for name, cube_dim, action_dim in (("x", 0, 0), ("y", 1, 1)):
+                slope, _intercept = np.polyfit(
+                    cube_rows[:, cube_dim], endpoint_rows[:, action_dim], 1
+                )
+                corr = np.corrcoef(
+                    cube_rows[:, cube_dim], endpoint_rows[:, action_dim]
+                )[0, 1]
+                print(
+                    f"chunk_endpoint_{name} slope={slope:.4f} corr={corr:.4f}"
+                )
+        shoulder_span = float(first_span[0])
+        shoulder_lift_span = float(first_span[1]) if len(first_span) > 1 else 0.0
         task_p95_mm = (
-            float(np.percentile(task_errors_m, 95) * 1000.0)
-            if task_errors_m else float("nan")
+            float(np.percentile(endpoint_errors_m, 95) * 1000.0)
+            if endpoint_errors_m else float("nan")
         )
-        if task_errors_m:
+        if endpoint_errors_m:
             print(
-                "task_space_error_mm "
-                f"median={np.median(task_errors_m) * 1000.0:.3f} "
+                "chunk_endpoint_error_mm "
+                f"median={np.median(endpoint_errors_m) * 1000.0:.3f} "
                 f"p95={task_p95_mm:.3f} "
-                f"max={np.max(task_errors_m) * 1000.0:.3f}"
+                f"max={np.max(endpoint_errors_m) * 1000.0:.3f}"
             )
         renderer.close()
         if args.min_shoulder_span > 0.0 and shoulder_span < args.min_shoulder_span:

@@ -49,14 +49,18 @@ def reset_cube(data, cx: float, cy: float) -> None:
     mujoco.mj_forward(data.model, data)
 
 
-def run_one(model, data, cube_xy: tuple[float, float], max_steps: int) -> dict:
+def run_one(model, data, cube_xy: tuple[float, float], max_steps: int, *,
+            expert_kwargs: dict | None = None,
+            rng: np.random.Generator | None = None) -> dict:
     mujoco.mj_resetData(model, data)
     reset_arm(model, data)
     reset_cube(data, cube_xy[0], cube_xy[1])
     for _ in range(50):
         mujoco.mj_step(model, data)
 
-    expert = ScriptedPickAndPlace(model, data, cube_xy, max_grasp_retries=1)
+    expert = ScriptedPickAndPlace(
+        model, data, cube_xy, rng=rng, **(expert_kwargs or {})
+    )
     cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
     touch_frames = 0
     grasp_frames = 0
@@ -102,6 +106,16 @@ def main() -> None:
                     default=",".join(str(v) for v in PICK_WORKSPACE_X_RANGE))
     ap.add_argument("--cube-y-range",
                     default=",".join(str(v) for v in PICK_WORKSPACE_Y_RANGE))
+    ap.add_argument("--recovery-jitter-xy", type=float, default=0.0)
+    ap.add_argument("--recovery-jitter-z", type=float, default=0.0)
+    ap.add_argument("--recovery-jitter-prob", type=float, default=0.0)
+    ap.add_argument("--max-grasp-retries", type=int, default=1)
+    ap.add_argument("--nudge-recovery-prob", type=float, default=0.0)
+    ap.add_argument("--nudge-recovery-xy", type=float, default=0.0)
+    ap.add_argument("--nudge-recovery-z", type=float, default=0.0)
+    ap.add_argument("--retry-miss-xy", type=float, default=0.0)
+    ap.add_argument("--retry-miss-prob", type=float, default=0.0)
+    ap.add_argument("--min-success-rate", type=float, default=0.0)
     args = ap.parse_args()
 
     model = load_arm_model()
@@ -110,6 +124,17 @@ def main() -> None:
     fixed_positions = parse_cube_positions(args.cube_positions)
     x_range = tuple(float(v) for v in args.cube_x_range.split(","))
     y_range = tuple(float(v) for v in args.cube_y_range.split(","))
+    expert_kwargs = {
+        "recovery_jitter_xy": args.recovery_jitter_xy,
+        "recovery_jitter_z": args.recovery_jitter_z,
+        "recovery_jitter_prob": args.recovery_jitter_prob,
+        "max_grasp_retries": args.max_grasp_retries,
+        "nudge_recovery_prob": args.nudge_recovery_prob,
+        "nudge_recovery_xy": args.nudge_recovery_xy,
+        "nudge_recovery_z": args.nudge_recovery_z,
+        "retry_miss_xy": args.retry_miss_xy,
+        "retry_miss_prob": args.retry_miss_prob,
+    }
 
     results = []
     for ep in range(args.num_episodes):
@@ -117,7 +142,10 @@ def main() -> None:
             cube_xy = fixed_positions[ep % len(fixed_positions)]
         else:
             cube_xy = (float(rng.uniform(*x_range)), float(rng.uniform(*y_range)))
-        result = run_one(model, data, cube_xy, args.max_steps)
+        result = run_one(
+            model, data, cube_xy, args.max_steps,
+            expert_kwargs=expert_kwargs, rng=rng,
+        )
         results.append(result)
         print(
             f"ep {ep:03d} cube=({cube_xy[0]:.3f},{cube_xy[1]:.3f}) "
@@ -137,6 +165,12 @@ def main() -> None:
     print(f"strict_grasp episodes: {grasped}/{n} ({grasped / n:.3f})")
     print(f"any_contact frames: {sum(int(r['touch_frames']) for r in results)}")
     print(f"strict_grasp frames: {sum(int(r['grasp_frames']) for r in results)}")
+    rate = successes / n if n else 0.0
+    if rate < args.min_success_rate:
+        raise SystemExit(
+            f"FAIL: strict expert success {rate:.3f} < required "
+            f"{args.min_success_rate:.3f}"
+        )
 
 
 if __name__ == "__main__":

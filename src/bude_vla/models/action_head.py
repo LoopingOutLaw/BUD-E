@@ -173,7 +173,8 @@ class ContextActionHead(nn.Module):
     def __init__(self, action_dim: int = 6, chunk_size: int = 8,
                  d: int = 256, hidden_dim: int = 512,
                  depth: int = 2, heads: int = 8,
-                 cond_dim: int = 0):
+                 cond_dim: int = 0,
+                 raw_cond_dim: int = 0):
         super().__init__()
         self.action_dim = action_dim
         self.chunk_size = chunk_size
@@ -210,8 +211,23 @@ class ContextActionHead(nn.Module):
             )
             if cond_dim > 0 else None
         )
+        self.raw_geometry_residual = (
+            nn.Sequential(
+                nn.Linear(raw_cond_dim, hidden_dim // 2),
+                nn.SiLU(),
+                nn.Linear(hidden_dim // 2, chunk_size * action_dim),
+            )
+            if raw_cond_dim > 0 else None
+        )
+        if self.raw_geometry_residual is not None:
+            # Preserve an initialized checkpoint's behavior exactly. Training
+            # then learns only the task-space correction that the contextual
+            # decoder failed to retain from compact physical inputs.
+            nn.init.zeros_(self.raw_geometry_residual[-1].weight)
+            nn.init.zeros_(self.raw_geometry_residual[-1].bias)
 
-    def forward(self, tokens: torch.Tensor, cond: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, cond: torch.Tensor | None = None,
+                raw_cond: torch.Tensor | None = None) -> torch.Tensor:
         b = tokens.shape[0]
         q = self.queries.expand(b, -1, -1)
         if cond is not None and self.query_cond is not None:
@@ -221,6 +237,11 @@ class ContextActionHead(nn.Module):
         if cond is not None and self.cond_residual is not None:
             residual = self.cond_residual(cond).view(b, self.chunk_size, self.action_dim)
             logits = logits + residual
+        if raw_cond is not None and self.raw_geometry_residual is not None:
+            raw_residual = self.raw_geometry_residual(raw_cond).view(
+                b, self.chunk_size, self.action_dim
+            )
+            logits = logits + raw_residual
         return torch.tanh(logits)
 
 

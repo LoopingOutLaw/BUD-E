@@ -563,6 +563,116 @@ Earlier v37-v42 percentages used the XY-arrival predicate and are retained as
 historical diagnostics only. They must not be presented as strict pick-and-drop
 success until rerun under this corrected contract.
 
+## V43 Strict Geometry: Fresh Data, Endpoint Fidelity, and Honest Selection
+
+V43 starts from a corrected broad baseline, not the eight-position video set.
+The selected v42 raw checkpoint scored:
+
+```text
+strict success: 81/200 (40.5%)
+any contact:    132/200 (66.0%)
+strict grasp:   108/200 (54.0%)
+```
+
+Its one-try X-bin success rates were 38.8%, 70.9%, 37.8%, and 11.8%; Y-bin
+rates were 24.4%, 41.7%, 60.0%, and 29.8%. This confirms a broad spatial
+regression, especially far X and negative Y, rather than a general inability to
+perform the task.
+
+The previous sensitivity diagnostic inspected only action zero of a 16-action
+chunk. That was the wrong contract for full-chunk execution. The corrected
+diagnostic compares the last action in the predicted initial chunk to the
+recorded expert chunk endpoint. Across a 4x4 workspace grid:
+
+| Initial chunk geometry | Expert | V42 raw |
+| --- | ---: | ---: |
+| X endpoint slope | 1.021 | 0.799 |
+| Y endpoint slope | 1.004 | 0.401 |
+| X endpoint span | 121.4 mm | 98.3 mm |
+| Y endpoint span | 90.6 mm | 74.1 mm |
+| Endpoint p95 error | reference | 47.7 mm |
+
+This explains why v42 often moves in the correct direction but stops outside
+grasp tolerance. The old first-action gates could pass while the deployed
+chunk still saturated before reaching workspace edges.
+
+### Demonstration correction
+
+The scripted CLOSE phase previously recomputed its Cartesian target from the
+live cube at every control step. Because the SO-101 gripper has one moving jaw,
+initial contact could move the cube; the arm then followed that motion and
+dragged the object laterally instead of holding the TCP fixed while closing.
+This generated the visible sweep/rotation learned by prior policies.
+
+CLOSE now captures the current cube pose once and holds that world-space
+anchor. A direct 100-position benchmark with the exact recording jitter,
+nudge, and retry probabilities achieved 100/100 strict released-and-settled
+success. A 20-attempt policy-rate recording pilot wrote 19 strict successes;
+the one rejected episode was a high-rate expert success that failed exact
+31.25 Hz replay, which is precisely what the recorder gate is intended to
+remove.
+
+Old v37/v41 demonstration data is intentionally excluded from v43. Fine-tuning
+longer on trajectories containing the cube-chasing behavior would reinforce,
+not remove, the observed sweep.
+
+### Decoder and training correction
+
+V43 keeps camera-only deployment semantics. The learned policy receives dual
+RGB, the language command, and measured six-joint proprioception. Its compact
+geometry residual receives `[joint_state, RGB_red_centroid]`; the centroid is
+computed from camera pixels and is available on a real camera. MuJoCo cube
+coordinates remain teacher/metric-only.
+
+The coordinated changes are:
+
+1. A zero-initialized raw-geometry MLP adds a residual directly to each context
+   decoder action logit. Zero initialization preserves transferred behavior,
+   while the direct path cannot lose location through token compression.
+2. Every demonstration contributes exact local frames `0,1,2,4,8,16` to the
+   cache, matching reset-time padded history seen at deployment.
+3. Deterministic action regression uses L1, with linearly increasing weight
+   from 1x to 4x across the chunk, so the endpoint is trained explicitly.
+4. The context decoder is reinitialized and trained at `1e-4`; the retained
+   non-DINO trunk uses `2e-5`, and DINOv2 uses `1e-7`.
+5. Flow loss is zero, so the unused flow head is not executed or optimized.
+   The deployed deterministic decoder is the surface being trained.
+6. EMA is disabled because v42's raw weights were the measured winner. Strict
+   raw-weight 8x8 grid evaluation therefore selects the same weights later
+   benchmark tools deploy.
+7. Only three recent step checkpoints are retained; `best.pt` and `final.pt`
+   are never pruned.
+
+This remains an action-chunking VLA design. LeRobot recommends ACT as a
+lightweight precise-manipulation baseline, and OpenVLA-OFT reports gains from
+parallel continuous action chunks with L1 regression. V43 adopts those
+applicable ideas without importing a model that exceeds the RTX 4060's 8 GiB
+VRAM budget.
+
+### Pipeline and acceptance
+
+`scripts/run_v43_strict_geometry.sh` has no timeout. It performs, in order:
+
+1. 100-position strict expert gate;
+2. 5,000 fresh recording attempts with policy-rate replay rejection;
+3. sampled replay gates before and after `ee_abs` conversion;
+4. 52k dual-camera cache with exact reset anchors;
+5. 220k training steps with strict 8x8 checkpoint evaluation;
+6. full-chunk geometry diagnostics and five deployment-mode comparisons;
+7. independent 200-position one-try and two-try benchmarks;
+8. a strict release-and-settle diagnostic video.
+
+The acceptance gate is at least 80% over 200 fresh random positions with at
+most one autonomous same-scene retry. The one-try rate is always reported
+separately. A retry homes only the arm, preserves the physically displaced
+cube, clears action/history state, and reobserves the scene from RGB.
+
+Obsolete v37-v41 checkpoints/data, both old 6k/64k caches, temporary smoke
+artifacts, and redundant v42 step snapshots were removed after verifying the
+retained v42 `best.pt` hash matched step 155k. Free disk increased from 55 GiB
+to 122 GiB; v42 `best.pt` and `final.pt` remain as the only initialization
+artifacts.
+
 ## Post-Training Decision Protocol
 
 Do not decide from training loss or one video. Use the 200-position random
@@ -594,7 +704,7 @@ Full no-time-limit pipeline:
 
 ```bash
 cd /home/aditya/bude_vla
-bash scripts/run_v42_affine_geometry.sh
+bash scripts/run_v43_strict_geometry.sh
 ```
 
 Regression tests:
@@ -605,18 +715,21 @@ MUJOCO_GL=egl PYTHONPATH=src \
   /home/aditya/venv-bude/bin/python -m unittest discover -s tests -v
 ```
 
-Standalone camera-only gate:
+Standalone corrected scripted-expert gate:
 
 ```bash
 cd /home/aditya/bude_vla
 MUJOCO_GL=egl PYTHONPATH=src \
-  /home/aditya/venv-bude/bin/python scripts/benchmark_visual_servo_pick.py \
-  --num-episodes 100 --min-success-rate 0.95 --seed 777
+  /home/aditya/venv-bude/bin/python scripts/benchmark_scripted_pick.py \
+  --num-episodes 100 --max-steps 2200 --max-grasp-retries 1 \
+  --min-success-rate 0.98 --seed 4301
 ```
 
 ## Primary References
 
 - [OpenVLA performance troubleshooting](https://github.com/openvla/openvla#vla-performance-troubleshooting)
+- [OpenVLA-OFT continuous action chunking](https://openvla-oft.github.io/)
+- [ALOHA ACT action chunking](https://tonyzhaozh.github.io/aloha/)
 - [LeRobot ACT documentation](https://huggingface.co/docs/lerobot/act)
 - [LeRobot SmolVLA documentation](https://huggingface.co/docs/lerobot/smolvla)
 - [Octo generalist robot policy](https://octo-models.github.io/)

@@ -39,7 +39,7 @@ from typing import Optional
 
 from bude_vla.env_runner import PolicyRolloutRunner
 from bude_vla.envs.so101_mjx import load_arm_model, CUBE_QPOS_START, CUBE_REST_Z
-from bude_vla.models.policy import BUDEPolicy, BUDEConfig
+from bude_vla.models.policy import BUDEPolicy, BUDEConfig, apply_saved_config
 
 
 def _load_policy(ckpt_path: str, img_size: int, device: str,
@@ -54,13 +54,7 @@ def _load_policy(ckpt_path: str, img_size: int, device: str,
     # CLI flags for inference when ckpt embeds it).
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     if "config" in ckpt:
-        cfg.use_dinov2 = ckpt["config"].get("use_dinov2", use_dinov2)
-        cfg.use_minilm = ckpt["config"].get("use_minilm", use_minilm)
-        cfg.n_history_frames = ckpt["config"].get("n_history_frames",
-                                                  n_history_frames)
-        cfg.chunk_size = ckpt["config"].get("chunk_size", cfg.chunk_size)
-        cfg.action_dim = ckpt["config"].get("action_dim", cfg.action_dim)
-        cfg.state_dim = ckpt["config"].get("state_dim", cfg.state_dim)
+        apply_saved_config(cfg, ckpt["config"])
     else:
         cfg.use_dinov2 = use_dinov2
         cfg.use_minilm = use_minilm

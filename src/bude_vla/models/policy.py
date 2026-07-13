@@ -5,7 +5,7 @@ agrees via this class.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import torch
 import torch.nn as nn
@@ -55,6 +55,7 @@ class BUDEConfig:
     use_perception: bool = False
     use_perception_action_cond: bool = False
     use_direct_proprio_action_cond: bool = False
+    use_raw_geometry_action_cond: bool = False
     perception_dim: int = 3
     input_feature_norm: str = "layernorm"  # legacy or information-preserving affine
     use_gripper_trigger_head: bool = False
@@ -62,6 +63,14 @@ class BUDEConfig:
     gripper_trigger_close_value: float = -1.0
     action_space: str = "joint_abs"  # joint_abs, ee_delta, or ee_abs
     ee_delta_scale: float = 0.05
+
+
+def apply_saved_config(cfg: BUDEConfig, saved: dict) -> BUDEConfig:
+    """Apply every persisted architecture field without loader-specific drift."""
+    for field in fields(cfg):
+        if field.name in saved and saved[field.name] is not None:
+            setattr(cfg, field.name, saved[field.name])
+    return cfg
 
 
 class BUDEPolicy(nn.Module):
@@ -87,6 +96,14 @@ class BUDEPolicy(nn.Module):
         super().__init__()
         cfg = cfg or BUDEConfig()
         self.cfg = cfg
+        if cfg.use_raw_geometry_action_cond and not cfg.use_perception:
+            raise ValueError(
+                "Raw geometry action conditioning requires camera perception."
+            )
+        if cfg.use_raw_geometry_action_cond and not cfg.use_context_action_head:
+            raise ValueError(
+                "Raw geometry action conditioning requires the context action head."
+            )
 
         # History stacking: channels are concatenated across time
         in_channels = cfg.in_channels * cfg.n_history_frames
@@ -172,6 +189,10 @@ class BUDEPolicy(nn.Module):
             if cfg.use_visual_action_cond else None
         )
         context_cond_dim = cfg.d * 2 if (cfg.use_perception_action_cond and cfg.use_perception) else 0
+        raw_geometry_cond_dim = (
+            cfg.state_dim + cfg.perception_dim
+            if cfg.use_raw_geometry_action_cond else 0
+        )
         self.context_action_head = (
             ContextActionHead(
                 action_dim=cfg.action_dim,
@@ -181,6 +202,7 @@ class BUDEPolicy(nn.Module):
                 depth=2,
                 heads=cfg.backbone_heads,
                 cond_dim=context_cond_dim,
+                raw_cond_dim=raw_geometry_cond_dim,
             )
             if cfg.use_context_action_head else None
         )
@@ -227,6 +249,17 @@ class BUDEPolicy(nn.Module):
         perception_emb = self._perception_embedding(batch, tokens)
         return torch.cat([state_hidden, perception_emb], dim=-1)
 
+    def _raw_geometry_action_cond(
+        self, batch: dict, ref: torch.Tensor
+    ) -> torch.Tensor | None:
+        if not self.cfg.use_raw_geometry_action_cond:
+            return None
+        proprio = batch["proprio"].to(device=ref.device, dtype=ref.dtype)
+        perception = self._perception_input(batch, ref)
+        # Both inputs are available on the real robot: joint/gripper state and
+        # an RGB-derived object centroid. No simulator world coordinates enter.
+        return torch.cat([proprio, perception], dim=-1)
+
 
     def _gripper_trigger_cond(self, batch: dict, tokens: torch.Tensor) -> torch.Tensor:
         if self.cfg.use_perception_action_cond and self.perception_proj is not None:
@@ -263,12 +296,8 @@ class BUDEPolicy(nn.Module):
         tokens = self.backbone(tokens)
         return tokens
 
-    def forward(self, batch: dict) -> dict:
+    def forward(self, batch: dict, *, compute_flow: bool = True) -> dict:
         """Training forward: compute predicted velocity field for action denoising."""
-        actions = batch["actions"]      # (B, T, A)
-        tau = batch["tau"]              # (B,)
-        noise = batch["noise"]          # (B, T, A)
-
         tokens = self.encode(batch)
         # Pull the state token out (always at position n_prompts).
         # Optionally add pooled visual patch tokens so action decoding cannot
@@ -283,16 +312,24 @@ class BUDEPolicy(nn.Module):
             visual_max = patches.max(dim=1).values
             state_hidden = self.action_cond_proj(torch.cat([state_hidden, visual_mean, visual_max], dim=-1))
 
-        # x_t at training time: (1-tau) * noise + tau * actions
-        # and the velocity target is actions - noise
-        tau_b = tau.view(-1, 1, 1)
-        x_t = (1.0 - tau_b) * noise + tau_b * actions
-        v_pred = self.action_head(x_t, tau, state_hidden)
-        out = {"velocity": v_pred, "tokens": tokens}
+        out = {"tokens": tokens}
+        if compute_flow:
+            actions = batch["actions"]      # (B, T, A)
+            tau = batch["tau"]              # (B,)
+            noise = batch["noise"]          # (B, T, A)
+            # x_t at training time: (1-tau) * noise + tau * actions
+            # and the velocity target is actions - noise
+            tau_b = tau.view(-1, 1, 1)
+            x_t = (1.0 - tau_b) * noise + tau_b * actions
+            out["velocity"] = self.action_head(x_t, tau, state_hidden)
         trigger_cond = None
         if self.context_action_head is not None:
             trigger_cond = self._context_action_cond(batch, tokens)
-            out["bc_actions"] = self.context_action_head(tokens, trigger_cond)
+            out["bc_actions"] = self.context_action_head(
+                tokens,
+                trigger_cond,
+                self._raw_geometry_action_cond(batch, tokens),
+            )
         elif self.bc_action_head is not None:
             trigger_cond = state_hidden
             out["bc_actions"] = self.bc_action_head(state_hidden)
@@ -306,7 +343,11 @@ class BUDEPolicy(nn.Module):
         """Inference: predict the action chunk via flow matching."""
         tokens = self.encode(batch)
         if self.context_action_head is not None:
-            actions = self.context_action_head(tokens, self._context_action_cond(batch, tokens))
+            actions = self.context_action_head(
+                tokens,
+                self._context_action_cond(batch, tokens),
+                self._raw_geometry_action_cond(batch, tokens),
+            )
             if self.gripper_trigger_head is not None:
                 logits = self.gripper_trigger_head(self._gripper_trigger_cond(batch, tokens))
                 close = torch.sigmoid(logits) >= self.cfg.gripper_trigger_threshold

@@ -37,6 +37,52 @@ class TrainingControlsTest(unittest.TestCase):
             {k: tuple(v.shape) for k, v in fixed.state_dict().items()},
         )
 
+    def test_saved_config_applies_new_architecture_fields(self):
+        from bude_vla.models.policy import BUDEConfig, apply_saved_config
+
+        cfg = apply_saved_config(BUDEConfig(), {
+            "chunk_size": 16,
+            "action_space": "ee_abs",
+            "use_raw_geometry_action_cond": True,
+            "unrelated_training_field": 123,
+        })
+
+        self.assertEqual(cfg.chunk_size, 16)
+        self.assertEqual(cfg.action_space, "ee_abs")
+        self.assertTrue(cfg.use_raw_geometry_action_cond)
+        self.assertFalse(hasattr(cfg, "unrelated_training_field"))
+
+    def test_raw_geometry_residual_is_zero_initialized(self):
+        from bude_vla.models.action_head import ContextActionHead
+
+        torch.manual_seed(3)
+        head = ContextActionHead(
+            action_dim=4, chunk_size=3, d=16, hidden_dim=32,
+            depth=1, heads=4, cond_dim=0, raw_cond_dim=9,
+        )
+        tokens = torch.randn(2, 5, 16)
+        raw_a = torch.zeros(2, 9)
+        raw_b = torch.ones(2, 9)
+
+        out_a = head(tokens, raw_cond=raw_a)
+        out_b = head(tokens, raw_cond=raw_b)
+
+        self.assertTrue(torch.allclose(out_a, out_b))
+        self.assertTrue(torch.count_nonzero(
+            head.raw_geometry_residual[-1].weight
+        ).item() == 0)
+
+    def test_raw_geometry_requires_context_decoder(self):
+        from bude_vla.models.policy import BUDEConfig, BUDEPolicy
+
+        cfg = BUDEConfig(
+            use_perception=True,
+            use_context_action_head=False,
+            use_raw_geometry_action_cond=True,
+        )
+        with self.assertRaisesRegex(ValueError, "context action head"):
+            BUDEPolicy(cfg)
+
     def test_bc_loss_weights_emphasize_gripper_and_late_phase(self):
         from scripts.train import build_bc_loss_weights
 
@@ -59,6 +105,33 @@ class TrainingControlsTest(unittest.TestCase):
         self.assertEqual(sample_w[:, 0, 0].tolist(), [2.0, 5.0, 5.0])
         self.assertEqual(dim_w.tolist(), [3.0, 7.0, 1.0, 1.0, 1.0, 7.0])
         self.assertAlmostEqual(denom.item(), (2.0 + 5.0 + 5.0) * 4 * 20.0)
+
+    def test_bc_loss_weights_emphasize_chunk_endpoint(self):
+        from scripts.train import build_bc_loss_weights
+
+        sample_w, _dim_w, denom = build_bc_loss_weights(
+            phase=None,
+            mask=torch.ones(1, 4),
+            action_dim=2,
+            early_bc_frac=0.2,
+            early_bc_weight=1.0,
+            late_bc_frac=0.5,
+            late_bc_weight=1.0,
+            gripper_loss_weight=1.0,
+            chunk_end_bc_weight=4.0,
+        )
+
+        self.assertEqual(sample_w[0, :, 0].tolist(), [1.0, 2.0, 3.0, 4.0])
+        self.assertAlmostEqual(denom.item(), 20.0)
+
+    def test_bc_error_supports_l1(self):
+        from scripts.train import build_bc_error
+
+        prediction = torch.tensor([0.0, 2.0])
+        target = torch.tensor([1.0, -1.0])
+        self.assertEqual(
+            build_bc_error(prediction, target, "l1").tolist(), [1.0, 3.0]
+        )
 
 
     def test_recovery_offset_decays_before_final_grasp(self):
@@ -93,6 +166,26 @@ class TrainingControlsTest(unittest.TestCase):
         self.assertTrue(should_retry_close(contact_step=None, retries_used=0, max_retries=1))
         self.assertFalse(should_retry_close(contact_step=12, retries_used=0, max_retries=1))
         self.assertFalse(should_retry_close(contact_step=None, retries_used=1, max_retries=1))
+
+    def test_close_anchor_does_not_chase_a_displaced_cube(self):
+        import mujoco
+        import numpy as np
+        from bude_vla.envs.so101_mjx import CUBE_QPOS_START, CUBE_REST_Z, load_arm_model
+        from bude_vla.scripted_pick_and_place import ScriptedPickAndPlace
+
+        model = load_arm_model()
+        data = mujoco.MjData(model)
+        data.qpos[CUBE_QPOS_START:CUBE_QPOS_START + 3] = [0.27, 0.02, CUBE_REST_Z]
+        mujoco.mj_forward(model, data)
+        expert = ScriptedPickAndPlace(model, data, np.array([0.27, 0.02]))
+        expert._begin_close(data)
+        anchor = expert._close_anchor_xyz.copy()
+
+        data.qpos[CUBE_QPOS_START:CUBE_QPOS_START + 3] = [0.24, -0.05, CUBE_REST_Z]
+        mujoco.mj_forward(model, data)
+
+        np.testing.assert_allclose(expert._close_anchor_xyz, anchor)
+        self.assertGreater(float(np.linalg.norm(expert._cube_xyz(data) - anchor)), 0.05)
 
 
     def test_resolve_frame_caches_matches_multiple_roots(self):
@@ -143,7 +236,10 @@ class TrainingControlsTest(unittest.TestCase):
             parse_cube_positions("0.25;0.30,0.04")
 
     def test_parse_weighted_phase_ranges_for_contact_focused_cache(self):
-        from scripts.build_frame_cache import parse_weighted_phase_ranges
+        from scripts.build_frame_cache import (
+            parse_anchor_local_frames,
+            parse_weighted_phase_ranges,
+        )
 
         ranges = parse_weighted_phase_ranges("0.08:0.28:0.70,0.28:0.55:0.25,0.55:1.00:0.05")
 
@@ -152,6 +248,9 @@ class TrainingControlsTest(unittest.TestCase):
             parse_weighted_phase_ranges("0.1:0.2")
         with self.assertRaisesRegex(ValueError, "0 <= lo < hi <= 1"):
             parse_weighted_phase_ranges("0.4:0.2:1")
+        self.assertEqual(parse_anchor_local_frames("0,1,4,4,16"), [0, 1, 4, 16])
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            parse_anchor_local_frames("0,-1")
 
     def test_select_contact_focused_frames_oversamples_contact_indices(self):
         import numpy as np
@@ -215,6 +314,29 @@ class TrainingControlsTest(unittest.TestCase):
 
         self.assertTrue(all(len(selected[i]) >= 3 for i in range(3)))
         self.assertLessEqual(sum(map(len, selected.values())), 12)
+
+    def test_cache_anchors_exact_reset_frames_for_every_episode(self):
+        import numpy as np
+        from scripts.build_frame_cache import EpisodeInfo, select_cache_frame_indices
+
+        episodes = [
+            EpisodeInfo(ep_idx=i, chunk_idx=0, start=i * 50, length=50, contact_locals=[])
+            for i in range(3)
+        ]
+        selected = select_cache_frame_indices(
+            episodes,
+            max_frames=12,
+            rng=np.random.default_rng(9),
+            early_prob=0.0,
+            early_max_frac=0.2,
+            phase_bins=0,
+            phase_ranges=[],
+            contact_prob=0.0,
+            contact_jitter=0,
+            anchor_local_frames=[0, 1, 4],
+        )
+
+        self.assertTrue(all({0, 1, 4}.issubset(selected[i]) for i in range(3)))
 
     def test_dinov2_adapter_initializes_current_top_frame(self):
         from bude_vla.models.vision import current_top_rgb_start
