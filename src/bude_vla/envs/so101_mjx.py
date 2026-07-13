@@ -35,6 +35,7 @@ Bowl gets contype=4, conaffinity=2 — collides with cube only, not robot.
 """
 from __future__ import annotations
 
+import dataclasses
 import math as _m
 import os
 from pathlib import Path
@@ -279,6 +280,109 @@ GRIPPER_QPOS_START = 5
 GRIPPER_QPOS_END = 6
 CUBE_QPOS_START = 6
 CUBE_QPOS_END = 13
+
+# A valid placement is deliberately stricter than merely passing over the
+# target marker. The bowl wall has a 35 mm inner radius and the cube has a
+# 15 mm half-extent, leaving roughly 20 mm of center-position clearance.
+BOWL_PLACEMENT_XY_RADIUS = 0.020
+BOWL_PLACEMENT_MAX_Z = 0.050
+BOWL_PLACEMENT_MAX_LINEAR_SPEED = 0.025
+BOWL_PLACEMENT_MAX_ANGULAR_SPEED = 1.0
+BOWL_PLACEMENT_SETTLE_STEPS = 8
+
+
+@dataclasses.dataclass(frozen=True)
+class BowlPlacementState:
+    """Observable simulator outcome used only for metrics and termination."""
+
+    inside_xy: bool
+    low_enough: bool
+    released: bool
+    settled: bool
+    xy_error: float
+    cube_z: float
+    linear_speed: float
+    angular_speed: float
+
+    @property
+    def placed(self) -> bool:
+        return self.inside_xy and self.low_enough and self.released and self.settled
+
+
+def bowl_placement_state(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    *,
+    xy_radius: float = BOWL_PLACEMENT_XY_RADIUS,
+    max_z: float = BOWL_PLACEMENT_MAX_Z,
+    max_linear_speed: float = BOWL_PLACEMENT_MAX_LINEAR_SPEED,
+    max_angular_speed: float = BOWL_PLACEMENT_MAX_ANGULAR_SPEED,
+) -> BowlPlacementState:
+    """Measure whether the cube has been released and settled inside the bowl.
+
+    This function intentionally uses simulator state because it is an outcome
+    metric, not a policy input. Requiring low height, low velocity, and no
+    finger contact prevents a held cube hovering over the bowl from counting.
+    """
+    cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
+    target_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, "target_zone"
+    )
+    cube_joint_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_JOINT, "cube_joint"
+    )
+    cube_pos = np.asarray(data.xpos[cube_id], dtype=np.float64)
+    target_pos = np.asarray(data.xpos[target_id], dtype=np.float64)
+    dof_adr = int(model.jnt_dofadr[cube_joint_id])
+    linear_speed = float(np.linalg.norm(data.qvel[dof_adr:dof_adr + 3]))
+    angular_speed = float(np.linalg.norm(data.qvel[dof_adr + 3:dof_adr + 6]))
+    xy_error = float(np.linalg.norm(cube_pos[:2] - target_pos[:2]))
+    static_touch, moving_touch = cube_pad_contact_flags(model, data)
+
+    return BowlPlacementState(
+        inside_xy=xy_error <= float(xy_radius),
+        low_enough=float(cube_pos[2]) <= float(max_z),
+        released=not (static_touch or moving_touch),
+        settled=(
+            linear_speed <= float(max_linear_speed)
+            and angular_speed <= float(max_angular_speed)
+        ),
+        xy_error=xy_error,
+        cube_z=float(cube_pos[2]),
+        linear_speed=linear_speed,
+        angular_speed=angular_speed,
+    )
+
+
+def is_cube_placed_in_bowl(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+) -> bool:
+    """Return the instantaneous strict placement predicate."""
+    return bowl_placement_state(model, data).placed
+
+
+class BowlPlacementTracker:
+    """Require a strict placement to remain valid for several policy steps."""
+
+    def __init__(self, required_steps: int = BOWL_PLACEMENT_SETTLE_STEPS):
+        if required_steps < 1:
+            raise ValueError("required_steps must be positive")
+        self.required_steps = int(required_steps)
+        self.stable_steps = 0
+        self.last_state: BowlPlacementState | None = None
+
+    def reset(self) -> None:
+        self.stable_steps = 0
+        self.last_state = None
+
+    def update(self, model: mujoco.MjModel, data: mujoco.MjData) -> bool:
+        self.last_state = bowl_placement_state(model, data)
+        if self.last_state.placed:
+            self.stable_steps += 1
+        else:
+            self.stable_steps = 0
+        return self.stable_steps >= self.required_steps
 
 
 def build_pick_proprio(model: mujoco.MjModel, data: mujoco.MjData, state_dim: int) -> np.ndarray:

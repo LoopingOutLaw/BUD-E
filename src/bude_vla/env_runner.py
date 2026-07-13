@@ -1,9 +1,9 @@
 """Policy-in-the-loop simulation runner with retry-on-failure.
 
 Core loop: render image -> policy.sample() -> kinematic arm override -> step sim.
-Ball carry is now handled by GraspController (grasp.py) — no kinematic
-teleport. The _carry_cube_with stub is kept for compatibility but is a no-op.
-On failure, reset arm to home + cube to start position, retry up to max_tries.
+Ball carry is now handled by contact physics — no kinematic teleport. On a
+retry, the arm returns home while the cube remains where the previous attempt
+left it. The policy must re-observe and recover from the real scene state.
 
 Exports
 -------
@@ -40,6 +40,7 @@ from bude_vla.envs.so101_mjx import (
     CUBE_REST_Z,
     POLICY_CONTROL_SUBSTEPS,
     N_ARM_JOINTS,
+    BowlPlacementTracker,
     is_grasping_from_contacts,
     build_pick_proprio,
 )
@@ -121,16 +122,6 @@ def _is_failure(model, data, step, max_steps) -> bool:
     if np.any(np.abs(data.qpos[ARM_QPOS_START:ARM_QPOS_END]) > 3.5):
         return True
     return False
-
-
-def _is_success(model, data, threshold: float = 0.05) -> bool:
-    cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
-    target_id = mujoco.mj_name2id(
-        model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
-    return bool(
-        np.linalg.norm(data.xpos[cube_id, :2] - data.xpos[target_id, :2])
-        < threshold
-    )
 
 
 def _build_proprio(model, data, state_dim: int) -> np.ndarray:
@@ -232,6 +223,7 @@ class PolicyRolloutRunner:
         try_labels: list = []
         success = False
         final_try_idx = 0
+        ever_grasped_episode = False
 
         ARM_SMOOTH_STEPS = max(6, self.arm_smooth_steps) if record_video_mode else self.arm_smooth_steps
         ARM_STEP_FRAC = (1.0 / ARM_SMOOTH_STEPS) if record_video_mode else self.arm_step_frac
@@ -256,13 +248,14 @@ class PolicyRolloutRunner:
 
         for try_idx in range(self.max_tries):
             _reset_arm_to_home(self.model, data)
-            _reset_cube(data, cube_xy)
+            if try_idx == 0:
+                _reset_cube(data, cube_xy)
             gripper_ctrl = 0.0
             chunk = None
             cursor = 0
             self._frame_buffer = []
             self._action_queue = []
-            ever_grasped = False
+            placement = BowlPlacementTracker()
             ik = (
                 make_ik_controller(self.model, data)
                 if uses_ik_action_space(policy.cfg) else None
@@ -273,7 +266,7 @@ class PolicyRolloutRunner:
                 stacked = self._stacked_view(img)
                 current_grasp = is_grasping_from_contacts(self.model, data)
                 if current_grasp > 0.5:
-                    ever_grasped = True
+                    ever_grasped_episode = True
                 arm_proprio = _build_proprio(self.model, data, self.state_dim)
                 if record_video_mode:
                     if record_camera != "default":
@@ -332,7 +325,7 @@ class PolicyRolloutRunner:
                 _carry_cube_with(self.model, data)
                 _smooth_arm_to(arm_target, try_idx)
 
-                if _is_success(self.model, data) and ever_grasped:
+                if placement.update(self.model, data) and ever_grasped_episode:
                     success = True
                     if record_video_mode:
                         if record_camera != "default":

@@ -44,6 +44,7 @@ from bude_vla.envs.so101_mjx import (
     PICK_WORKSPACE_X_RANGE,
     PICK_WORKSPACE_Y_RANGE,
     POLICY_CONTROL_SUBSTEPS,
+    BowlPlacementTracker,
     load_arm_model, CUBE_REST_Z,
     is_grasping_from_contacts,
     is_touching_cube_from_contacts,
@@ -52,7 +53,6 @@ from bude_vla.envs.so101_mjx import (
 from bude_vla.models.policy import BUDEPolicy, BUDEConfig
 from bude_vla.perception import detect_red_centroid
 
-SUCCESS_THRESHOLD = 0.05
 INSTRUCTION = "pick up the red cube and place it in the blue target zone"
 MAX_STEPS = 4000
 SUBSTEPS_PER_FRAME = POLICY_CONTROL_SUBSTEPS
@@ -159,13 +159,6 @@ def reset_arm(model, data):
     mujoco.mj_forward(model, data)
 
 
-def is_success(data) -> bool:
-    cube_id = mujoco.mj_name2id(data.model, mujoco.mjtObj.mjOBJ_BODY, "cube")
-    target_id = mujoco.mj_name2id(data.model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
-    err = np.linalg.norm(data.xpos[cube_id, :2] - data.xpos[target_id, :2])
-    return err < SUCCESS_THRESHOLD
-
-
 def is_failure(data, step, max_steps: int = MAX_STEPS) -> bool:
     if step >= max_steps:
         return True
@@ -227,7 +220,8 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
              cube_positions: list[tuple[float, float]] | None = None,
              cube_x_range: tuple[float, float] = PICK_WORKSPACE_X_RANGE,
              cube_y_range: tuple[float, float] = PICK_WORKSPACE_Y_RANGE,
-             max_steps: int = MAX_STEPS):
+             max_steps: int = MAX_STEPS,
+             max_tries: int = 1):
     rng = np.random.default_rng(seed)
     all_frames = []
     n_success = 0
@@ -267,10 +261,25 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
         action_queue: list = []  # only used when ensembling=True
         ever_grasped = False
         close_until = -1
+        placement = BowlPlacementTracker()
         ik = make_ik_controller(model, data) if uses_ik_action_space(cfg) else None
         img_buffer = []  # reset per episode
 
-        for step in range(max_steps):
+        for rollout_step in range(max_steps * max(1, max_tries)):
+            try_idx = rollout_step // max_steps
+            step = rollout_step % max_steps
+            if try_idx > 0 and step == 0:
+                print(f"RETRY {try_idx + 1}/{max_tries}", end=" ", flush=True)
+                reset_arm(model, data)
+                for _ in range(50):
+                    mujoco.mj_step(model, data)
+                chunk = None
+                cursor = 0
+                action_queue = []
+                close_until = -1
+                placement.reset()
+                img_buffer = []
+                ik = make_ik_controller(model, data) if uses_ik_action_space(cfg) else None
             # Render from SAME cameras as training
             obs_renderer.update_scene(data, camera=front_top_cam)
             img_top = np.asarray(obs_renderer.render()).copy()
@@ -362,19 +371,24 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
             for _ in range(SUBSTEPS_PER_FRAME):
                 mujoco.mj_step(model, data)
 
-            frame = add_overlay(vid_frame, f"ep {ep} step {step}",
+            if is_grasping_from_contacts(model, data) > 0.5:
+                ever_grasped = True
+
+            frame = add_overlay(
+                vid_frame,
+                f"ep {ep} try {try_idx + 1}/{max_tries} step {step}",
                                 grasped=(use_contact_signal and is_grasping > 0.5))
             all_frames.append(frame)
 
-            if is_success(data) and ever_grasped:
+            if placement.update(model, data) and ever_grasped:
                 n_success += 1
                 for _ in range(30):
                     mujoco.mj_step(model, data)
                     vid_renderer.update_scene(data, camera=vid_cam)
                     vf = np.asarray(vid_renderer.render()).copy()
-                    f = add_overlay(vf, f"ep {ep}", "SUCCESS", grasped=True)
+                    f = add_overlay(vf, f"ep {ep}", "SUCCESS", grasped=False)
                     all_frames.append(f)
-                print(f"SUCCESS (step {step})")
+                print(f"SUCCESS (try {try_idx + 1}, step {step})")
                 break
 
             if is_failure(data, step, max_steps=max_steps):
@@ -409,6 +423,11 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", default="demos/videos/eval_pick_v8.mp4")
     ap.add_argument("--max-steps", type=int, default=MAX_STEPS)
+    ap.add_argument(
+        "--max-tries", type=int, default=1,
+        help=("Maximum attempts per cube. Later attempts home only the arm and "
+              "preserve the cube where the previous attempt left it."),
+    )
     ap.add_argument("--ensembling", action="store_true",
                      help="Replan every step (or every --replan-every steps) and "
                           "blend overlapping chunk predictions instead of blindly "
@@ -485,6 +504,7 @@ def main():
         cube_x_range=tuple(args.cube_x_range),
         cube_y_range=tuple(args.cube_y_range),
         max_steps=args.max_steps,
+        max_tries=args.max_tries,
     )
 
     rate = n_success / n_total * 100 if n_total > 0 else 0

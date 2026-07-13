@@ -518,6 +518,51 @@ The benchmark now prints no-contact, touch-no-grasp, and grasp-no-success
 counts plus four X and Y workspace bins. This prevents a central-workspace
 improvement from hiding another edge regression.
 
+## V42 Outcome Audit: Release, Settle, and Retry
+
+The original success predicate was incomplete:
+
+```text
+ever grasped AND distance(cube_xy, target_xy) < 0.05 m
+```
+
+It became true during MOVE while the cube was still held above the bowl. Eval
+then terminated immediately, so the recorded video never reached the policy's
+later release actions. This explains the apparent convention-breaking behavior:
+the shoulder turns toward positive world Y because the bowl is physically at
+`(0.32, 0.16)`, then the old evaluator cut the episode at overhead arrival.
+
+The shared outcome contract now requires all of:
+
+- cube-center error at most 20 mm, consistent with the 35 mm bowl inner radius
+  and 15 mm cube half-extent;
+- cube center at or below 50 mm, rejecting a carried cube above the bowl;
+- no static- or moving-pad contact, proving physical release;
+- cube linear speed at most 25 mm/s and angular speed at most 1 rad/s;
+- all conditions sustained for eight consecutive policy control frames.
+
+This simulator state is used only for termination and metrics. It is not added
+to images, proprioception, or the policy batch. A known-good scripted expert
+passed 10/10 random episodes under the strict contract.
+
+Re-evaluating the selected v42 raw step-155k checkpoint on the fixed set:
+
+| Execution | Strict success | Contact | Strict grasp |
+| --- | ---: | ---: | ---: |
+| one attempt | 4/8 | 4/8 | 4/8 |
+| one same-scene retry | 5/8 | 5/8 | 5/8 |
+
+The successful episodes completed only after release and settling at policy
+steps 240-325. One previously failed position `(0.23,-0.02)` succeeded on its
+second attempt: attempt one displaced the cube, the arm homed without resetting
+the object, and the camera-conditioned policy solved the changed scene. The
+remaining fixed-set failures are no-contact failures concentrated at far X, so
+retry is useful recovery but not a substitute for fixing edge reach.
+
+Earlier v37-v42 percentages used the XY-arrival predicate and are retained as
+historical diagnostics only. They must not be presented as strict pick-and-drop
+success until rerun under this corrected contract.
+
 ## Post-Training Decision Protocol
 
 Do not decide from training loss or one video. Use the 200-position random

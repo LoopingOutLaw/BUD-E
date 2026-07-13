@@ -37,6 +37,7 @@ from bude_vla.envs.so101_mjx import (
     PICK_WORKSPACE_X_RANGE,
     PICK_WORKSPACE_Y_RANGE,
     POLICY_CONTROL_SUBSTEPS,
+    BowlPlacementTracker,
     build_pick_proprio,
     is_grasping_from_contacts,
     is_touching_cube_from_contacts,
@@ -59,9 +60,6 @@ from bude_vla.scripted_pick_and_place import (
 from eval_pick_ball import INSTRUCTION, load_policy, parse_cube_positions
 
 SUBSTEPS_PER_FRAME = POLICY_CONTROL_SUBSTEPS
-SUCCESS_THRESHOLD = 0.05
-
-
 def reset_arm(model, data) -> None:
     data.qpos[0] = 0.0
     data.qpos[1] = -0.5
@@ -79,12 +77,6 @@ def reset_cube(data, cx: float, cy: float) -> None:
     data.qpos[CUBE_QPOS_START + 3:CUBE_QPOS_START + 7] = [1.0, 0.0, 0.0, 0.0]
     data.qvel[CUBE_QPOS_START:CUBE_QPOS_END] = 0.0
     mujoco.mj_forward(data.model, data)
-
-
-def is_success(model, data) -> bool:
-    cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
-    target_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
-    return bool(np.linalg.norm(data.xpos[cube_id, :2] - data.xpos[target_id, :2]) < SUCCESS_THRESHOLD)
 
 
 def is_failure(model, data, step: int, max_steps: int) -> bool:
@@ -243,6 +235,8 @@ def rollout_episode(model, policy, cfg, action_lo, action_hi, device: str,
     intervention_started = False
     intervention_frames = 0
     interventions_started = 0
+    placement = BowlPlacementTracker()
+    placed = False
     cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
     gripper_site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "gripperframe")
 
@@ -328,7 +322,10 @@ def rollout_episode(model, policy, cfg, action_lo, action_hi, device: str,
         for _ in range(SUBSTEPS_PER_FRAME):
             mujoco.mj_step(model, data)
 
-        if is_success(model, data):
+        if is_grasping_from_contacts(model, data) > 0.5:
+            ever_grasped = True
+        placed = placement.update(model, data)
+        if placed and ever_grasped:
             break
         if is_failure(model, data, step, max_steps):
             break
@@ -336,7 +333,7 @@ def rollout_episode(model, policy, cfg, action_lo, action_hi, device: str,
     target_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
     cube_final = data.xpos[cube_id].copy()
     target_pos = data.xpos[target_id].copy()
-    reached_target = bool(np.linalg.norm(cube_final[:2] - target_pos[:2]) < SUCCESS_THRESHOLD)
+    reached_target = bool(placed)
     proprio_arr = np.array(proprios, dtype=np.float32)
     any_contact_frames = int((proprio_arr[:, 8] > 0.5).sum()) if proprio_arr.ndim == 2 and proprio_arr.shape[1] >= 10 else 0
     strict_grasp_frames = int((proprio_arr[:, 9] > 0.5).sum()) if proprio_arr.ndim == 2 and proprio_arr.shape[1] >= 10 else 0
