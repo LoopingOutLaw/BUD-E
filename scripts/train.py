@@ -410,6 +410,7 @@ def train(
     resume: str | None = None,
     init_from: str | None = None,
     init_from_raw: bool = False,
+    init_drop_prefixes: list[str] | None = None,
     num_workers: int = 0,
     use_dinov2: bool = False,
     dinov2_finetune_blocks: int = 4,
@@ -430,6 +431,8 @@ def train(
     use_context_action_head: bool = True,
     use_perception: bool = True,
     use_perception_action_cond: bool = True,
+    use_direct_proprio_action_cond: bool = False,
+    input_feature_norm: str = "layernorm",
     early_bc_weight: float = 12.0,
     early_bc_frac: float = 0.22,
     late_bc_weight: float = 1.0,
@@ -481,7 +484,9 @@ def train(
     cfg.use_context_action_head = use_context_action_head
     cfg.use_perception = use_perception
     cfg.use_perception_action_cond = use_perception_action_cond
+    cfg.use_direct_proprio_action_cond = use_direct_proprio_action_cond
     cfg.perception_dim = 3
+    cfg.input_feature_norm = input_feature_norm
     cfg.use_gripper_trigger_head = use_gripper_trigger_head
     cfg.gripper_trigger_threshold = gripper_trigger_threshold
     cfg.gripper_trigger_close_value = gripper_trigger_close_value
@@ -497,6 +502,8 @@ def train(
         raise ValueError("Use either --init-from for weight initialization or --resume for exact continuation, not both.")
     if init_from_raw and init_from is None:
         raise ValueError("--init-from-raw requires --init-from.")
+    if init_drop_prefixes and init_from is None:
+        raise ValueError("--init-drop-prefix requires --init-from.")
 
     if init_from is not None:
         init_ckpt = torch.load(init_from, map_location=device, weights_only=False)
@@ -530,6 +537,20 @@ def train(
         else:
             init_sd = init_ckpt.get("ema_state_dict") or init_ckpt["model_state_dict"]
         init_sd = adapt_state_dict_for_state_dim(init_sd, saved_cfg.get("state_dim"), cfg.state_dim)
+        drop_prefixes = tuple(init_drop_prefixes or ())
+        explicitly_dropped = []
+        if drop_prefixes:
+            explicitly_dropped = [
+                key for key in init_sd if key.startswith(drop_prefixes)
+            ]
+            init_sd = {
+                key: value for key, value in init_sd.items()
+                if not key.startswith(drop_prefixes)
+            }
+            print(
+                f"  reinitialized {len(explicitly_dropped)} tensors matching "
+                f"--init-drop-prefix={list(drop_prefixes)}"
+            )
         if allow_action_head_mismatch:
             current_sd = policy.state_dict()
             dropped = []
@@ -544,8 +565,14 @@ def train(
                 print(f"  dropped {len(dropped)} shape-mismatched tensors for new action head/action_dim")
         missing, unexpected = policy.load_state_dict(init_sd, strict=False)
         allowed_prefixes = ("action_head.", "bc_action_head.", "action_cond_proj.", "context_action_head.", "perception_proj.", "gripper_trigger_head.")
-        allowed_missing = [k for k in missing if k.startswith(allowed_prefixes)]
-        other_missing = [k for k in missing if not k.startswith(allowed_prefixes)]
+        allowed_missing = [
+            k for k in missing
+            if k.startswith(allowed_prefixes) or k.startswith(drop_prefixes)
+        ]
+        other_missing = [
+            k for k in missing
+            if not k.startswith(allowed_prefixes) and not k.startswith(drop_prefixes)
+        ]
         if other_missing or unexpected:
             raise ValueError(
                 "Unexpected --init-from state_dict mismatch:\n"
@@ -662,6 +689,8 @@ def train(
             ("use_context_action_head", cfg.use_context_action_head, saved_cfg.get("use_context_action_head", False)),
             ("use_perception", cfg.use_perception, saved_cfg.get("use_perception", False)),
             ("use_perception_action_cond", cfg.use_perception_action_cond, saved_cfg.get("use_perception_action_cond", False)),
+            ("use_direct_proprio_action_cond", cfg.use_direct_proprio_action_cond, saved_cfg.get("use_direct_proprio_action_cond", False)),
+            ("input_feature_norm", cfg.input_feature_norm, saved_cfg.get("input_feature_norm", "layernorm")),
             ("use_gripper_trigger_head", cfg.use_gripper_trigger_head, saved_cfg.get("use_gripper_trigger_head", False)),
             ("action_space", cfg.action_space, saved_cfg.get("action_space", "joint_abs")),
         ]
@@ -847,7 +876,9 @@ def train(
                     "use_context_action_head": cfg.use_context_action_head,
                     "use_perception": cfg.use_perception,
                     "use_perception_action_cond": cfg.use_perception_action_cond,
+                    "use_direct_proprio_action_cond": cfg.use_direct_proprio_action_cond,
                     "perception_dim": cfg.perception_dim,
+                    "input_feature_norm": cfg.input_feature_norm,
                     "use_gripper_trigger_head": cfg.use_gripper_trigger_head,
                     "gripper_trigger_loss_weight": gripper_trigger_loss_weight if cfg.use_gripper_trigger_head else None,
                     "gripper_trigger_label_threshold": gripper_trigger_label_threshold if cfg.use_gripper_trigger_head else None,
@@ -948,7 +979,9 @@ def train(
             "use_context_action_head": cfg.use_context_action_head,
             "use_perception": cfg.use_perception,
             "use_perception_action_cond": cfg.use_perception_action_cond,
+            "use_direct_proprio_action_cond": cfg.use_direct_proprio_action_cond,
             "perception_dim": cfg.perception_dim,
+            "input_feature_norm": cfg.input_feature_norm,
             "use_gripper_trigger_head": cfg.use_gripper_trigger_head,
             "gripper_trigger_loss_weight": gripper_trigger_loss_weight if cfg.use_gripper_trigger_head else None,
             "gripper_trigger_label_threshold": gripper_trigger_label_threshold if cfg.use_gripper_trigger_head else None,
@@ -1019,6 +1052,20 @@ if __name__ == "__main__":
                         help="Disable the pixel-derived red-cube centroid token.")
     parser.add_argument("--no-perception-action-cond", action="store_true",
                         help="Disable direct pixel-centroid conditioning in the action decoder.")
+    parser.add_argument(
+        "--direct-proprio-action-cond",
+        action="store_true",
+        help=("Add the deployable joint-state embedding directly to the "
+              "action decoder condition, bypassing transformer information loss."),
+    )
+    parser.add_argument(
+        "--input-feature-norm",
+        choices=["layernorm", "affine"],
+        default="layernorm",
+        help=("Transform applied independently to compact physical inputs. "
+              "Use affine for new runs; unlike LayerNorm it preserves exact "
+              "2D centroid and joint-state information."),
+    )
     parser.add_argument("--early-bc-weight", type=float, default=12.0,
                         help="Extra BC loss weight for early approach frames where cube visual grounding matters most.")
     parser.add_argument("--early-bc-frac", type=float, default=0.22,
@@ -1053,6 +1100,14 @@ if __name__ == "__main__":
                         help="Initialize model weights from a checkpoint without loading optimizer/scheduler state. Useful for adding the BC head to an existing flow checkpoint.")
     parser.add_argument("--init-from-raw", action="store_true",
                         help="With --init-from, initialize from model_state_dict instead of EMA weights.")
+    parser.add_argument(
+        "--init-drop-prefix",
+        action="append",
+        default=[],
+        help=("Module prefix to reinitialize instead of loading from "
+              "--init-from. May be repeated; intended for controlled "
+              "architecture corrections such as proprio. or perception_proj."),
+    )
     parser.add_argument("--resume", default=None,
                         help="Path to a checkpoint to resume training from. "
                              "Restores model, optimizer, step counter, and "
@@ -1113,6 +1168,7 @@ if __name__ == "__main__":
         resume=args.resume,
         init_from=args.init_from,
         init_from_raw=args.init_from_raw,
+        init_drop_prefixes=args.init_drop_prefix,
         task_name=args.task,
         num_workers=args.num_workers,
         use_dinov2=args.use_dinov2,
@@ -1134,6 +1190,8 @@ if __name__ == "__main__":
         use_context_action_head=not args.no_context_action_head,
         use_perception=not args.no_perception,
         use_perception_action_cond=not args.no_perception_action_cond,
+        use_direct_proprio_action_cond=args.direct_proprio_action_cond,
+        input_feature_norm=args.input_feature_norm,
         early_bc_weight=args.early_bc_weight,
         early_bc_frac=args.early_bc_frac,
         late_bc_weight=args.late_bc_weight,

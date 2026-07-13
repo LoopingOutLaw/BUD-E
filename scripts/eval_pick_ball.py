@@ -74,7 +74,9 @@ def load_policy(ckpt_path: str, img_size: int, device: str, *,
     cfg.use_context_action_head = saved_cfg.get("use_context_action_head", False)
     cfg.use_perception = saved_cfg.get("use_perception", False)
     cfg.use_perception_action_cond = saved_cfg.get("use_perception_action_cond", False)
+    cfg.use_direct_proprio_action_cond = saved_cfg.get("use_direct_proprio_action_cond", False)
     cfg.perception_dim = saved_cfg.get("perception_dim", 3)
+    cfg.input_feature_norm = saved_cfg.get("input_feature_norm", "layernorm")
     cfg.use_gripper_trigger_head = saved_cfg.get("use_gripper_trigger_head", False)
     cfg.gripper_trigger_threshold = saved_cfg.get("gripper_trigger_threshold", 0.5) or 0.5
     cfg.gripper_trigger_close_value = saved_cfg.get("gripper_trigger_close_value", -1.0) or -1.0
@@ -217,6 +219,7 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
              ensembling: bool = False, ensembling_k: float = 0.5,
              replan_every: int = 1,
              exec_first_only: bool = False,
+             execute_horizon: int = 0,
              debug_actions: bool = False,
              contact_close_reflex: bool = False,
              contact_close_steps: int = 120,
@@ -327,7 +330,11 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
                     if action_lo is not None:
                         a = denormalize_actions(a, action_lo, action_hi)
                 else:
-                    if chunk is None or cursor >= cfg.chunk_size:
+                    horizon = (
+                        cfg.chunk_size if execute_horizon <= 0
+                        else min(cfg.chunk_size, execute_horizon)
+                    )
+                    if chunk is None or cursor >= horizon:
                         chunk = policy.sample(batch)[0].detach().cpu().numpy()
                         cursor = 0
                     a = chunk[cursor]
@@ -418,6 +425,11 @@ def main():
     ap.add_argument("--exec-first-only", action="store_true",
                     help="Drop all but chunk[0] of each sampled chunk and re-sample "
                          "every step. Equivalent to chunk_size=1 without retraining.")
+    ap.add_argument(
+        "--execute-horizon", type=int, default=0,
+        help=("For non-ensembled chunk execution, replan after this many "
+              "actions; 0 executes the full trained chunk."),
+    )
     ap.add_argument("--debug-actions", action="store_true",
                     help="Print pre-clip arm targets during eval to diagnose joint-limit clipping.")
     ap.add_argument("--contact-close-reflex", action="store_true",
@@ -464,6 +476,7 @@ def main():
         ensembling=args.ensembling, ensembling_k=args.ensembling_k,
         replan_every=args.replan_every,
         exec_first_only=args.exec_first_only,
+        execute_horizon=args.execute_horizon,
         debug_actions=args.debug_actions,
         contact_close_reflex=args.contact_close_reflex,
         contact_close_steps=args.contact_close_steps,

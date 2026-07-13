@@ -55,7 +55,9 @@ def load_policy(path: str, device: str):
     cfg.use_context_action_head = saved.get("use_context_action_head", False)
     cfg.use_perception = saved.get("use_perception", False)
     cfg.use_perception_action_cond = saved.get("use_perception_action_cond", False)
+    cfg.use_direct_proprio_action_cond = saved.get("use_direct_proprio_action_cond", False)
     cfg.perception_dim = saved.get("perception_dim", 3)
+    cfg.input_feature_norm = saved.get("input_feature_norm", "layernorm")
     cfg.action_space = saved.get("action_space", "joint_abs")
     cfg.ee_delta_scale = saved.get("ee_delta_scale", 0.05) or 0.05
     cfg.patch_size = 16
