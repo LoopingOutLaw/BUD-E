@@ -32,6 +32,7 @@ from bude_vla.envs.so101_mjx import (
     CUBE_QPOS_START,
     CUBE_REST_Z,
     is_grasping_from_contacts,
+    is_cube_placed_in_bowl,
     build_pick_proprio,
 )
 
@@ -92,7 +93,7 @@ def _main_loop(
 
     cube_final = data.xpos[cube_body_id].copy()
     target_pos = data.xpos[target_body_id].copy()
-    reached_target = bool(np.linalg.norm(cube_final[:2] - target_pos[:2]) < 0.05)
+    reached_target = is_cube_placed_in_bowl(model, data)
     success = bool(reached_target and ever_grasped)
     sim_substeps = EXPERT_CONTROL_SUBSTEPS * record_stride
     fps = int(round(1.0 / (float(model.opt.timestep) * sim_substeps)))
@@ -185,9 +186,7 @@ def _record_policy_rate_replay(
 
     cube_final = data.xpos[cube_body_id].copy()
     target_pos = data.xpos[target_body_id].copy()
-    reached_target = bool(
-        np.linalg.norm(cube_final[:2] - target_pos[:2]) < 0.05
-    )
+    reached_target = is_cube_placed_in_bowl(model, data)
     fps = int(round(1.0 / (float(model.opt.timestep) * sim_substeps)))
     return {
         "images": np.asarray(images, dtype=np.uint8),

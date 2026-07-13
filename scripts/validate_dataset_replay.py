@@ -21,10 +21,11 @@ from bude_vla.action_space import (
 from bude_vla.envs.so101_mjx import (
     PICK_WORKSPACE_X_RANGE,
     PICK_WORKSPACE_Y_RANGE,
+    BowlPlacementTracker,
     is_grasping_from_contacts,
     load_arm_model,
 )
-from eval_pick_ball import is_success, reset_arm, reset_cube
+from eval_pick_ball import reset_arm, reset_cube
 
 
 def load_episode(root: Path, meta_path: Path) -> tuple[dict, np.ndarray]:
@@ -59,6 +60,8 @@ def replay_one(
         mujoco.mj_step(model, data)
 
     ever_grasped = False
+    placement = BowlPlacementTracker()
+    placed = False
     cfg = SimpleNamespace(action_space=action_space, ee_delta_scale=0.05)
     ik = make_ik_controller(model, data) if uses_ik_action_space(cfg) else None
     expected_dim = 4 if uses_ik_action_space(cfg) else model.nu
@@ -77,10 +80,11 @@ def replay_one(
             ever_grasped = ever_grasped or (
                 is_grasping_from_contacts(model, data) > 0.5
             )
+        placed = placement.update(model, data)
 
     return {
         "grasped": ever_grasped,
-        "success": bool(ever_grasped and is_success(data)),
+        "success": bool(ever_grasped and placed),
     }
 
 

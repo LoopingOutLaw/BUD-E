@@ -23,6 +23,7 @@ from bude_vla.envs.so101_mjx import (
     EXPERT_CONTROL_SUBSTEPS,
     PICK_WORKSPACE_X_RANGE,
     PICK_WORKSPACE_Y_RANGE,
+    BowlPlacementTracker,
     is_grasping_from_contacts,
     is_touching_cube_from_contacts,
     load_arm_model,
@@ -35,9 +36,6 @@ from bude_vla.visual_servo import (
 from eval_pick_ball import parse_cube_positions, reset_arm, reset_cube
 
 SUBSTEPS_PER_FRAME = EXPERT_CONTROL_SUBSTEPS
-SUCCESS_THRESHOLD = 0.05
-
-
 def run_one(
     model: mujoco.MjModel,
     data: mujoco.MjData,
@@ -73,12 +71,14 @@ def run_one(
         cube_position_provider=tracker,
     )
     cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube")
-    target_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "target_zone")
     touch_frames = 0
     grasp_frames = 0
     ever_grasped = False
     tracking_errors: list[float] = []
     reason = "timeout"
+    placement = BowlPlacementTracker()
+    placed = False
+    done_steps = 0
 
     for step in range(max_steps):
         ctrl, _arm_q, done, _info = expert.step(model, data)
@@ -91,6 +91,7 @@ def run_one(
         touch_frames += int(touching)
         grasp_frames += int(grasping)
         ever_grasped = ever_grasped or grasping
+        placed = placement.update(model, data)
 
         estimate = tracker.last_xy
         if estimate is not None and not ever_grasped:
@@ -99,16 +100,13 @@ def run_one(
 
         if done:
             reason = "controller_done"
-            break
+            done_steps += 1
+            if placed or done_steps >= placement.required_steps:
+                break
     else:
         step = max_steps - 1
 
-    cube = data.xpos[cube_id].copy()
-    target = data.xpos[target_id].copy()
-    success = bool(
-        ever_grasped
-        and np.linalg.norm(cube[:2] - target[:2]) < SUCCESS_THRESHOLD
-    )
+    success = bool(ever_grasped and placed)
     return {
         "success": success,
         "touch_frames": touch_frames,

@@ -11,10 +11,24 @@ post-rollout metrics.
 
 ## Current Status
 
-V41 is the strongest completed learned policy. Its selected step-105k absolute
-task-space checkpoint scored **89/200 success (44.5%)**, 145/200 contact
-(72.5%), and 120/200 strict grasp (60.0%) on random workspace positions. This
-more than doubled v39's 20.7% joint-space result. The fixed set remained 3/8.
+V42 is the current learned policy. It preserves camera and joint geometry,
+predicts absolute TCP targets plus gripper control, and executes them through
+IK. The selected artifact is the raw step-155k checkpoint stored as
+`checkpoints/pick_v42_affine_geometry/pick_v42_affine_geometry_best.pt`.
+
+An outcome-audit found that all earlier evaluators declared success when a
+previously grasped cube came within 50 mm of the bowl in XY. They did not
+require release, low height, or settling, so videos stopped while the cube was
+still held above the bowl. Historical v37-v42 success percentages are therefore
+transport-arrival metrics and must not be compared to the corrected metric.
+
+Success now requires the cube center within 20 mm of the bowl center, below
+50 mm, moving slowly, free of both finger pads, for eight consecutive policy
+steps. The scripted expert remains 10/10 under this contract. V42 scores 4/8
+on the fixed set with one attempt and 5/8 with one same-scene retry. In the
+four successful single-attempt episodes, the policy grasped, carried, released,
+and settled the cube at steps 240-325; the release behavior was already learned
+but hidden by premature evaluation termination.
 
 The remaining error is spatially systematic: success is 63.2% in the central-X
 quarter but 14.7% in far X, and 73.3% in positive-central Y but 23.2% in
@@ -27,7 +41,7 @@ were passed through LayerNorm before projection, including the RGB-derived
 mean and scale, so distinct 2D locations can become identical before the first
 learned layer. The same problem affected the six joint-state values.
 
-The active experiment is **pick_v42_affine_geometry**. It keeps the VLA,
+The completed **pick_v42_affine_geometry** experiment keeps the VLA,
 DINOv2, dual cameras, language, absolute TCP action chunks, and IK execution,
 but replaces those lossy transforms with learnable per-feature affine scaling.
 It also gives the action decoder a direct deployable joint-state embedding.
@@ -46,6 +60,20 @@ a deterministic 6x6 grid. After training it compares EMA/raw weights and four
 receding-horizon modes on identical positions, runs a 200-position acceptance
 benchmark, prints stage and workspace failure bins, and writes a video. It does
 not claim success unless the independent random benchmark reaches 80%.
+
+Correct fixed-set evaluation with one autonomous same-scene retry:
+
+    cd /home/aditya/bude_vla
+    MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python \
+      scripts/eval_pick_ball.py \
+      --ckpt checkpoints/pick_v42_affine_geometry/pick_v42_affine_geometry_best.pt \
+      --raw-weights --num-episodes 8 --max-steps 450 --max-tries 2 \
+      --cube-positions '0.23,-0.02;0.25,0.00;0.27,0.02;0.29,0.04;0.31,-0.01;0.33,0.05;0.22,0.06;0.34,0.03' \
+      --out demos/videos/eval_pick_v42_strict_retry.mp4
+
+On a retry, only the arm is homed. The cube remains where the failed attempt
+left it, policy history is cleared, and the policy reobserves the scene from
+RGB. Simulator cube coordinates are not added to the policy input.
 
 Watch progress:
 

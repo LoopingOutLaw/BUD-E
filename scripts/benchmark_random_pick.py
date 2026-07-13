@@ -23,6 +23,7 @@ from bude_vla.envs.so101_mjx import (
     PICK_WORKSPACE_X_RANGE,
     PICK_WORKSPACE_Y_RANGE,
     N_ARM_JOINTS,
+    BowlPlacementTracker,
     build_pick_proprio,
     is_grasping_from_contacts,
     is_touching_cube_from_contacts,
@@ -35,7 +36,6 @@ from eval_pick_ball import (
     SUBSTEPS_PER_FRAME,
     build_batch,
     is_failure,
-    is_success,
     load_policy,
     parse_cube_positions,
     reset_arm,
@@ -102,7 +102,8 @@ def run_one(policy, model, data, renderer, text_ids, action_lo, action_hi, cfg,
             exec_first_only: bool, ensembling: bool, ensembling_k: float,
             replan_every: int, execute_horizon: int,
             contact_close_reflex: bool,
-            contact_close_steps: int, contact_close_value: float) -> dict:
+            contact_close_steps: int, contact_close_value: float,
+            max_tries: int = 1) -> dict:
     front_top_cam = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "front_top")
     wrist_cam = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_cam")
 
@@ -119,9 +120,21 @@ def run_one(policy, model, data, renderer, text_ids, action_lo, action_hi, cfg,
     first_touch_step: int | None = None
     first_grasp_step: int | None = None
     close_until = -1
+    placement = BowlPlacementTracker()
     ik = make_ik_controller(model, data) if uses_ik_action_space(cfg) else None
 
-    for step in range(max_steps):
+    for rollout_step in range(max_steps * max(1, max_tries)):
+        try_idx = rollout_step // max_steps
+        step = rollout_step % max_steps
+        if try_idx > 0 and step == 0:
+            reset_arm(model, data)
+            for _ in range(50):
+                mujoco.mj_step(model, data)
+            img_buffer = []
+            action_state = {"chunk": None, "cursor": 0, "action_queue": []}
+            close_until = -1
+            placement.reset()
+            ik = make_ik_controller(model, data) if uses_ik_action_space(cfg) else None
         renderer.update_scene(data, camera=front_top_cam)
         top = np.asarray(renderer.render()).copy()
         renderer.update_scene(data, camera=wrist_cam)
@@ -135,13 +148,13 @@ def run_one(policy, model, data, renderer, text_ids, action_lo, action_hi, cfg,
         if touching:
             touch_frames += 1
             if first_touch_step is None:
-                first_touch_step = step
+                first_touch_step = rollout_step
             if contact_close_reflex:
                 close_until = max(close_until, step + contact_close_steps)
         if grasping:
             grasp_frames += 1
             if first_grasp_step is None:
-                first_grasp_step = step
+                first_grasp_step = rollout_step
 
         proprio = build_pick_proprio(model, data, cfg.state_dim)
         batch = build_batch(stacked, proprio, text_ids, device, n_history_frames=cfg.n_history_frames)
@@ -168,14 +181,20 @@ def run_one(policy, model, data, renderer, text_ids, action_lo, action_hi, cfg,
         for _ in range(SUBSTEPS_PER_FRAME):
             mujoco.mj_step(model, data)
 
-        if is_success(data) and grasp_frames > 0:
+        if is_grasping_from_contacts(model, data) > 0.5 and not grasping:
+            grasp_frames += 1
+            if first_grasp_step is None:
+                first_grasp_step = rollout_step
+
+        if placement.update(model, data) and grasp_frames > 0:
             return {
                 "success": True,
                 "touch_frames": touch_frames,
                 "grasp_frames": grasp_frames,
                 "first_touch_step": first_touch_step,
                 "first_grasp_step": first_grasp_step,
-                "steps": step + 1,
+                "steps": rollout_step + 1,
+                "tries": try_idx + 1,
             }
         if is_failure(data, step, max_steps=max_steps):
             break
@@ -186,7 +205,8 @@ def run_one(policy, model, data, renderer, text_ids, action_lo, action_hi, cfg,
         "grasp_frames": grasp_frames,
         "first_touch_step": first_touch_step,
         "first_grasp_step": first_grasp_step,
-        "steps": max_steps,
+        "steps": max_steps * max(1, max_tries),
+        "tries": max(1, max_tries),
     }
 
 
@@ -248,6 +268,11 @@ def main() -> None:
                     help="Evaluate model_state_dict instead of EMA weights.")
     ap.add_argument("--num-episodes", type=int, default=100)
     ap.add_argument("--max-steps", type=int, default=900)
+    ap.add_argument(
+        "--max-tries", type=int, default=1,
+        help=("Maximum attempts per cube. Retries home only the arm and leave "
+              "the cube at its current physical position."),
+    )
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--img-size", type=int, default=224)
     ap.add_argument("--cube-positions", default=None)
@@ -305,13 +330,15 @@ def main() -> None:
             contact_close_reflex=args.contact_close_reflex,
             contact_close_steps=args.contact_close_steps,
             contact_close_value=args.contact_close_value,
+            max_tries=args.max_tries,
         )
         result["cube_xy"] = cube_xy
         results.append(result)
         print(
             f"ep {ep:03d} cube=({cube_xy[0]:.3f},{cube_xy[1]:.3f}) "
             f"touch={result['touch_frames']} grasp={result['grasp_frames']} "
-            f"success={result['success']} steps={result['steps']}",
+            f"success={result['success']} tries={result['tries']} "
+            f"steps={result['steps']}",
             flush=True,
         )
 
