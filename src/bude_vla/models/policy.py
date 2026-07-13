@@ -12,7 +12,7 @@ import torch.nn as nn
 
 from bude_vla.models.action_head import ContextActionHead, DirectActionHead, FlowMatchingActionHead, GripperTriggerHead
 from bude_vla.models.backbone import PolicyTransformer
-from bude_vla.models.proprio import ProprioProjector
+from bude_vla.models.proprio import ProprioProjector, feature_transform
 from bude_vla.models.soft_prompts import SoftPrompts
 from bude_vla.models.text_encoder import MiniLMTextEncoder, TinyTextEncoder
 from bude_vla.models.vision import DINOv2Tower, ViTSmall
@@ -54,7 +54,9 @@ class BUDEConfig:
     use_context_action_head: bool = False
     use_perception: bool = False
     use_perception_action_cond: bool = False
+    use_direct_proprio_action_cond: bool = False
     perception_dim: int = 3
+    input_feature_norm: str = "layernorm"  # legacy or information-preserving affine
     use_gripper_trigger_head: bool = False
     gripper_trigger_threshold: float = 0.5
     gripper_trigger_close_value: float = -1.0
@@ -121,10 +123,14 @@ class BUDEPolicy(nn.Module):
                 depth=cfg.text_depth,
                 heads=cfg.text_heads,
             )
-        self.proprio = ProprioProjector(state_dim=cfg.state_dim, out_dim=cfg.d)
+        self.proprio = ProprioProjector(
+            state_dim=cfg.state_dim,
+            out_dim=cfg.d,
+            feature_norm=cfg.input_feature_norm,
+        )
         self.perception_proj = (
             nn.Sequential(
-                nn.LayerNorm(cfg.perception_dim),
+                feature_transform(cfg.perception_dim, cfg.input_feature_norm),
                 nn.Linear(cfg.perception_dim, cfg.d),
                 nn.SiLU(),
                 nn.Linear(cfg.d, cfg.d),
@@ -213,6 +219,11 @@ class BUDEPolicy(nn.Module):
         if not self.cfg.use_perception_action_cond or self.perception_proj is None:
             return None
         state_hidden = tokens[:, self.cfg.n_prompts, :]
+        if self.cfg.use_direct_proprio_action_cond:
+            # Preserve exact kinematic state at the action decoder instead of
+            # requiring the transformer state token to retain every joint
+            # value through all attention layers.
+            state_hidden = state_hidden + self.proprio(batch["proprio"])
         perception_emb = self._perception_embedding(batch, tokens)
         return torch.cat([state_hidden, perception_emb], dim=-1)
 

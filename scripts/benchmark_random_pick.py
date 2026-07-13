@@ -190,6 +190,57 @@ def run_one(policy, model, data, renderer, text_ids, action_lo, action_hi, cfg,
     }
 
 
+def print_workspace_breakdown(
+    results: list[dict],
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    bins: int = 4,
+) -> None:
+    """Print spatial and stage failures without exposing them to the policy."""
+    no_touch = sum(r["touch_frames"] == 0 for r in results)
+    touch_no_grasp = sum(
+        r["touch_frames"] > 0 and r["grasp_frames"] == 0 for r in results
+    )
+    grasp_no_success = sum(
+        r["grasp_frames"] > 0 and not r["success"] for r in results
+    )
+    print(
+        "failure stages: "
+        f"no_contact={no_touch} touch_no_grasp={touch_no_grasp} "
+        f"grasp_no_success={grasp_no_success}"
+    )
+
+    for axis, value_index, limits in (
+        ("x", 0, x_range),
+        ("y", 1, y_range),
+    ):
+        edges = np.linspace(limits[0], limits[1], bins + 1)
+        print(f"{axis}-workspace bins:")
+        for i in range(bins):
+            include_hi = i == bins - 1
+            selected = [
+                r for r in results
+                if r["cube_xy"][value_index] >= edges[i]
+                and (
+                    r["cube_xy"][value_index] <= edges[i + 1]
+                    if include_hi else
+                    r["cube_xy"][value_index] < edges[i + 1]
+                )
+            ]
+            n_bin = len(selected)
+            if n_bin == 0:
+                continue
+            contact = sum(r["touch_frames"] > 0 for r in selected) / n_bin
+            grasp = sum(r["grasp_frames"] > 0 for r in selected) / n_bin
+            success = sum(bool(r["success"]) for r in selected) / n_bin
+            closing = "]" if include_hi else ")"
+            print(
+                f"  [{edges[i]:+.4f},{edges[i + 1]:+.4f}{closing} "
+                f"n={n_bin} contact={contact:.3f} grasp={grasp:.3f} "
+                f"success={success:.3f}"
+            )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
@@ -287,6 +338,7 @@ def main() -> None:
         print(f"median first_touch_step: {float(np.median(first_touch)):.1f}")
     else:
         print("median first_touch_step: NA")
+    print_workspace_breakdown(results, x_range, y_range)
 
     success_rate = successes / max(1, n)
     if success_rate < args.min_success_rate:

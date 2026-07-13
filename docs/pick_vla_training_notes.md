@@ -435,6 +435,89 @@ hierarchical split also follows the principle that high-level visual-language
 reasoning and low-level execution can be separated while retaining visual
 context throughout the policy.
 
+## V41 Completed Result
+
+The deterministic 6x6 training evaluation peaked at step 105k with 13/36.
+Nearby checkpoints fluctuated substantially: step 50k scored 12/36, 75k and
+90k scored 11/36, and the final 120k checkpoint scored 9/36. The selected
+step-105k checkpoint used native 16-action chunks; first-action replanning was
+0/36 because repeatedly executing the first small absolute target prevents the
+demonstrated chunk from advancing.
+
+Independent results for selected v41:
+
+```text
+200-position success:       89/200 (44.5%)
+200-position contact:      145/200 (72.5%)
+200-position strict grasp: 120/200 (60.0%)
+fixed-set video:              3/8 (37.5%)
+offline motion MAE:          2.5 mm on stored chunks
+initial-grid TCP error:      7.3 mm median, 15.2 mm p95
+```
+
+Failure stages were 55 no-contact episodes, 25 touch-without-grasp episodes,
+and 31 grasp-without-success episodes. Workspace bins exposed the larger issue:
+
+| Region | Contact | Grasp | Success |
+| --- | ---: | ---: | ---: |
+| X 0.22-0.25 | 86.2% | 70.7% | 44.8% |
+| X 0.25-0.28 | 86.0% | 71.9% | 63.2% |
+| X 0.28-0.31 | 64.7% | 58.8% | 43.1% |
+| X 0.31-0.34 | 38.2% | 23.5% | 14.7% |
+| Y -0.030--0.0075 | 51.8% | 41.1% | 23.2% |
+| Y -0.0075-0.015 | 63.5% | 51.9% | 36.5% |
+| Y 0.015-0.0375 | 91.1% | 80.0% | 73.3% |
+| Y 0.0375-0.060 | 89.4% | 72.3% | 51.1% |
+
+Source coverage does not explain the asymmetry. The 3,784 episodes divide
+24.8%, 25.6%, 24.8%, and 24.8% across four X bins. The 64k cache has the same
+24.8%, 25.7%, 24.9%, and 24.6% split, covers every episode, and contains a
+minimum of 12 rows per episode.
+
+## V42 Information-Preserving Geometry Path
+
+The remaining failure was traced to LayerNorm on compact physical vectors.
+For vectors related by `x2 = a*x1 + b`, LayerNorm produces the same result for
+positive `a`. With visible cubes the third centroid feature is fixed at one,
+and distinct 2D points inside the workspace can satisfy that relation. The
+action decoder therefore received a lossy centroid even though the cache
+contained balanced labels. Joint-state LayerNorm introduced the same class of
+collision into proprioception.
+
+V42 makes three controlled changes:
+
+1. Replace centroid and proprio LayerNorm with learnable per-feature affine
+   transforms. Inputs are already bounded, and this operation preserves every
+   feature when its scale is non-zero.
+2. Add the transformed joint-state embedding directly to the action decoder's
+   state condition so exact kinematics need not survive all transformer layers.
+3. Reinitialize only `proprio.`, `perception_proj.`, and
+   `context_action_head.` while transferring the v41 DINOv2, text, soft-prompt,
+   and transformer trunk.
+
+V42 recipe:
+
+```text
+source weights:          v41 best raw shared trunk
+dataset/cache:           unchanged v41 ee_abs / 64k history-2 cache
+input feature transform: per-feature affine
+direct action condition: transformed measured joint state
+training horizon:        160000 microsteps
+effective batch:         32
+new-module LR:           3e-5
+DINO backbone LR:        1e-7
+BC / flow:               8.0 / 0.0
+gripper dimension:       5x
+EMA:                     0.995
+selection:               deterministic 6x6 grid every 5000 steps
+deployment selection:    paired EMA/raw and horizons 8/12/16/ensemble
+acceptance:              at least 80% on 200 random positions
+```
+
+The benchmark now prints no-contact, touch-no-grasp, and grasp-no-success
+counts plus four X and Y workspace bins. This prevents a central-workspace
+improvement from hiding another edge regression.
+
 ## Post-Training Decision Protocol
 
 Do not decide from training loss or one video. Use the 200-position random
@@ -466,7 +549,7 @@ Full no-time-limit pipeline:
 
 ```bash
 cd /home/aditya/bude_vla
-bash scripts/run_v41_ee_abs.sh
+bash scripts/run_v42_affine_geometry.sh
 ```
 
 Regression tests:

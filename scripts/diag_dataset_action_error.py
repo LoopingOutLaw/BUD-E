@@ -35,7 +35,14 @@ def load_policy(path: str, device: str):
     cfg.use_context_action_head = saved_cfg.get("use_context_action_head", False)
     cfg.use_perception = saved_cfg.get("use_perception", False)
     cfg.use_perception_action_cond = saved_cfg.get("use_perception_action_cond", False)
+    cfg.use_direct_proprio_action_cond = saved_cfg.get("use_direct_proprio_action_cond", False)
     cfg.perception_dim = saved_cfg.get("perception_dim", 3)
+    cfg.input_feature_norm = saved_cfg.get("input_feature_norm", "layernorm")
+    cfg.use_gripper_trigger_head = saved_cfg.get("use_gripper_trigger_head", False)
+    cfg.gripper_trigger_threshold = saved_cfg.get("gripper_trigger_threshold", 0.5) or 0.5
+    cfg.gripper_trigger_close_value = saved_cfg.get("gripper_trigger_close_value", -1.0) or -1.0
+    cfg.action_space = saved_cfg.get("action_space", "joint_abs")
+    cfg.ee_delta_scale = saved_cfg.get("ee_delta_scale", 0.05) or 0.05
 
     policy = BUDEPolicy(cfg).to(device)
     policy.load_state_dict(ckpt.get("ema_state_dict") or ckpt["model_state_dict"])
@@ -120,21 +127,27 @@ def main() -> None:
             mask = item["mask"].detach().cpu().numpy().astype(bool)
             err = np.abs(pred[mask] - gt[mask])
             rows.append((ep_i, frame_in_ep, float(err.mean()),
-                         float(err[:, :5].mean()), float(err[:, 5].mean()),
-                         pred[0], gt[0]))
+                         float(err[:, :-1].mean()), float(err[:, -1].mean()),
+                         err.mean(axis=0), pred[0], gt[0]))
     if not rows:
         raise RuntimeError("no rows sampled")
 
     mean_all = np.mean([r[2] for r in rows])
-    mean_arm = np.mean([r[3] for r in rows])
+    mean_motion = np.mean([r[3] for r in rows])
     mean_grip = np.mean([r[4] for r in rows])
-    print(f"sampled={len(rows)} mean_abs_error all={mean_all:.4f} arm={mean_arm:.4f} grip={mean_grip:.4f}")
+    per_dim = np.mean(np.stack([r[5] for r in rows]), axis=0)
+    print(f"sampled={len(rows)} mean_abs_error all={mean_all:.4f} "
+          f"motion={mean_motion:.4f} grip={mean_grip:.4f}")
+    print(f"per_dim_mae={np.array2string(per_dim, precision=5)} "
+          f"action_space={cfg.action_space}")
     print("\nfirst-action comparisons:")
-    for ep_i, frame, mae, arm_mae, grip_mae, pred0, gt0 in rows[:20]:
+    for ep_i, frame, mae, motion_mae, grip_mae, _per_dim, pred0, gt0 in rows[:20]:
         print(f"  ep={ep_i:03d} frame={frame:04d} mae={mae:.4f} "
-              f"arm={arm_mae:.4f} grip={grip_mae:.4f}")
-        print(f"    pred0 arm={np.array2string(pred0[:5], precision=3)} grip={pred0[5]:+.3f}")
-        print(f"    gt0   arm={np.array2string(gt0[:5], precision=3)} grip={gt0[5]:+.3f}")
+              f"motion={motion_mae:.4f} grip={grip_mae:.4f}")
+        print(f"    pred0 motion={np.array2string(pred0[:-1], precision=4)} "
+              f"grip={pred0[-1]:+.3f}")
+        print(f"    gt0   motion={np.array2string(gt0[:-1], precision=4)} "
+              f"grip={gt0[-1]:+.3f}")
 
 
 if __name__ == "__main__":

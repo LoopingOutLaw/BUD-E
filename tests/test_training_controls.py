@@ -8,6 +8,35 @@ import torch
 
 
 class TrainingControlsTest(unittest.TestCase):
+    def test_affine_feature_transform_preserves_layernorm_collision(self):
+        from bude_vla.models.proprio import PerFeatureAffine
+
+        # x2 = a*x1 + b for every feature, so LayerNorm maps these distinct
+        # cube centroids to the same vector. The affine transform must not.
+        x1 = torch.tensor([[0.20, 0.10, 1.00]])
+        x2 = torch.tensor([[0.04, -0.08, 1.00]])
+
+        self.assertTrue(torch.allclose(
+            torch.nn.LayerNorm(3, elementwise_affine=False)(x1),
+            torch.nn.LayerNorm(3, elementwise_affine=False)(x2),
+            atol=1e-5,
+        ))
+        affine = PerFeatureAffine(3)
+        self.assertFalse(torch.allclose(affine(x1), affine(x2)))
+
+    def test_affine_policy_keeps_checkpoint_compatible_parameter_shapes(self):
+        from bude_vla.models.policy import BUDEConfig, BUDEPolicy
+
+        legacy_cfg = BUDEConfig(use_perception=True, input_feature_norm="layernorm")
+        fixed_cfg = BUDEConfig(use_perception=True, input_feature_norm="affine")
+        legacy = BUDEPolicy(legacy_cfg)
+        fixed = BUDEPolicy(fixed_cfg)
+
+        self.assertEqual(
+            {k: tuple(v.shape) for k, v in legacy.state_dict().items()},
+            {k: tuple(v.shape) for k, v in fixed.state_dict().items()},
+        )
+
     def test_bc_loss_weights_emphasize_gripper_and_late_phase(self):
         from scripts.train import build_bc_loss_weights
 

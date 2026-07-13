@@ -11,60 +11,49 @@ post-rollout metrics.
 
 ## Current Status
 
-V39 remains the strongest completed learned joint-space policy: 31/150 success
-(20.7%), 52.7% contact, and 32.0% strict grasp. V40 did not solve the remaining
-failure. Its deterministic 6x6 workspace evaluation peaked at 8/36 (22%) at
-step 45k and ended at 2/36 (6%) at step 60k.
+V41 is the strongest completed learned policy. Its selected step-105k absolute
+task-space checkpoint scored **89/200 success (44.5%)**, 145/200 contact
+(72.5%), and 120/200 strict grasp (60.0%) on random workspace positions. This
+more than doubled v39's 20.7% joint-space result. The fixed set remained 3/8.
 
-V40 did pass the shoulder-pan span check, but its shoulder-lift span was only
-0.008 rad. Forward-kinematics analysis then exposed a flaw in that diagnostic:
-the arm may trade shoulder-lift against elbow, so requiring one expert joint
-trajectory is not a valid task-level gate. The correct measurement is the
-predicted gripper target. V40 has 15.8 mm median and 22.5 mm p95 first-action
-TCP error, which is large relative to a 30 mm cube.
+The remaining error is spatially systematic: success is 63.2% in the central-X
+quarter but 14.7% in far X, and 73.3% in positive-central Y but 23.2% in
+negative Y. This is not missing data: all 3,784 demonstrations are represented
+in the 64k cache and both episode and cache coverage are uniform by workspace.
 
-The active experiment is **pick_v41_ee_abs**. It removes inverse kinematics from
-what the network must learn: the VLA predicts absolute TCP x/y/z plus gripper,
-and the shared IK controller converts that prediction to SO-101 joint targets.
-Runtime inputs remain top/wrist RGB, language, and six measured joint/gripper
-positions. No simulator cube coordinates, progress clock, or contact flags are
-policy inputs.
+Inspection exposed an architectural information-loss bug. Compact vectors
+were passed through LayerNorm before projection, including the RGB-derived
+`[pixel_x, pixel_y, valid]` centroid. Per-sample LayerNorm removes cross-feature
+mean and scale, so distinct 2D locations can become identical before the first
+learned layer. The same problem affected the six joint-state values.
 
-The representation was accepted before training:
+The active experiment is **pick_v42_affine_geometry**. It keeps the VLA,
+DINOv2, dual cameras, language, absolute TCP action chunks, and IK execution,
+but replaces those lossy transforms with learnable per-feature affine scaling.
+It also gives the action decoder a direct deployable joint-state embedding.
+No cube coordinates, progress clock, simulator contacts, or other privileged
+state are added.
 
-    camera-only visual-servo expert: 100/100 success
-    original joint-action replay:    200/200 success
-    ee_abs in-memory replay:           98/100 success
-    ee_abs production replay:         199/200 success (99.5%)
-    v40 first-action TCP error:       15.8 mm median, 22.5 mm p95
-
-The **ee_abs** replay uses the exact production conversion and IK execution path.
-This establishes a 99.5% control/data ceiling; v41 training measures whether the
-VLA can infer those task-space targets from its deployable observations.
-
-## Run V41
+## Run V42
 
     cd /home/aditya/bude_vla
-    bash scripts/run_v41_ee_abs.sh
+    bash scripts/run_v42_affine_geometry.sh
 
-The launcher reuses the 3,784 verified v37 episodes and the 64k memory-mapped
-image cache. Relabeling changes only action coordinates and symlinks videos, so
-it adds about 100 MiB rather than duplicating the 42 GiB source dataset.
-
-V41 initializes the shared visual-language trunk from v40 raw weights, rebuilds
-the incompatible 4D action outputs, trains for up to 120,000 microsteps, and
-selects checkpoints on a deterministic 6x6 workspace grid. It then compares native chunks with first-action replanning on the same 36 positions. The final decision
-is a 200-position random benchmark. The script exits nonzero below 80%, writes
-a fixed-set video either way, preserves step checkpoints on failure, and prunes
-them only after the 80% gate passes.
+V42 reuses the v41 task-space dataset and existing 36 GiB image cache. It
+retains the trained DINOv2/transformer trunk, deliberately rebuilds only the
+proprio, pixel-centroid, and context-action modules, and selects checkpoints on
+a deterministic 6x6 grid. After training it compares EMA/raw weights and four
+receding-horizon modes on identical positions, runs a 200-position acceptance
+benchmark, prints stage and workspace failure bins, and writes a video. It does
+not claim success unless the independent random benchmark reaches 80%.
 
 Watch progress:
 
     cd /home/aditya/bude_vla
     tail -F \
-      logs/pick_v41_train.log \
-      logs/pick_v41_task_space_sensitivity.log \
-      logs/pick_v41_random_bench.log
+      logs/pick_v42_train.log \
+      logs/pick_v42_task_space_sensitivity.log \
+      logs/pick_v42_random_bench.log
 
 ## V39 Completed Result
 
@@ -204,7 +193,8 @@ retain eval frames unless video recording is explicitly enabled.
 ## Repository Map
 
 ```text
-scripts/run_v41_ee_abs.sh             Active task-space VLA pipeline
+scripts/run_v42_affine_geometry.sh     Active information-preserving VLA pipeline
+scripts/run_v41_ee_abs.sh              Completed absolute task-space baseline
 scripts/run_v40_radial_precision.sh Completed joint-space radial experiment
 scripts/run_v39_shoulder_precision.sh Completed shoulder-pan precision run
 scripts/run_v38_broad_cache.sh        Completed broad-cache baseline
