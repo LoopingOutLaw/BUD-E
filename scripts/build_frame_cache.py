@@ -24,6 +24,23 @@ class EpisodeInfo:
     contact_locals: list[int]
 
 
+def parse_anchor_local_frames(spec: str | None) -> list[int]:
+    """Parse required episode-local frame indices such as ``0,1,4,8``."""
+    if spec is None or not str(spec).strip():
+        return []
+    frames: list[int] = []
+    for raw in str(spec).split(','):
+        try:
+            frame = int(raw.strip())
+        except ValueError as exc:
+            raise ValueError("anchor local frames must be comma-separated integers") from exc
+        if frame < 0:
+            raise ValueError("anchor local frames must be non-negative")
+        if frame not in frames:
+            frames.append(frame)
+    return frames
+
+
 def parse_weighted_phase_ranges(spec: str | None) -> list[tuple[float, float, float]]:
     if spec is None or not str(spec).strip():
         return []
@@ -84,6 +101,7 @@ def select_cache_frame_indices(
     contact_prob: float,
     contact_jitter: int,
     min_frames_per_episode: int = 0,
+    anchor_local_frames: list[int] | tuple[int, ...] = (),
 ) -> dict[int, set[int]]:
     selected_by_ep: dict[int, set[int]] = {e.ep_idx: set() for e in episodes}
     if not episodes or max_frames <= 0:
@@ -93,16 +111,32 @@ def select_cache_frame_indices(
     weights = ep_lengths.astype(np.float64)
     weights /= weights.sum()
     n_eps = len(episodes)
+    selected_count = 0
 
     contact_refs: list[tuple[int, int]] = []
     for ep_i, ep in enumerate(episodes):
         for local in ep.contact_locals:
             contact_refs.append((ep_i, local))
 
-    def add_local(ep_i: int, local: int) -> None:
+    def add_local(ep_i: int, local: int) -> bool:
+        nonlocal selected_count
+        if selected_count >= max_frames:
+            return False
         ep = episodes[ep_i]
         local = min(max(int(local), 0), ep.length - 1)
+        before = len(selected_by_ep[ep.ep_idx])
         selected_by_ep[ep.ep_idx].add(local)
+        if len(selected_by_ep[ep.ep_idx]) > before:
+            selected_count += 1
+            return True
+        return False
+
+    # Eval starts at the exact reset state with a padded image history. Random
+    # phase bins almost never select frame zero, so explicitly cover reset and
+    # the first few control frames for every demonstrated cube position.
+    for ep_i, _ep in enumerate(episodes):
+        for local in anchor_local_frames:
+            add_local(ep_i, local)
 
     coverage_per_ep = min(
         max(0, int(min_frames_per_episode)),
@@ -121,7 +155,7 @@ def select_cache_frame_indices(
             lo = bin_i / phase_bins
             hi = (bin_i + 1) / phase_bins
             target = min(max_frames, (bin_i + 1) * per_bin)
-            while sum(len(v) for v in selected_by_ep.values()) < target:
+            while selected_count < target:
                 ep_i = int(rng.choice(n_eps, p=weights))
                 ep = episodes[ep_i]
                 phase = float(rng.uniform(lo, hi))
@@ -131,7 +165,7 @@ def select_cache_frame_indices(
 
     attempts = 0
     max_attempts = max_frames * 100
-    while sum(len(v) for v in selected_by_ep.values()) < max_frames and attempts < max_attempts:
+    while selected_count < max_frames and attempts < max_attempts:
         attempts += 1
         use_contact = contact_refs and rng.random() < contact_prob
         if use_contact:
@@ -166,6 +200,11 @@ def main() -> None:
                     help='Local frame jitter around sampled contact frames.')
     ap.add_argument('--min-frames-per-episode', type=int, default=0,
                     help='Guarantee this many phase-stratified cache rows per episode before random sampling.')
+    ap.add_argument(
+        '--anchor-local-frames', default=None,
+        help=('Comma-separated exact episode-local frames required for every '
+              'episode, e.g. 0,1,2,4,8,16. Covers the deployment reset state.'),
+    )
     args = ap.parse_args()
 
     root = Path(args.data_root)
@@ -196,6 +235,12 @@ def main() -> None:
 
     rng = np.random.default_rng(args.seed)
     phase_ranges = parse_weighted_phase_ranges(args.phase_ranges)
+    anchor_local_frames = parse_anchor_local_frames(args.anchor_local_frames)
+    if len(anchor_local_frames) * len(episodes) > args.max_frames:
+        raise ValueError(
+            "--max-frames is too small to include every requested anchor "
+            f"({len(anchor_local_frames)} anchors x {len(episodes)} episodes)"
+        )
     selected_by_ep = select_cache_frame_indices(
         episodes=episodes,
         max_frames=args.max_frames,
@@ -207,6 +252,7 @@ def main() -> None:
         contact_prob=max(0.0, min(1.0, args.contact_prob)),
         contact_jitter=max(0, args.contact_jitter),
         min_frames_per_episode=max(0, args.min_frames_per_episode),
+        anchor_local_frames=anchor_local_frames,
     )
     if args.contact_prob > 0.0:
         print(f'contact-aware sampling: contact_frames={n_contact_frames} contact_prob={args.contact_prob:.2f}', flush=True)
@@ -262,6 +308,7 @@ def main() -> None:
         'contact_jitter': int(args.contact_jitter),
         'contact_frames_available': int(n_contact_frames),
         'min_frames_per_episode': int(args.min_frames_per_episode),
+        'anchor_local_frames': anchor_local_frames,
     }
     (out / 'meta.json').write_text(json.dumps(meta, indent=2))
     print(f'done: {out} frames={total_sel} shape={(total_sel, H, W, channels)}')

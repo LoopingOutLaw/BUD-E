@@ -15,37 +15,21 @@ import torch
 
 from bude_vla.data.action_normalization import denormalize_actions
 from bude_vla.data.lerobot_v3 import BUDETrainingDataset
-from bude_vla.models.policy import BUDEConfig, BUDEPolicy
+from bude_vla.models.policy import BUDEConfig, BUDEPolicy, apply_saved_config
 
 
-def load_policy(path: str, device: str):
+def load_policy(path: str, device: str, *, use_ema: bool = True):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     saved_cfg = ckpt.get("config", {})
     cfg = BUDEConfig()
-    cfg.use_dinov2 = saved_cfg.get("use_dinov2", False)
-    cfg.use_minilm = saved_cfg.get("use_minilm", False)
-    cfg.dinov2_finetune_blocks = saved_cfg.get("dinov2_finetune_blocks", 4)
-    cfg.n_history_frames = saved_cfg.get("n_history_frames", 1)
-    cfg.chunk_size = saved_cfg.get("chunk_size", 4)
-    cfg.img_size = saved_cfg.get("img_size", 224)
-    cfg.action_dim = saved_cfg.get("action_dim", 6)
-    cfg.state_dim = saved_cfg.get("state_dim", 6)
-    cfg.use_bc_head = saved_cfg.get("use_bc_head", False)
-    cfg.use_visual_action_cond = saved_cfg.get("use_visual_action_cond", False)
-    cfg.use_context_action_head = saved_cfg.get("use_context_action_head", False)
-    cfg.use_perception = saved_cfg.get("use_perception", False)
-    cfg.use_perception_action_cond = saved_cfg.get("use_perception_action_cond", False)
-    cfg.use_direct_proprio_action_cond = saved_cfg.get("use_direct_proprio_action_cond", False)
-    cfg.perception_dim = saved_cfg.get("perception_dim", 3)
-    cfg.input_feature_norm = saved_cfg.get("input_feature_norm", "layernorm")
-    cfg.use_gripper_trigger_head = saved_cfg.get("use_gripper_trigger_head", False)
-    cfg.gripper_trigger_threshold = saved_cfg.get("gripper_trigger_threshold", 0.5) or 0.5
-    cfg.gripper_trigger_close_value = saved_cfg.get("gripper_trigger_close_value", -1.0) or -1.0
-    cfg.action_space = saved_cfg.get("action_space", "joint_abs")
-    cfg.ee_delta_scale = saved_cfg.get("ee_delta_scale", 0.05) or 0.05
+    cfg.chunk_size = 4
+    apply_saved_config(cfg, saved_cfg)
 
     policy = BUDEPolicy(cfg).to(device)
-    policy.load_state_dict(ckpt.get("ema_state_dict") or ckpt["model_state_dict"])
+    policy.load_state_dict(
+        ckpt.get("ema_state_dict") or ckpt["model_state_dict"]
+        if use_ema else ckpt["model_state_dict"]
+    )
     policy.eval()
 
     lo = np.asarray(ckpt["action_norm_lo"], dtype=np.float32)
@@ -62,12 +46,17 @@ def main() -> None:
     ap.add_argument("--episodes", type=int, default=4)
     ap.add_argument("--samples-per-episode", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--raw-weights", action="store_true",
+                    help="Evaluate model_state_dict instead of EMA weights.")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    policy, cfg, lo, hi, ckpt = load_policy(args.ckpt, device)
+    policy, cfg, lo, hi, ckpt = load_policy(
+        args.ckpt, device, use_ema=not args.raw_weights
+    )
     print(f"checkpoint step={ckpt.get('step')} img={cfg.img_size} chunk={cfg.chunk_size} "
-          f"history={cfg.n_history_frames} state={cfg.state_dim} action={cfg.action_dim}")
+          f"history={cfg.n_history_frames} state={cfg.state_dim} action={cfg.action_dim} "
+          f"weights={'raw' if args.raw_weights else 'ema'}")
 
     ds = BUDETrainingDataset(
         Path(args.data_root),

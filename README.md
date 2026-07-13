@@ -11,9 +11,9 @@ post-rollout metrics.
 
 ## Current Status
 
-V42 is the current learned policy. It preserves camera and joint geometry,
-predicts absolute TCP targets plus gripper control, and executes them through
-IK. The selected artifact is the raw step-155k checkpoint stored as
+V42 is the retained learned-policy baseline. It preserves camera and joint
+geometry, predicts absolute TCP targets plus gripper control, and executes them
+through IK. Its selected raw step-155k artifact is stored as
 `checkpoints/pick_v42_affine_geometry/pick_v42_affine_geometry_best.pt`.
 
 An outcome-audit found that all earlier evaluators declared success when a
@@ -22,54 +22,65 @@ require release, low height, or settling, so videos stopped while the cube was
 still held above the bowl. Historical v37-v42 success percentages are therefore
 transport-arrival metrics and must not be compared to the corrected metric.
 
-Success now requires the cube center within 20 mm of the bowl center, below
+Success requires the cube center within 20 mm of the bowl center, below
 50 mm, moving slowly, free of both finger pads, for eight consecutive policy
-steps. The scripted expert remains 10/10 under this contract. V42 scores 4/8
-on the fixed set with one attempt and 5/8 with one same-scene retry. In the
-four successful single-attempt episodes, the policy grasped, carried, released,
-and settled the cube at steps 240-325; the release behavior was already learned
-but hidden by premature evaluation termination.
+steps. V42 scores 4/8 on the fixed set with one attempt and 5/8 with one
+same-scene retry. Its independent 200-position one-try baseline is 81/200
+(40.5%) strict success, 132/200 contact, and 108/200 strict grasp. This broad
+result, rather than the fixed eight positions, is the starting point for v43.
 
-The remaining error is spatially systematic: success is 63.2% in the central-X
-quarter but 14.7% in far X, and 73.3% in positive-central Y but 23.2% in
-negative Y. This is not missing data: all 3,784 demonstrations are represented
-in the 64k cache and both episode and cache coverage are uniform by workspace.
+The corrected failures are spatially systematic. One-try strict success is
+70.9% in central X but 11.8% at far X; the four Y bins score 24.4%, 41.7%,
+60.0%, and 29.8%. Full-chunk diagnostics explain the gap: the expert endpoint
+changes 1.021 m/m in X and 1.004 m/m in Y, while v42 changes only 0.799 and
+0.401. Its endpoint p95 error is 47.7 mm, well outside grasp tolerance.
 
-Inspection exposed an architectural information-loss bug. Compact vectors
-were passed through LayerNorm before projection, including the RGB-derived
-`[pixel_x, pixel_y, valid]` centroid. Per-sample LayerNorm removes cross-feature
-mean and scale, so distinct 2D locations can become identical before the first
-learned layer. The same problem affected the six joint-state values.
+Inspection also found a demonstration bug. During CLOSE, the scripted teacher
+recomputed its target from the live cube every step. When the moving jaw nudged
+the cube, the whole arm chased it sideways instead of holding position and
+closing against the static finger. Those trajectories taught the visible sweep
+after contact. CLOSE now captures one fixed world-space anchor; the corrected
+expert passed 100/100 strict randomized episodes, and its policy-rate recorder
+passed 19/20 in the preflight pilot.
 
-The completed **pick_v42_affine_geometry** experiment keeps the VLA,
-DINOv2, dual cameras, language, absolute TCP action chunks, and IK execution,
-but replaces those lossy transforms with learnable per-feature affine scaling.
-It also gives the action decoder a direct deployable joint-state embedding.
-No cube coordinates, progress clock, simulator contacts, or other privileged
-state are added.
+The active **pick_v43_strict_geometry** pipeline therefore regenerates all
+demonstrations instead of extending flawed data. It keeps the VLA, DINOv2,
+dual cameras, language, absolute TCP action chunks, and IK execution, and adds:
 
-## Run V42
+- a zero-initialized residual from measured joint state plus an RGB-derived red
+  component centroid directly to action logits;
+- exact reset and early-control cache anchors for every demonstrated cube;
+- L1 action regression with increasing weight across the 16-action chunk;
+- a fresh context action decoder with a separate learning rate;
+- raw-weight strict grid checkpoint selection and bounded checkpoint retention.
+
+The centroid is calculated from camera pixels and can run on the real camera;
+it is not a simulator coordinate. Simulator cube state remains restricted to
+the teacher and metrics. No progress clock, target coordinate, or simulator
+contact is supplied to the policy.
+
+## Run V43
 
     cd /home/aditya/bude_vla
-    bash scripts/run_v42_affine_geometry.sh
+    bash scripts/run_v43_strict_geometry.sh
 
-V42 reuses the v41 task-space dataset and existing 36 GiB image cache. It
-retains the trained DINOv2/transformer trunk, deliberately rebuilds only the
-proprio, pixel-centroid, and context-action modules, and selects checkpoints on
-a deterministic 6x6 grid. After training it compares EMA/raw weights and four
-receding-horizon modes on identical positions, runs a 200-position acceptance
-benchmark, prints stage and workspace failure bins, and writes a video. It does
-not claim success unless the independent random benchmark reaches 80%.
+The script has no timeout and is resumable at completed data/cache stages and
+recent training checkpoints. It records up to 5,000 fresh attempts, rejects
+failed policy-rate replays, validates both joint and converted `ee_abs`
+controls, builds a 52k-frame cache, and trains for 220k steps. It then compares
+five execution modes, logs separate 200-position one-try and two-try results,
+and claims the target only if autonomous same-scene retries reach at least 80%
+under the strict released-and-settled metric.
 
 Correct fixed-set evaluation with one autonomous same-scene retry:
 
     cd /home/aditya/bude_vla
     MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python \
       scripts/eval_pick_ball.py \
-      --ckpt checkpoints/pick_v42_affine_geometry/pick_v42_affine_geometry_best.pt \
+      --ckpt checkpoints/pick_v43_strict_geometry/pick_v43_strict_geometry_best.pt \
       --raw-weights --num-episodes 8 --max-steps 450 --max-tries 2 \
       --cube-positions '0.23,-0.02;0.25,0.00;0.27,0.02;0.29,0.04;0.31,-0.01;0.33,0.05;0.22,0.06;0.34,0.03' \
-      --out demos/videos/eval_pick_v42_strict_retry.mp4
+      --out demos/videos/eval_pick_v43_strict_geometry.mp4
 
 On a retry, only the arm is homed. The cube remains where the failed attempt
 left it, policy history is cleared, and the policy reobserves the scene from
@@ -79,9 +90,9 @@ Watch progress:
 
     cd /home/aditya/bude_vla
     tail -F \
-      logs/pick_v42_train.log \
-      logs/pick_v42_task_space_sensitivity.log \
-      logs/pick_v42_random_bench.log
+      logs/pick_v43_train.log \
+      logs/pick_v43_chunk_geometry.log \
+      logs/pick_v43_random_two_try.log
 
 ## V39 Completed Result
 
@@ -206,28 +217,26 @@ repeated random-position coverage follows
 
 ## Memory And Storage
 
-The v38 cache is approximately 36 GiB:
+The v43 cache is bounded at approximately 31 GiB:
 
 ```text
-64000 frames * 224 * 224 * (2 histories * 6 RGB channels) * 1 byte
+52000 frames * 224 * 224 * (2 histories * 6 RGB channels) * 1 byte
 ```
 
 Training uses batch size 4, gradient accumulation 8, and in-process data
-loading with zero workers. The effective batch is 32 while the 36 GiB cache remains memory-mapped instead of
+loading with zero workers. The effective batch is 32 while the cache remains memory-mapped instead of
 being copied into RAM. The runner checks free disk and available RAM before
 expensive stages, sets a repository-local temporary directory, and does not
-retain eval frames unless video recording is explicitly enabled.
+retain eval frames unless video recording is explicitly enabled. Training keeps
+only three recent step checkpoints plus `best.pt` and `final.pt`.
 
 ## Repository Map
 
 ```text
-scripts/run_v42_affine_geometry.sh     Active information-preserving VLA pipeline
-scripts/run_v41_ee_abs.sh              Completed absolute task-space baseline
-scripts/run_v40_radial_precision.sh Completed joint-space radial experiment
-scripts/run_v39_shoulder_precision.sh Completed shoulder-pan precision run
-scripts/run_v38_broad_cache.sh        Completed broad-cache baseline
-scripts/run_v37_camera_fixed.sh       Reproducible fresh v37 baseline pipeline
-scripts/benchmark_visual_servo_pick.py Camera-only perception/mechanics gate
+scripts/run_v43_strict_geometry.sh      Active fresh-data strict VLA pipeline
+scripts/run_v42_affine_geometry.sh      Archived affine-geometry baseline recipe
+scripts/run_v37_camera_fixed.sh         Archived fresh-data baseline recipe
+scripts/benchmark_scripted_pick.py      Strict expert/mechanics gate
 scripts/record_pick_episodes.py        Fresh demonstration recorder
 scripts/validate_dataset_replay.py     Persisted-action contract gate
 scripts/build_frame_cache.py           Bounded frame/history cache builder

@@ -50,7 +50,7 @@ from bude_vla.envs.so101_mjx import (
     is_touching_cube_from_contacts,
     build_pick_proprio,
 )
-from bude_vla.models.policy import BUDEPolicy, BUDEConfig
+from bude_vla.models.policy import BUDEPolicy, BUDEConfig, apply_saved_config
 from bude_vla.perception import detect_red_centroid
 
 INSTRUCTION = "pick up the red cube and place it in the blue target zone"
@@ -62,26 +62,10 @@ def load_policy(ckpt_path: str, img_size: int, device: str, *,
                 use_ema: bool = True):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = BUDEConfig()
-
     saved_cfg = ckpt.get("config", {})
-    cfg.use_dinov2 = saved_cfg.get("use_dinov2", False)
-    cfg.use_minilm = saved_cfg.get("use_minilm", False)
-    cfg.n_history_frames = saved_cfg.get("n_history_frames", 1)
-    cfg.chunk_size = saved_cfg.get("chunk_size", 4)
-    cfg.img_size = saved_cfg.get("img_size", img_size)
-    cfg.use_bc_head = saved_cfg.get("use_bc_head", False)
-    cfg.use_visual_action_cond = saved_cfg.get("use_visual_action_cond", False)
-    cfg.use_context_action_head = saved_cfg.get("use_context_action_head", False)
-    cfg.use_perception = saved_cfg.get("use_perception", False)
-    cfg.use_perception_action_cond = saved_cfg.get("use_perception_action_cond", False)
-    cfg.use_direct_proprio_action_cond = saved_cfg.get("use_direct_proprio_action_cond", False)
-    cfg.perception_dim = saved_cfg.get("perception_dim", 3)
-    cfg.input_feature_norm = saved_cfg.get("input_feature_norm", "layernorm")
-    cfg.use_gripper_trigger_head = saved_cfg.get("use_gripper_trigger_head", False)
-    cfg.gripper_trigger_threshold = saved_cfg.get("gripper_trigger_threshold", 0.5) or 0.5
-    cfg.gripper_trigger_close_value = saved_cfg.get("gripper_trigger_close_value", -1.0) or -1.0
-    cfg.action_space = saved_cfg.get("action_space", "joint_abs")
-    cfg.ee_delta_scale = saved_cfg.get("ee_delta_scale", 0.05) or 0.05
+    cfg.img_size = img_size
+    cfg.chunk_size = 4
+    apply_saved_config(cfg, saved_cfg)
 
     action_lo = ckpt.get("action_norm_lo", None)
     action_hi = ckpt.get("action_norm_hi", None)

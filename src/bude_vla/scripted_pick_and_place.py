@@ -180,6 +180,10 @@ class ScriptedPickAndPlace:
         self._last_grasp_contact_step = None
         self._grasp_action = GRIPPER_CLOSED
         self._grasp_succeeded = False
+        # CLOSE must hold a fixed world target. Following the live cube while
+        # one jaw pushes it makes the entire arm chase the object across the
+        # table instead of closing against the static finger.
+        self._close_anchor_xyz: np.ndarray | None = None
 
         # Store cube position at start (for approach target)
         self._cube_start_xyz = np.array([cube_start_xy[0], cube_start_xy[1], CUBE_REST_Z])
@@ -200,6 +204,11 @@ class ScriptedPickAndPlace:
     def _capture_grasp_anchor(self, data) -> None:
         """Remember where the cube was grasped, including retry displacement."""
         self._grasp_anchor_xyz = self._cube_xyz(data)
+
+    def _begin_close(self, data) -> None:
+        self._close_anchor_xyz = self._cube_xyz(data)
+        self.phase = CLOSE
+        self.phase_step = 0
 
     def _reacquire_cube_if_available(self, data) -> None:
         reacquire = getattr(self._cube_position_provider, "reacquire", None)
@@ -291,8 +300,7 @@ class ScriptedPickAndPlace:
                 self.phase = BACKOFF
                 self.phase_step = 0
             elif self.phase_step >= DESCENT_STEPS:
-                self.phase = CLOSE
-                self.phase_step = 0
+                self._begin_close(data)
 
         elif self.phase == BACKOFF:
             backoff_pos = self._cube_xyz(data).copy()
@@ -311,7 +319,11 @@ class ScriptedPickAndPlace:
 
         elif self.phase == CLOSE:
             # Contact-triggered closing (matching pick-101 exactly)
-            grasp_target = self._cube_xyz(data).copy()
+            # DAgger can seed the expert directly into CLOSE, so initialize
+            # lazily as well as through the normal DESCENT transition.
+            if self._close_anchor_xyz is None:
+                self._close_anchor_xyz = self._cube_xyz(data)
+            grasp_target = self._close_anchor_xyz.copy()
             grasp_target[2] += GRASP_Z_OFFSET
             grasp_target[1] += FINGER_WIDTH_OFFSET
             if self._retries_used == 0:
@@ -374,6 +386,7 @@ class ScriptedPickAndPlace:
                     self._contact_step = None
                     self._contact_action = None
                     self._last_grasp_contact_step = None
+                    self._close_anchor_xyz = None
                     self.phase = APPROACH
                     self.phase_step = 0
                 else:

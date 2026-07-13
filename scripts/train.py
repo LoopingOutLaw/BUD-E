@@ -69,10 +69,15 @@ def build_bc_loss_weights(
     gripper_loss_weight: float,
     shoulder_pan_loss_weight: float = 1.0,
     shoulder_lift_loss_weight: float = 1.0,
+    chunk_end_bc_weight: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return sample/dimension weights and denominator for weighted BC loss."""
+    if chunk_end_bc_weight <= 0.0:
+        raise ValueError("chunk_end_bc_weight must be positive")
     if phase is None:
-        sample_w = torch.ones((mask.shape[0], 1, 1), device=mask.device, dtype=mask.dtype)
+        phase_w = torch.ones(
+            (mask.shape[0], 1, 1), device=mask.device, dtype=mask.dtype
+        )
     else:
         phase = phase.to(device=mask.device, dtype=mask.dtype)
         sample_w_1d = torch.ones_like(phase)
@@ -88,7 +93,19 @@ def build_bc_loss_weights(
                 torch.full_like(sample_w_1d, late_bc_weight),
                 sample_w_1d,
             )
-        sample_w = sample_w_1d.view(-1, 1, 1)
+        phase_w = sample_w_1d.view(-1, 1, 1)
+
+    # The rollout executes a chunk open loop. Later chunk targets therefore
+    # determine whether the approach actually reaches the object instead of
+    # merely moving in the right direction for the first control step.
+    chunk_w = torch.linspace(
+        1.0,
+        float(chunk_end_bc_weight),
+        mask.shape[1],
+        device=mask.device,
+        dtype=mask.dtype,
+    ).view(1, -1, 1)
+    sample_w = phase_w * chunk_w
 
     dim_w = build_action_dim_weights(
         action_dim, mask.device, mask.dtype, gripper_loss_weight,
@@ -96,6 +113,39 @@ def build_bc_loss_weights(
     dim_w_view = dim_w.view(1, 1, action_dim)
     denom = (mask.unsqueeze(-1) * sample_w * dim_w_view).sum().clamp_min(1.0)
     return sample_w, dim_w, denom
+
+
+def build_bc_error(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    loss_type: str,
+) -> torch.Tensor:
+    """Return unreduced deterministic action regression error."""
+    if loss_type == "mse":
+        return (prediction - target) ** 2
+    if loss_type == "l1":
+        return (prediction - target).abs()
+    if loss_type == "smooth_l1":
+        return nn.functional.smooth_l1_loss(
+            prediction, target, reduction="none", beta=0.1
+        )
+    raise ValueError(f"Unsupported BC loss type: {loss_type!r}")
+
+
+def prune_step_checkpoints(
+    checkpoint_dir: Path, task_name: str, keep_last: int
+) -> list[Path]:
+    """Remove older reproducible step snapshots while retaining recent ones."""
+    if keep_last <= 0:
+        return []
+    step_files = sorted(
+        checkpoint_dir.glob(f"{task_name}_step_*.pt"),
+        key=lambda path: path.name,
+    )
+    removed = step_files[:-keep_last]
+    for path in removed:
+        path.unlink()
+    return removed
 
 
 class PhaseBalancedBatchSampler(torch.utils.data.Sampler[list[int]]):
@@ -402,6 +452,7 @@ def train(
     img_size: int = 224,
     lr: float = 3e-4,
     backbone_lr: float = 1e-5,
+    action_head_lr: float | None = None,
     weight_decay: float = 1e-4,
     save_every: int = 5000,
     device: str = "cuda",
@@ -432,6 +483,7 @@ def train(
     use_perception: bool = True,
     use_perception_action_cond: bool = True,
     use_direct_proprio_action_cond: bool = False,
+    use_raw_geometry_action_cond: bool = False,
     input_feature_norm: str = "layernorm",
     early_bc_weight: float = 12.0,
     early_bc_frac: float = 0.22,
@@ -440,6 +492,8 @@ def train(
     gripper_loss_weight: float = 1.0,
     shoulder_pan_loss_weight: float = 1.0,
     shoulder_lift_loss_weight: float = 1.0,
+    bc_loss_type: str = "mse",
+    chunk_end_bc_weight: float = 1.0,
     use_gripper_trigger_head: bool = False,
     gripper_trigger_loss_weight: float = 1.0,
     gripper_trigger_label_threshold: float = 0.0,
@@ -452,11 +506,17 @@ def train(
     lazy_cache_size: int = 8,
     episode_batches: bool = True,
     frame_cache: str | None = None,
+    keep_last_checkpoints: int = 0,
 ):
     if data_roots is None:
         raise ValueError(
             "Must specify --data-root. Default reach+push data is not "
             "appropriate for pick-and-place training."
+        )
+    if flow_loss_weight == 0.0 and not use_bc_head:
+        raise ValueError(
+            "At least one trained action objective is required; do not combine "
+            "--flow-loss-weight=0 with --no-bc-head."
         )
     torch.manual_seed(train_seed)
     np.random.seed(train_seed)
@@ -485,6 +545,7 @@ def train(
     cfg.use_perception = use_perception
     cfg.use_perception_action_cond = use_perception_action_cond
     cfg.use_direct_proprio_action_cond = use_direct_proprio_action_cond
+    cfg.use_raw_geometry_action_cond = use_raw_geometry_action_cond
     cfg.perception_dim = 3
     cfg.input_feature_norm = input_feature_norm
     cfg.use_gripper_trigger_head = use_gripper_trigger_head
@@ -613,26 +674,45 @@ def train(
                           action_stats=(_action_lo, _action_hi),
                           target_state_dim=cfg.state_dim)
 
+    if flow_loss_weight == 0.0:
+        for param in policy.action_head.parameters():
+            param.requires_grad_(False)
+        print("  flow head frozen: --flow-loss-weight=0")
+    if cfg.use_context_action_head and policy.bc_action_head is not None:
+        for param in policy.bc_action_head.parameters():
+            param.requires_grad_(False)
+        print("  legacy vector BC head frozen: context decoder is active")
+
     # Differential LR: pretrained DINOv2 backbone gets backbone_lr,
     # new modules (proj, text, proprio, backbone transformer, action head) get lr.
     # NOTE: patch_embed is excluded from pretrained group — with n_history_frames>1,
     # most input channels are zero-initialized and need the full lr, not backbone_lr.
     pretrained_params = []
+    action_decoder_params = []
     new_params = []
+    action_head_lr = lr if action_head_lr is None else float(action_head_lr)
+    action_prefixes = (
+        "action_head.", "bc_action_head.", "context_action_head.",
+        "gripper_trigger_head.",
+    )
     for name, p in policy.named_parameters():
         if not p.requires_grad:
             continue
         if use_dinov2 and "vision.backbone" in name and "patch_embed" not in name:
             pretrained_params.append(p)
+        elif name.startswith(action_prefixes):
+            action_decoder_params.append(p)
         else:
             new_params.append(p)
     param_groups = [
         {"params": pretrained_params, "lr": backbone_lr},
         {"params": new_params, "lr": lr},
+        {"params": action_decoder_params, "lr": action_head_lr},
     ]
     optimizer = AdamW(param_groups, weight_decay=weight_decay)
     print(f"  pretrained backbone params: {sum(p.numel() for p in pretrained_params):,} (lr={backbone_lr})")
     print(f"  new module params: {sum(p.numel() for p in new_params):,} (lr={lr})")
+    print(f"  action decoder params: {sum(p.numel() for p in action_decoder_params):,} (lr={action_head_lr})")
     print(f"  effective batch size: {batch_size * grad_accum_steps}")
 
     scaler = GradScaler("cuda", enabled=(device == "cuda"))
@@ -690,9 +770,16 @@ def train(
             ("use_perception", cfg.use_perception, saved_cfg.get("use_perception", False)),
             ("use_perception_action_cond", cfg.use_perception_action_cond, saved_cfg.get("use_perception_action_cond", False)),
             ("use_direct_proprio_action_cond", cfg.use_direct_proprio_action_cond, saved_cfg.get("use_direct_proprio_action_cond", False)),
+            ("use_raw_geometry_action_cond", cfg.use_raw_geometry_action_cond, saved_cfg.get("use_raw_geometry_action_cond", False)),
             ("input_feature_norm", cfg.input_feature_norm, saved_cfg.get("input_feature_norm", "layernorm")),
             ("use_gripper_trigger_head", cfg.use_gripper_trigger_head, saved_cfg.get("use_gripper_trigger_head", False)),
             ("action_space", cfg.action_space, saved_cfg.get("action_space", "joint_abs")),
+            ("bc_loss_type", bc_loss_type, saved_cfg.get("bc_loss_type", "mse")),
+            ("chunk_end_bc_weight", chunk_end_bc_weight, saved_cfg.get("chunk_end_bc_weight", 1.0)),
+            ("action_head_lr", action_head_lr, saved_cfg.get("action_head_lr", saved_cfg.get("lr"))),
+            ("lr", lr, saved_cfg.get("lr")),
+            ("backbone_lr", backbone_lr, saved_cfg.get("backbone_lr")),
+            ("flow_loss_weight", flow_loss_weight, saved_cfg.get("flow_loss_weight", 1.0)),
         ]
         _mismatches = [f"{name}: checkpoint={saved!r} vs current CLI={cur!r}"
                        for name, cur, saved in _checks
@@ -734,7 +821,9 @@ def train(
             scheduler.step()
         running_loss = 0.0
         dl_iter = iter(dl)
-        print(f"  resumed from step {step}, lr={scheduler.get_last_lr()[0]:.2e}, "
+        resumed_lrs = scheduler.get_last_lr()
+        print(f"  resumed from step {step}, trunk_lr={resumed_lrs[1]:.2e}, "
+              f"action_lr={resumed_lrs[2]:.2e}, "
               f"loss_hist entries={len(loss_history)}")
 
     best_eval_rate = max(
@@ -756,22 +845,28 @@ def train(
                  for k, v in batch.items()}
 
         with autocast("cuda", enabled=(device == "cuda")):
-            out = policy(batch)
-            v_pred = out["velocity"]
-            v_target = batch["actions"] - batch["noise"]
             mask = batch["mask"].unsqueeze(-1)  # (B, chunk_size, 1)
-            flow_dim_w = build_action_dim_weights(
-                v_pred.shape[-1], mask.device, mask.dtype, gripper_loss_weight,
-                shoulder_pan_loss_weight, shoulder_lift_loss_weight)
-            flow_dim_w_view = flow_dim_w.view(1, 1, -1)
-            flow_denom = (mask * flow_dim_w_view).sum().clamp_min(1.0)
-            flow_loss = (((v_pred - v_target) ** 2) * mask * flow_dim_w_view).sum() / flow_denom
+            out = policy(batch, compute_flow=flow_loss_weight > 0.0)
+            action_dim = batch["actions"].shape[-1]
+            if "velocity" in out:
+                v_pred = out["velocity"]
+                v_target = batch["actions"] - batch["noise"]
+                flow_dim_w = build_action_dim_weights(
+                    action_dim, mask.device, mask.dtype, gripper_loss_weight,
+                    shoulder_pan_loss_weight, shoulder_lift_loss_weight)
+                flow_dim_w_view = flow_dim_w.view(1, 1, -1)
+                flow_denom = (mask * flow_dim_w_view).sum().clamp_min(1.0)
+                flow_loss = (((v_pred - v_target) ** 2) * mask * flow_dim_w_view).sum() / flow_denom
+            else:
+                flow_loss = torch.zeros((), device=device)
             if "bc_actions" in out:
-                bc_err = ((out["bc_actions"] - batch["actions"]) ** 2) * mask
+                bc_err = build_bc_error(
+                    out["bc_actions"], batch["actions"], bc_loss_type
+                ) * mask
                 sample_w, dim_w, bc_denom = build_bc_loss_weights(
                     phase=batch.get("phase"),
                     mask=mask.squeeze(-1),
-                    action_dim=v_pred.shape[-1],
+                    action_dim=action_dim,
                     early_bc_frac=early_bc_frac,
                     early_bc_weight=early_bc_weight,
                     late_bc_frac=late_bc_frac,
@@ -779,6 +874,7 @@ def train(
                     gripper_loss_weight=gripper_loss_weight,
                     shoulder_pan_loss_weight=shoulder_pan_loss_weight,
                     shoulder_lift_loss_weight=shoulder_lift_loss_weight,
+                    chunk_end_bc_weight=chunk_end_bc_weight,
                 )
                 bc_loss = (bc_err * sample_w * dim_w.view(1, 1, -1)).sum() / bc_denom
                 loss = flow_loss_weight * flow_loss + bc_loss_weight * bc_loss
@@ -828,10 +924,11 @@ def train(
             trigger_avg = running_trigger_loss / 100
             elapsed = time.time() - t0
             sps = step / elapsed
+            current_lrs = scheduler.get_last_lr()
             loss_history.append((step, avg))
             print(f"step {step:6d} | loss {avg:.6f} | flow {flow_avg:.6f} | "
                   f"bc {bc_avg:.6f} | grip_cls {trigger_avg:.6f} | grad_norm {float(grad_norm):.3f} | "
-                  f"lr {scheduler.get_last_lr()[0]:.2e} | "
+                  f"trunk_lr {current_lrs[1]:.2e} | action_lr {current_lrs[2]:.2e} | "
                   f"{sps:.1f} steps/s | epoch {epoch}")
             running_loss = 0.0
             running_flow_loss = 0.0
@@ -865,6 +962,9 @@ def train(
                     "use_bc_head": cfg.use_bc_head,
                     "bc_loss_weight": bc_loss_weight if cfg.use_bc_head else None,
                     "flow_loss_weight": flow_loss_weight,
+                    "lr": lr,
+                    "backbone_lr": backbone_lr,
+                    "action_head_lr": action_head_lr,
                     "early_bc_weight": early_bc_weight if cfg.use_bc_head else None,
                     "early_bc_frac": early_bc_frac if cfg.use_bc_head else None,
                     "late_bc_weight": late_bc_weight if cfg.use_bc_head else None,
@@ -872,11 +972,14 @@ def train(
                     "gripper_loss_weight": gripper_loss_weight if cfg.use_bc_head else None,
                     "shoulder_pan_loss_weight": shoulder_pan_loss_weight if cfg.use_bc_head else None,
                     "shoulder_lift_loss_weight": shoulder_lift_loss_weight if cfg.use_bc_head else None,
+                    "bc_loss_type": bc_loss_type if cfg.use_bc_head else None,
+                    "chunk_end_bc_weight": chunk_end_bc_weight if cfg.use_bc_head else None,
                     "use_visual_action_cond": cfg.use_visual_action_cond,
                     "use_context_action_head": cfg.use_context_action_head,
                     "use_perception": cfg.use_perception,
                     "use_perception_action_cond": cfg.use_perception_action_cond,
                     "use_direct_proprio_action_cond": cfg.use_direct_proprio_action_cond,
+                    "use_raw_geometry_action_cond": cfg.use_raw_geometry_action_cond,
                     "perception_dim": cfg.perception_dim,
                     "input_feature_norm": cfg.input_feature_norm,
                     "use_gripper_trigger_head": cfg.use_gripper_trigger_head,
@@ -889,6 +992,14 @@ def train(
                 },
             }, ckpt_path)
             print(f"  saved checkpoint: {ckpt_path}")
+            removed = prune_step_checkpoints(
+                ckpt_dir, task_name, keep_last_checkpoints
+            )
+            if removed:
+                print(
+                    f"  pruned {len(removed)} old step checkpoint(s); "
+                    f"keeping the newest {keep_last_checkpoints}"
+                )
 
         if eval_every > 0 and step > 0 and step % eval_every == 0:
             if ema_enabled:
@@ -968,6 +1079,9 @@ def train(
             "use_bc_head": cfg.use_bc_head,
             "bc_loss_weight": bc_loss_weight if cfg.use_bc_head else None,
             "flow_loss_weight": flow_loss_weight,
+            "lr": lr,
+            "backbone_lr": backbone_lr,
+            "action_head_lr": action_head_lr,
             "early_bc_weight": early_bc_weight if cfg.use_bc_head else None,
             "early_bc_frac": early_bc_frac if cfg.use_bc_head else None,
             "late_bc_weight": late_bc_weight if cfg.use_bc_head else None,
@@ -975,11 +1089,14 @@ def train(
             "gripper_loss_weight": gripper_loss_weight if cfg.use_bc_head else None,
             "shoulder_pan_loss_weight": shoulder_pan_loss_weight if cfg.use_bc_head else None,
             "shoulder_lift_loss_weight": shoulder_lift_loss_weight if cfg.use_bc_head else None,
+            "bc_loss_type": bc_loss_type if cfg.use_bc_head else None,
+            "chunk_end_bc_weight": chunk_end_bc_weight if cfg.use_bc_head else None,
             "use_visual_action_cond": cfg.use_visual_action_cond,
             "use_context_action_head": cfg.use_context_action_head,
             "use_perception": cfg.use_perception,
             "use_perception_action_cond": cfg.use_perception_action_cond,
             "use_direct_proprio_action_cond": cfg.use_direct_proprio_action_cond,
+            "use_raw_geometry_action_cond": cfg.use_raw_geometry_action_cond,
             "perception_dim": cfg.perception_dim,
             "input_feature_norm": cfg.input_feature_norm,
             "use_gripper_trigger_head": cfg.use_gripper_trigger_head,
@@ -1015,7 +1132,16 @@ if __name__ == "__main__":
     parser.add_argument("--backbone-lr", type=float, default=1e-5,
                         help="Learning rate for pretrained DINOv2 backbone. "
                              "Lower than --lr to preserve pretrained features.")
+    parser.add_argument(
+        "--action-head-lr", type=float, default=None,
+        help="Learning rate for action decoder heads; defaults to --lr.",
+    )
     parser.add_argument("--save-every", type=int, default=5000)
+    parser.add_argument(
+        "--keep-last-checkpoints", type=int, default=0,
+        help=("Keep only this many newest step checkpoints; best/final are "
+              "never pruned. Zero keeps every step checkpoint."),
+    )
     parser.add_argument("--data-root", action="append", default=None,
                         help="Dataset root(s) to train on. May be passed "
                              "multiple times. Required — no default.")
@@ -1041,7 +1167,16 @@ if __name__ == "__main__":
     parser.add_argument("--no-bc-head", action="store_true",
                         help="Disable the deterministic behavior-cloning action head. New training enables it by default for stable receding-horizon rollout.")
     parser.add_argument("--bc-loss-weight", type=float, default=1.0,
-                        help="Weight for direct normalized action-chunk MSE when the BC head is enabled.")
+                        help="Weight for direct normalized action-chunk regression when the BC head is enabled.")
+    parser.add_argument(
+        "--bc-loss-type", choices=["mse", "l1", "smooth_l1"], default="mse",
+        help="Deterministic action regression loss. L1 is robust for continuous action chunks.",
+    )
+    parser.add_argument(
+        "--chunk-end-bc-weight", type=float, default=1.0,
+        help=("Linear BC weight at the final chunk action; 1 disables "
+              "within-chunk weighting."),
+    )
     parser.add_argument("--flow-loss-weight", type=float, default=1.0,
                         help="Weight for auxiliary flow-matching loss. Lower this when deploying the BC/context head.")
     parser.add_argument("--no-visual-action-cond", action="store_true",
@@ -1057,6 +1192,12 @@ if __name__ == "__main__":
         action="store_true",
         help=("Add the deployable joint-state embedding directly to the "
               "action decoder condition, bypassing transformer information loss."),
+    )
+    parser.add_argument(
+        "--raw-geometry-action-cond",
+        action="store_true",
+        help=("Add a zero-initialized residual from deployable raw proprio and "
+              "RGB-derived object centroid directly to action logits."),
     )
     parser.add_argument(
         "--input-feature-norm",
@@ -1163,6 +1304,7 @@ if __name__ == "__main__":
         img_size=args.img_size,
         lr=args.lr,
         backbone_lr=args.backbone_lr,
+        action_head_lr=args.action_head_lr,
         save_every=args.save_every,
         augment=args.augment,
         resume=args.resume,
@@ -1191,6 +1333,7 @@ if __name__ == "__main__":
         use_perception=not args.no_perception,
         use_perception_action_cond=not args.no_perception_action_cond,
         use_direct_proprio_action_cond=args.direct_proprio_action_cond,
+        use_raw_geometry_action_cond=args.raw_geometry_action_cond,
         input_feature_norm=args.input_feature_norm,
         early_bc_weight=args.early_bc_weight,
         early_bc_frac=args.early_bc_frac,
@@ -1199,6 +1342,8 @@ if __name__ == "__main__":
         gripper_loss_weight=args.gripper_loss_weight,
         shoulder_pan_loss_weight=args.shoulder_pan_loss_weight,
         shoulder_lift_loss_weight=args.shoulder_lift_loss_weight,
+        bc_loss_type=args.bc_loss_type,
+        chunk_end_bc_weight=args.chunk_end_bc_weight,
         use_gripper_trigger_head=args.use_gripper_trigger_head,
         gripper_trigger_loss_weight=args.gripper_trigger_loss_weight,
         gripper_trigger_label_threshold=args.gripper_trigger_label_threshold,
@@ -1211,4 +1356,5 @@ if __name__ == "__main__":
         lazy_cache_size=args.lazy_cache_size,
         episode_batches=not args.no_episode_batches,
         frame_cache=args.frame_cache,
+        keep_last_checkpoints=args.keep_last_checkpoints,
     )
