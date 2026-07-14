@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/PyTorch-2.4+-ee4c2c.svg?logo=pytorch&logoColor=white" />
   <img src="https://img.shields.io/badge/MuJoCo-3.2+-green.svg" />
   <img src="https://img.shields.io/badge/LeRobot-SO--101-orange.svg" />
-  <img src="https://img.shields.io/badge/License-MIT-yellow.svg" />
+  <img src="https://img.shields.io/badge/License-Apache--2.0-yellow.svg" />
 </p>
 
 <p align="center">
@@ -18,21 +18,40 @@
   <strong>🔁 Closed-loop grasp recovery</strong>
 </p>
 
+<p align="center">
+  <a href="#video-gallery"><b>Video Gallery</b></a> ·
+  <a href="#architecture"><b>Architecture</b></a> ·
+  <a href="#quick-start"><b>Quick Start</b></a> ·
+  <a href="docs/pick_vla_training_notes.md"><b>Technical Report</b></a>
+</p>
+
 </div>
 
 ---
 
+<a id="video-gallery"></a>
+
 ## 🎬 See It In Action
+
+Click either preview to open the full tracked MP4 directly on GitHub.
 
 <table>
   <tr>
     <td align="center" width="50%">
-      <b>One-Shot VLA Policy (81.0%)</b><br>
-      <video src="media/03_v43_one_shot.mp4" width="100%" controls></video>
+      <a href="media/03_v43_one_shot.mp4">
+        <img src="media/previews/03_v43_one_shot.png" width="100%" alt="One-shot BUD-E VLA evaluation preview">
+      </a><br>
+      <b>One-Shot VLA Policy</b><br>
+      <sub>81.0% strict success · no recovery</sub><br>
+      <a href="media/03_v43_one_shot.mp4"><b>▶ Watch MP4</b></a>
     </td>
     <td align="center" width="50%">
-      <b>With Local Grasp Recovery (94.5%)</b><br>
-      <video src="media/04_v43_feedback_recovery.mp4" width="100%" controls></video>
+      <a href="media/04_v43_feedback_recovery.mp4">
+        <img src="media/previews/04_v43_feedback_recovery.png" width="100%" alt="BUD-E feedback recovery evaluation preview">
+      </a><br>
+      <b>Feedback-Gated Recovery</b><br>
+      <sub>94.5% strict success · in-place regrasp</sub><br>
+      <a href="media/04_v43_feedback_recovery.mp4"><b>▶ Watch MP4</b></a>
     </td>
   </tr>
 </table>
@@ -40,12 +59,33 @@
 <details>
 <summary><b>📹 Full Development Timeline</b></summary>
 
-| Stage | Video | Milestone |
-|-------|-------|-----------|
-| 📷 Camera-Fixed Baseline | <video src="media/01_camera_fixed_baseline.mp4" width="240" controls></video> | Corrected camera, timing, and observation contracts |
-| 🦾 First Learned Picks | <video src="media/02_first_complete_pick.mp4" width="240" controls></video> | Spatially responsive shoulder control and full transport |
-| 🎯 Final One-Shot VLA | <video src="media/03_v43_one_shot.mp4" width="240" controls></video> | Fresh strict data, absolute TCP chunks, corrected placement metric |
-| 🔄 Feedback Recovery | <video src="media/04_v43_feedback_recovery.mp4" width="240" controls></video> | In-place reopen, realign, regrasp, verify, and continue |
+<table>
+  <tr>
+    <th width="25%">Stage</th>
+    <th width="35%">Preview</th>
+    <th width="40%">Milestone</th>
+  </tr>
+  <tr>
+    <td><b>01 · Camera-Fixed Baseline</b></td>
+    <td align="center"><a href="media/01_camera_fixed_baseline.mp4"><img src="media/previews/01_camera_fixed_baseline.png" width="220" alt="Camera-fixed training baseline preview"></a><br><a href="media/01_camera_fixed_baseline.mp4">Watch MP4</a></td>
+    <td>Corrected camera, timing, and observation contracts.</td>
+  </tr>
+  <tr>
+    <td><b>02 · First Learned Picks</b></td>
+    <td align="center"><a href="media/02_first_complete_pick.mp4"><img src="media/previews/02_first_complete_pick.png" width="220" alt="First complete learned picks preview"></a><br><a href="media/02_first_complete_pick.mp4">Watch MP4</a></td>
+    <td>Spatially responsive shoulder control and complete transport.</td>
+  </tr>
+  <tr>
+    <td><b>03 · Final One-Shot VLA</b></td>
+    <td align="center"><a href="media/03_v43_one_shot.mp4"><img src="media/previews/03_v43_one_shot.png" width="220" alt="Final one-shot VLA preview"></a><br><a href="media/03_v43_one_shot.mp4">Watch MP4</a></td>
+    <td>Fresh strict data, absolute TCP chunks, and corrected placement metrics.</td>
+  </tr>
+  <tr>
+    <td><b>04 · Feedback Recovery</b></td>
+    <td align="center"><a href="media/04_v43_feedback_recovery.mp4"><img src="media/previews/04_v43_feedback_recovery.png" width="220" alt="Final feedback recovery preview"></a><br><a href="media/04_v43_feedback_recovery.mp4">Watch MP4</a></td>
+    <td>In-place reopen, visual realignment, verified regrasp, and continuation.</td>
+  </tr>
+</table>
 
 </details>
 
@@ -63,6 +103,8 @@ BUD-E exceeds its **80% acceptance target** on 200 unseen random cube positions 
 > 🏆 **Local recovery converted 27 previous failures into successes with zero regressions.**
 
 ---
+
+<a id="architecture"></a>
 
 ## 🏗️ Architecture
 
@@ -126,6 +168,8 @@ Policy ──▶ Close Request ──▶ Wait 2 frames ──▶ Measure Jaw Pos
 - ✅ Aborts after 2 failed local cycles instead of carrying empty
 
 ---
+
+<a id="quick-start"></a>
 
 ## 🚀 Quick Start
 
@@ -286,7 +330,7 @@ Before deploying on physical SO-101 hardware:
 
 ```bibtex
 @software{bude_vla_2026,
-  author = {Aditya},
+  author = {Aditya Arora},
   title = {BUD-E: A Compact Vision-Language-Action System for Closed-Loop Pick-and-Place},
   year = {2026},
   url = {https://github.com/LoopingOutLaw/BUD-E}
