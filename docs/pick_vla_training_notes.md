@@ -1,325 +1,388 @@
 # BUD-E Final Technical Report
 
-This document describes the completed v43 SO-101 pick-and-place system. It
-replaces the former version-by-version experiment diary. Historical percentages
-that used the old transport-arrival metric are intentionally omitted because
-they are not comparable to the final release-and-settle definition.
+> **Complete documentation for the v43 SO-101 pick-and-place system.**
+>
+> This document replaces the former version-by-version experiment diary. Historical percentages that used the old transport-arrival metric are intentionally omitted because they are not comparable to the final release-and-settle definition.
 
-## 1. Objective And Acceptance
+---
 
-The task is:
+## Table of Contents
 
-> Pick up the red cube and place it in the blue target zone.
+1. [Objective & Acceptance Criteria](#1-objective--acceptance-criteria)
+2. [Final Quantitative Results](#2-final-quantitative-results)
+3. [Evaluation Semantics](#3-evaluation-semantics)
+4. [Runtime Observation & Action Contract](#4-runtime-observation--action-contract)
+5. [Model Architecture](#5-model-architecture)
+6. [Data Pipeline](#6-data-pipeline)
+7. [Training Recipe](#7-training-recipe)
+8. [Feedback-Gated Local Grasp Recovery](#8-feedback-gated-local-grasp-recovery)
+9. [Rejected Approaches](#9-rejected-approaches)
+10. [Reproduction](#10-reproduction)
+11. [Curated Videos](#11-curated-videos)
+12. [Artifact & Storage Policy](#12-artifact--storage-policy)
+13. [Physical SO-101 Deployment](#13-physical-so-101-deployment)
 
-The learned system must infer object location from RGB, control the SO-101 from
-measured robot state, and complete the task over random reachable cube
-positions. Cube pose is never supplied to the learned policy or runtime
-recovery controller.
+---
 
-The project acceptance gate is at least 80% strict success over 200 fresh random
-positions. V43 reached 81.0% as a one-shot VLA and 94.5% with feedback-gated
-local grasp recovery.
+## 1. Objective & Acceptance Criteria
 
-## 2. Final Quantitative Result
+**Task:** Pick up the red cube and place it in the blue target zone.
 
-Checkpoint:
+The learned system must infer object location from RGB, control the SO-101 from measured robot state, and complete the task over random reachable cube positions. **Cube pose is never supplied to the learned policy or runtime recovery controller.**
 
-`checkpoints/pick_v43_strict_geometry/pick_v43_strict_geometry_best.pt`
+| Gate | Threshold | v43 Result |
+|------|-----------|------------|
+| Strict success (one-shot) | ≥ 80% | **81.0%** ✅ |
+| Strict success (with recovery) | — | **94.5%** |
 
-The strict grid evaluator selected raw training step 80,000. The independent
-paired benchmark used seed 4311.
+---
 
-| Metric | One-shot VLA | With local recovery |
-| --- | ---: | ---: |
-| Strict placement success | 162/200 (81.0%) | 189/200 (94.5%) |
+## 2. Final Quantitative Results
+
+**Checkpoint:** `checkpoints/pick_v43_strict_geometry/pick_v43_strict_geometry_best.pt`
+
+The strict grid evaluator selected raw training step **80,000**. The independent paired benchmark used seed **4311**.
+
+| Metric | One-shot VLA | With Local Recovery |
+|--------|:------------:|:-------------------:|
+| **Strict placement success** | **162/200 (81.0%)** | **189/200 (94.5%)** |
 | Any cube contact | 183/200 (91.5%) | 199/200 (99.5%) |
 | Strict grasp | 174/200 (87.0%) | 196/200 (98.0%) |
 
-Of 38 one-shot failures, 27 completed in the feedback run. Twenty-six invoked a
-true local grasp retry and one needed only the bounded 650-step horizon. No
-one-shot success regressed. Eleven episodes remained failures.
+### Failure Analysis
 
-The eight-position diagnostic video scored 7/8. Five successes remained pure
-VLA rollouts and two invoked local recovery.
+- **38** one-shot failures → **27** completed with feedback (26 true local retries, 1 bounded horizon)
+- **Zero** one-shot successes regressed
+- **11** episodes remained failures after recovery
+- Diagnostic video (8 fixed positions): **7/8** (5 pure VLA, 2 with recovery)
+
+---
 
 ## 3. Evaluation Semantics
 
-Earlier evaluators stopped when a previously grasped cube moved near the bowl
-in XY. That could mark success while the cube was still held above the target.
-The final evaluator requires all of the following for eight consecutive policy
-steps:
+### Strict Placement Definition
 
-- cube center within 20 mm of the bowl center in XY;
-- cube below 50 mm world height;
-- cube translational speed below the settle threshold;
-- no contact with either gripper pad;
-- a grasp must have occurred earlier in the episode.
+Earlier evaluators stopped when a previously grasped cube moved near the bowl in XY. This could mark success while the cube was still held above the target. The final evaluator requires **all** of the following for **8 consecutive policy steps**:
 
-These semantics are shared by training-time evaluation,
-`benchmark_random_pick.py`, and `eval_pick_ball.py`.
+| Criterion | Threshold |
+|-----------|-----------|
+| Cube center to bowl center (XY) | ≤ 20 mm |
+| Cube height (world Z) | ≤ 50 mm |
+| Translational speed | < settle threshold |
+| No gripper contact | Both pads clear |
+| Grasp occurred | Earlier in episode |
 
-## 4. Runtime Observation And Action Contract
+These semantics are shared by training-time evaluation, `benchmark_random_pick.py`, and `eval_pick_ball.py`.
 
-### Observations
+---
 
-| Signal | Shape | Source |
-| --- | --- | --- |
-| Top RGB | 2 x 3 x 224 x 224 | current and previous frame |
-| Wrist RGB | 2 x 3 x 224 x 224 | current and previous frame |
-| Proprioception | 6 | five arm joints plus gripper position |
-| Instruction | up to 64 tokens | compact BPE tokenizer |
-| RGB geometry | 3 | normalized red centroid and visibility |
+## 4. Runtime Observation & Action Contract
 
-The model does not receive:
+### 4.1 Observations
 
-- simulator cube XYZ;
-- target-relative cube vectors;
-- simulator contact or strict-grasp bits;
-- episode phase or elapsed-progress features;
-- scripted-controller state;
-- post-rollout success labels.
+| Signal | Shape | Source | Notes |
+|--------|-------|--------|-------|
+| Top RGB | 2 × 3 × 224 × 224 | Current + previous frame | History-stacked |
+| Wrist RGB | 2 × 3 × 224 × 224 | Current + previous frame | History-stacked |
+| Proprioception | 6 | Measured encoders | 5 arm joints + gripper |
+| Instruction | ≤ 64 tokens | Compact BPE tokenizer | Language task spec |
+| RGB geometry | 3 | Camera pixels | Normalized red centroid + visibility |
 
-RGB geometry is calculated from camera pixels. The top-camera pixel-to-workspace
-homography is calibrated from known marker placements and does not query object
-state during rollout.
+**The model does NOT receive:**
+- ❌ Simulator cube XYZ
+- ❌ Target-relative cube vectors
+- ❌ Simulator contact or strict-grasp bits
+- ❌ Episode phase or elapsed-progress features
+- ❌ Scripted-controller state
+- ❌ Post-rollout success labels
 
-### Actions
+RGB geometry is calculated from camera pixels. The top-camera pixel-to-workspace homography is calibrated from known marker placements and does not query object state during rollout.
 
-The policy predicts 16 future four-dimensional actions:
+### 4.2 Actions
 
-~~~text
+The policy predicts **16 future four-dimensional actions**:
+
+```text
 [tcp_x, tcp_y, tcp_z, gripper]
-~~~
+```
 
-The action space is `ee_abs`: absolute TCP position plus gripper target. An
-orientation-constrained damped least-squares IK solver maps each target to the
-five arm joints. Training demonstrations and policy execution both operate at
-31.25 Hz with four MuJoCo substeps per retained action.
+| Property | Value |
+|----------|-------|
+| Action space | `ee_abs` — absolute TCP position + gripper target |
+| Controller | Orientation-constrained damped least-squares IK |
+| Policy rate | 31.25 Hz |
+| MuJoCo substeps | 4 per retained action |
+| Execution mode | Full 16-action chunk before replanning |
 
-The final deployment mode executes the complete 16-action chunk before
-replanning. Shorter horizons and temporal ensembling were benchmarked rather
-than assumed; both reduced success for the selected checkpoint.
+> **Note:** Shorter horizons and temporal ensembling were benchmarked rather than assumed; both reduced success for the selected checkpoint.
+
+---
 
 ## 5. Model Architecture
 
-The retained checkpoint contains 40,716,382 parameters.
+**Total parameters:** 40,716,382
 
-| Component | Final configuration |
-| --- | --- |
-| Vision | pretrained DINOv2 ViT-S/14 |
-| Vision input | 12 channels: two times x two RGB cameras |
-| Vision adaptation | pretrained kernel on current top RGB; other channels zero-initialized |
-| Vision fine-tuning | final four transformer blocks, norm, positions, adapter |
-| Text | compact learned BPE transformer |
-| Robot state | six-dimensional affine feature projector |
-| Domain adaptation | 32 learned soft prompts |
-| Fusion backbone | 8 layers, width 256, 8 attention heads, FFN 1024 |
-| Action decoder | context transformer, 16 x 4 outputs |
-| Spatial residual | zero-initialized joint-state plus RGB-geometry residual |
-| Action normalization | persisted per-dimension bounds from recorded data |
+| Component | Configuration |
+|-----------|---------------|
+| **Vision** | Pretrained DINOv2 ViT-S/14 |
+| Vision input | 12 channels: 2 times × 2 RGB cameras |
+| Vision adaptation | Pretrained kernel on current top RGB; other channels zero-initialized |
+| Vision fine-tuning | Final 4 transformer blocks + norm + positions + adapter |
+| **Text** | Compact learned BPE transformer |
+| **Robot state** | 6-dimensional affine feature projector |
+| **Domain adaptation** | 32 learned soft prompts |
+| **Fusion backbone** | 8 layers, width 256, 8 attention heads, FFN 1024 |
+| **Action decoder** | Context transformer, 16 × 4 outputs |
+| **Spatial residual** | Zero-initialized joint-state + RGB-geometry residual |
+| **Action normalization** | Persisted per-dimension bounds from recorded data |
 
-The repository retains the flow-matching head for architecture compatibility,
-but v43 trains the deterministic context action decoder with
-`flow_loss_weight=0`. This was the more stable representation for precise
-absolute task-space imitation on the available data and hardware.
+### Design Notes
+
+- The repository retains the flow-matching head for architecture compatibility, but v43 trains the deterministic context action decoder with `flow_loss_weight=0`. This was the more stable representation for precise absolute task-space imitation on the available data and hardware.
+- The spatial residual provides direct kinematic-state conditioning at the action decoder, avoiding the need for the transformer to preserve exact joint values through all attention layers.
+
+---
 
 ## 6. Data Pipeline
 
-V43 regenerated demonstrations instead of extending earlier datasets.
+V43 regenerated demonstrations instead of extending earlier datasets. Each stage gates the next.
 
-1. The scripted expert must pass at least 98/100 randomized strict episodes.
-2. Up to 5,000 fresh successful demonstrations are recorded.
-3. The controller plans at 125 Hz and retains every fourth action.
-4. Each retained sequence is replayed at the exact 31.25 Hz policy rate.
-5. Failed policy-rate replays are rejected before writing.
-6. Joint targets are converted to absolute TCP targets.
-7. Converted actions must pass at least 95% persisted-action replay.
-8. A 52,000-frame memory-mapped cache is built with exact reset anchors and
-   balanced early, approach, and late-task coverage.
+### 6.1 Pipeline Stages
 
-Only successful trajectories enter the final base dataset. Mild XY/Z recovery,
-light nudge recovery, and a small retry fraction provide corrective behavior
-without allowing retries to dominate the main strategy.
+```
+Expert Gate (≥98/100)
+    ↓
+Fresh Recording (≤5,000 episodes)
+    ↓
+Policy-Rate Replay Validation (reject failures)
+    ↓
+Task-Space Conversion (joint → ee_abs)
+    ↓
+Replay Gate (≥95% success)
+    ↓
+Frame Cache (52,000 frames, balanced coverage)
+    ↓
+Training
+```
 
-### Corrected demonstration defects
+### 6.2 Stage Details
 
-The following defects were fixed before the final recording:
+| Stage | Requirement |
+|-------|-------------|
+| Expert gate | ≥ 98/100 randomized strict episodes |
+| Recording | Up to 5,000 fresh successful demonstrations |
+| Control rate | 125 Hz planner, every 4th action retained |
+| Replay validation | Failed policy-rate replays rejected before writing |
+| Conversion | Joint targets → absolute TCP targets |
+| Conversion gate | ≥ 95% persisted-action replay success |
+| Frame cache | 52,000 frames, exact reset anchors, balanced early/approach/late coverage |
 
-- camera framing did not cover the complete training workspace;
-- red fingertip debug geometry confused red-object localization;
-- demonstration and deployment action rates did not match;
-- the pretrained DINO adapter was attached to the oldest rather than current
-  top frame;
-- RGB inputs lacked the expected pretrained normalization;
-- progress proprio leaked scripted episode time into inference;
-- stale contact could count as a grasp;
-- the teacher chased a cube laterally while closing instead of holding a fixed
-  final grasp anchor;
-- some recovery paths lifted toward stale pre-retry positions;
-- evaluation retained unnecessary frames and exhausted system RAM.
+### 6.3 Corrected Demonstration Defects
 
-Training loss had previously fallen despite zero closed-loop success because
-these were data and execution contract failures, not optimization failures.
+The following defects were identified and fixed before final recording:
 
-## 7. Final Training Recipe
+| # | Defect | Impact |
+|---|--------|--------|
+| 1 | Camera framing incomplete | Lost workspace coverage |
+| 2 | Red fingertip debug geometry | Confused red-object localization |
+| 3 | Action rate mismatch between demo and deploy | Execution contract violation |
+| 4 | DINO adapter on oldest (not current) top frame | Stale visual features |
+| 5 | Missing ImageNet normalization | Distribution shift |
+| 6 | Progress proprio leaked scripted time | Privileged information at inference |
+| 7 | Stale contact counted as grasp | False positive grasp detection |
+| 8 | Teacher chased cube while closing | Unstable final grasp |
+| 9 | Recovery lifted toward stale positions | Incorrect retry trajectories |
+| 10 | Evaluation retained unnecessary frames | RAM exhaustion |
+
+> **Critical insight:** Training loss had previously fallen despite zero closed-loop success because these were **data and execution contract failures**, not optimization failures.
+
+---
+
+## 7. Training Recipe
 
 | Setting | Value |
-| --- | ---: |
+|---------|------:|
 | Image size | 224 |
 | History frames | 2 |
 | Chunk size | 16 |
 | Batch size | 4 |
 | Gradient accumulation | 8 |
-| Effective batch | 32 |
+| **Effective batch** | **32** |
 | Data workers | 0 |
 | Planned steps | 220,000 |
 | Main learning rate | 2e-5 |
 | Action decoder learning rate | 1e-4 |
 | DINOv2 learning rate | 1e-7 |
-| BC objective | masked L1 |
+| BC objective | Masked L1 |
 | BC weight | 8.0 |
 | Chunk-end weight | 4.0 |
 | Gripper weight | 5.0 |
 | Flow weight | 0.0 |
-| EMA | disabled |
-| Evaluation | 64 episodes on an 8 x 8 grid every 10k steps |
+| EMA | Disabled |
+| Evaluation | 64 episodes on 8×8 grid every 10k steps |
 
-Checkpoint selection uses strict closed-loop success, not final supervised
-loss. Training keeps three recent snapshots plus `best.pt` and `final.pt`.
-This matters because later checkpoints can overfit even while training loss
-continues to decrease.
+### Checkpoint Selection
+
+- Uses **strict closed-loop success**, not final supervised loss
+- Keeps 3 recent snapshots + `best.pt` + `final.pt`
+- Later checkpoints can overfit even while training loss continues to decrease
+
+---
 
 ## 8. Feedback-Gated Local Grasp Recovery
 
-The user-facing retry requirement was: if grasping fails, do not continue to
-transport; reopen and retry from the current scene. The old implementation
-homed the arm and replayed the entire task, which recovered only 8 of 38
-failures.
+### 8.1 Design Requirement
 
-The final state machine in `src/bude_vla/grasp_retry.py` implements the
-requested local behavior:
+> "If grasping fails, do not continue to transport; reopen and retry from the current scene."
 
-1. **Policy:** pass VLA commands through unchanged.
-2. **Settle:** after a close request, wait two measured policy frames.
-3. **Verify:** treat a blocked jaw aperture as a grasp.
-4. **Open:** if empty, reopen without moving to home.
-5. **Back off:** lift 55 mm at the current TCP and clear stale action chunks.
-6. **Reacquire:** locate the displaced red cube from top-camera RGB.
-7. **Align:** use RGB plus IK for a bounded local approach and descent.
-8. **Probe:** close slowly while monitoring measured motor obstruction.
-9. **Tighten:** apply only a bounded additional close after obstruction.
-10. **Lift:** move to the demonstrated post-grasp height.
-11. **Replan:** return control to a fresh VLA chunk.
-12. **Abort:** after two failed local cycles, stop instead of carrying empty.
+The old implementation homed the arm and replayed the entire task — recovering only 8 of 38 failures. The final state machine implements **true local behavior**.
 
-Successful VLA trajectories remain bit-for-bit unchanged. The controller never
-homes the arm, resets the cube, or receives MuJoCo cube/contact state.
+### 8.2 State Machine
 
-### Grasp verification calibration
+| Step | Phase | Action |
+|------|-------|--------|
+| 1 | **Policy** | Pass VLA commands through unchanged |
+| 2 | **Settle** | After close request, wait 2 measured policy frames |
+| 3 | **Verify** | Blocked jaw aperture → grasp; empty → recovery |
+| 4 | **Open** | If empty, reopen without moving to home |
+| 5 | **Back off** | Lift 55 mm at current TCP; clear stale action chunks |
+| 6 | **Reacquire** | Locate displaced red cube from top-camera RGB |
+| 7 | **Align** | RGB + IK for bounded local approach and descent |
+| 8 | **Probe** | Close slowly while monitoring measured motor obstruction |
+| 9 | **Tighten** | Bounded additional close after obstruction |
+| 10 | **Lift** | Move to demonstrated post-grasp height |
+| 11 | **Replan** | Return control to fresh VLA chunk |
+| 12 | **Abort** | After 2 failed local cycles, stop (don't carry empty) |
 
-In simulation, empty hard closure settled near -0.175 rad. Sixty successful
-cube grasps first registered between 0.1635 and 0.1968 rad, with median 0.1803.
-The simulated default threshold of 0.08 lies between those distributions.
+### 8.3 Key Properties
 
-That number must not be copied directly to a physical SO-101. Real deployment
-must measure empty-close and object-blocked distributions for the assembled
-gripper, then choose a threshold with margin. Servo position, load/current if
-available, timeout, and a conservative lift check should all feed the hardware
-safety implementation.
+- ✅ Successful VLA trajectories remain **bit-for-bit unchanged**
+- ✅ Controller **never homes** the arm
+- ✅ Controller **never resets** the cube
+- ✅ Controller **never receives** MuJoCo cube/contact state
+
+### 8.4 Grasp Verification Calibration
+
+| Condition | Measured Position |
+|-----------|-------------------|
+| Empty hard closure | ~ -0.175 rad |
+| Successful cube grasps (60 samples) | 0.1635 – 0.1968 rad (median 0.1803) |
+| **Default threshold** | **0.08 rad** |
+
+> ⚠️ **This threshold must be recalibrated on physical hardware.** Real deployment must measure empty-close and object-blocked distributions for the assembled gripper, then choose a threshold with margin. Servo position, load/current, timeout, and conservative lift check should all feed the hardware safety implementation.
+
+---
 
 ## 9. Rejected Approaches
 
-The following were measured and intentionally not retained:
+The following were **measured and intentionally not retained**:
 
-- more steps on flawed data;
-- hidden cube position in model proprioception;
-- episode-progress proprioception;
-- whole-task homing retries;
-- deterministic VLA replan after the same local miss;
-- blind radial search around an estimated cube;
-- forced lift/transport without verified grasp;
-- shortening execution horizon for a model trained on full chunks;
-- temporal ensembling without paired validation;
-- DAgger datasets collected from policies with incorrect camera/time contracts;
-- pure end-effector delta control, which lost broad reaching accuracy.
+| Approach | Why Rejected |
+|----------|--------------|
+| More steps on flawed data | Fundamental contract issues |
+| Hidden cube position in proprio | Privileged state, not deployable |
+| Episode-progress proprio | Same issue |
+| Whole-task homing retries | Only 8/38 recovery rate |
+| Deterministic VLA replan after miss | No feedback, repeated failures |
+| Blind radial search around estimate | Unreliable, no visual confirmation |
+| Forced lift/transport without verified grasp | High drop rate |
+| Shortening horizon for full-chunk model | Reduced success |
+| Temporal ensembling without validation | Assumed, not measured |
+| DAgger from policies with wrong contracts | Garbage in, garbage out |
+| Pure end-effector delta control | Lost broad reaching accuracy |
 
-These experiments remain represented in Git history where useful, but their
-version-specific launch scripts, logs, checkpoints, caches, and videos are not
-part of the completed source snapshot.
+These experiments remain in Git history where useful, but their version-specific scripts, logs, checkpoints, caches, and videos are not part of the completed source snapshot.
+
+---
 
 ## 10. Reproduction
 
-Run the complete no-time-limit pipeline:
+### Full Pipeline
 
-~~~bash
+```bash
 cd BUD-E
 bash scripts/run_v43_strict_geometry.sh
-~~~
+```
 
-The pipeline checks free disk and available RAM, refuses concurrent data or
-training processes, resumes completed data/cache stages, and resumes the newest
-compatible checkpoint after interruption.
+The pipeline:
+- ✅ Checks free disk (≥70 GiB) and available RAM (≥6 GiB)
+- ✅ Refuses concurrent data or training processes
+- ✅ Resumes completed data/cache stages
+- ✅ Resumes newest compatible checkpoint after interruption
 
-Run tests:
+### Independent Benchmark
 
-~~~bash
+```bash
+MUJOCO_GL=egl PYTHONPATH=src python scripts/benchmark_random_pick.py \
+  --ckpt checkpoints/pick_v43_strict_geometry/pick_v43_strict_geometry_best.pt \
+  --raw-weights --num-episodes 200 --max-steps 650 --max-tries 1 \
+  --local-grasp-retry --local-grasp-retries 2 --seed 4311 \
+  --min-success-rate 0.80
+```
+
+### Tests
+
+```bash
 MUJOCO_GL=egl PYTHONPATH=src python -m unittest discover -s tests -v
-~~~
+```
 
-Run the final benchmark:
-
-~~~bash
-MUJOCO_GL=egl PYTHONPATH=src python scripts/benchmark_random_pick.py --ckpt checkpoints/pick_v43_strict_geometry/pick_v43_strict_geometry_best.pt --raw-weights --num-episodes 200 --max-steps 650 --max-tries 1 --local-grasp-retry --local-grasp-retries 2 --seed 4311 --min-success-rate 0.80
-~~~
+---
 
 ## 11. Curated Videos
 
 | File | Purpose |
-| --- | --- |
-| `media/01_camera_fixed_baseline.mp4` | early corrected training baseline |
-| `media/02_first_complete_pick.mp4` | first complete learned pick-and-place milestone |
-| `media/03_v43_one_shot.mp4` | final one-shot learned policy |
-| `media/04_v43_feedback_recovery.mp4` | final in-place closed-loop grasp recovery |
+|------|---------|
+| `media/01_camera_fixed_baseline.mp4` | Early corrected training baseline |
+| `media/02_first_complete_pick.mp4` | First complete learned pick-and-place milestone |
+| `media/03_v43_one_shot.mp4` | Final one-shot learned policy |
+| `media/04_v43_feedback_recovery.mp4` | Final in-place closed-loop grasp recovery |
 
-Generated evaluation videos belong under `demos/videos/` and remain ignored.
-Only this four-video set is tracked in Git.
+Generated evaluation videos belong under `demos/videos/` and remain ignored. Only this four-video set is tracked in Git.
 
-## 12. Artifact And Storage Policy
+---
 
-Tracked:
+## 12. Artifact & Storage Policy
 
-- source, tests, final runner, technical documentation, URDF/assets;
-- four compressed representative MP4 videos.
+### Tracked in Git
 
-Local and ignored:
+- Source, tests, final runner, technical documentation
+- URDF and assets
+- Four compressed representative MP4 videos
+- Architecture diagram (`media/bude_architecture.png`)
 
-- `data/`: recorded episodes and frame caches;
-- `checkpoints/`: model snapshots;
-- `logs/`: training and evaluation logs;
-- `demos/`: generated videos;
-- temporary files and Python caches.
+### Local / Ignored
 
-The final cache is approximately 31 GiB and is memory-mapped. Training uses
-zero data workers to avoid duplicating the cache in RAM on the development
-laptop.
+| Path | Contents | Approx. Size |
+|------|----------|-------------|
+| `data/` | Recorded episodes and frame caches | ~31 GiB |
+| `checkpoints/` | Model snapshots | Variable |
+| `logs/` | Training and evaluation logs | Variable |
+| `demos/` | Generated videos | Variable |
+
+The final cache is memory-mapped. Training uses zero data workers to avoid duplicating the cache in RAM on the development laptop.
+
+---
 
 ## 13. Physical SO-101 Deployment
 
-The simulation policy is not a drop-in command for uncalibrated hardware.
+> ⚠️ **The simulation policy is NOT a drop-in command for uncalibrated hardware.**
+
 Before physical execution:
 
-1. calibrate all joint directions, offsets, and hard limits;
-2. calibrate top and wrist cameras and refit the top-camera homography;
-3. calibrate empty and blocked gripper feedback thresholds;
-4. limit TCP velocity, joint velocity, gripper force, and recovery attempts;
-5. add an operator emergency stop and workspace exclusion zones;
-6. validate perception and IK with the arm disabled;
-7. replay slowly above the table before enabling contact;
-8. collect real demonstrations and fine-tune for the visual/physics domain gap.
+| Step | Action |
+|------|--------|
+| 1 | Calibrate all joint directions, offsets, and hard limits |
+| 2 | Calibrate top and wrist cameras; refit top-camera homography |
+| 3 | Calibrate empty and blocked gripper feedback thresholds |
+| 4 | Limit TCP velocity, joint velocity, gripper force, and recovery attempts |
+| 5 | Add operator emergency stop and workspace exclusion zones |
+| 6 | Validate perception and IK with the arm disabled |
+| 7 | Replay slowly above the table before enabling contact |
+| 8 | Collect real demonstrations and fine-tune for the visual/physics domain gap |
 
-The deployable observation design is compatible with this transition: cameras,
-joint encoders, language, and servo feedback are real signals. MuJoCo-only
-metrics remain outside control.
+The deployable observation design is compatible with this transition: cameras, joint encoders, language, and servo feedback are real signals. MuJoCo-only metrics remain outside control.
+
+---
 
 ## References
 

@@ -1,200 +1,276 @@
-# BUD-E
+<div align="center">
 
-BUD-E is a compact vision-language-action system for closed-loop pick-and-place
-with the 6-DoF LeRobot SO-101 arm. It learns from dual-camera demonstrations in
-MuJoCo, predicts task-space action chunks, and uses measured gripper feedback
-for local recovery when a grasp fails.
+# 🤖 BUD-E
 
-**Project status: complete.** The retained v43 system exceeds the project's
-80% acceptance target on 200 unseen random cube positions.
+### **A Compact Vision-Language-Action System for Closed-Loop Robotic Manipulation**
 
-## Final Results
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.11+-blue.svg?logo=python&logoColor=white" />
+  <img src="https://img.shields.io/badge/PyTorch-2.4+-ee4c2c.svg?logo=pytorch&logoColor=white" />
+  <img src="https://img.shields.io/badge/MuJoCo-3.2+-green.svg" />
+  <img src="https://img.shields.io/badge/LeRobot-SO--101-orange.svg" />
+  <img src="https://img.shields.io/badge/License-MIT-yellow.svg" />
+</p>
 
-All results use the same seeded positions and the strict placement definition:
-the cube must be released inside the bowl, below the rim, moving slowly, and
-stable for eight consecutive policy steps.
+<p align="center">
+  <strong>🎯 94.5% success on 200 unseen random positions</strong> &nbsp;|&nbsp;
+  <strong>🧠 ~40.7M parameters</strong> &nbsp;|&nbsp;
+  <strong>🔁 Closed-loop grasp recovery</strong>
+</p>
 
-| Evaluation | Success | Contact | Strict grasp |
-| --- | ---: | ---: | ---: |
-| VLA, one attempt | **162/200 (81.0%)** | 183/200 (91.5%) | 174/200 (87.0%) |
-| VLA + local feedback recovery | **189/200 (94.5%)** | 199/200 (99.5%) | 196/200 (98.0%) |
+</div>
 
-On the paired benchmark, local recovery converted 27 previous failures into
-successes with zero regressions. Twenty-six of those episodes invoked the
-closed-loop grasp recovery; one completed because of the bounded longer
-horizon. The final fixed-position video scored 7/8.
+---
 
-## Videos
+## 🎬 See It In Action
 
-These short checkpoint evaluations show the development path and final system.
-Historical videos are qualitative milestones; the table above is the canonical
-quantitative result.
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <b>One-Shot VLA Policy (81.0%)</b><br>
+      <video src="media/03_v43_one_shot.mp4" width="100%" controls></video>
+    </td>
+    <td align="center" width="50%">
+      <b>With Local Grasp Recovery (94.5%)</b><br>
+      <video src="media/04_v43_feedback_recovery.mp4" width="100%" controls></video>
+    </td>
+  </tr>
+</table>
 
-| Stage | Video | What changed |
-| --- | --- | --- |
-| Camera-fixed baseline | [MP4](media/01_camera_fixed_baseline.mp4) | Correct camera, timing, and observation contracts |
-| First complete learned picks | [MP4](media/02_first_complete_pick.mp4) | Spatially responsive shoulder control and full transport |
-| Final v43 one-shot VLA | [MP4](media/03_v43_one_shot.mp4) | Fresh strict data, absolute TCP chunks, corrected placement metric |
-| Final feedback recovery | [MP4](media/04_v43_feedback_recovery.mp4) | In-place reopen, realign, regrasp, verify, and continue |
+<details>
+<summary><b>📹 Full Development Timeline</b></summary>
 
-## System Contract
+| Stage | Video | Milestone |
+|-------|-------|-----------|
+| 📷 Camera-Fixed Baseline | <video src="media/01_camera_fixed_baseline.mp4" width="240" controls></video> | Corrected camera, timing, and observation contracts |
+| 🦾 First Learned Picks | <video src="media/02_first_complete_pick.mp4" width="240" controls></video> | Spatially responsive shoulder control and full transport |
+| 🎯 Final One-Shot VLA | <video src="media/03_v43_one_shot.mp4" width="240" controls></video> | Fresh strict data, absolute TCP chunks, corrected placement metric |
+| 🔄 Feedback Recovery | <video src="media/04_v43_feedback_recovery.mp4" width="240" controls></video> | In-place reopen, realign, regrasp, verify, and continue |
 
-The learned policy receives only signals available on a physical arm:
+</details>
 
-- current and previous 224x224 top-camera and wrist-camera RGB frames;
-- five measured arm-joint positions and one gripper position;
-- the language instruction;
-- a three-value red-component observation derived from camera pixels.
+---
 
-It never receives MuJoCo cube coordinates, target-relative object vectors,
-episode progress, simulator contacts, or success labels at inference.
-Simulator state is restricted to scripted teachers, calibration fixtures,
-diagnostics, and post-rollout metrics.
+## 📊 Results at a Glance
 
-The output is a 16-step chunk of four absolute actions:
+BUD-E exceeds its **80% acceptance target** on 200 unseen random cube positions using the strict placement definition (cube released inside the bowl, below the rim, moving slowly, and stable for 8 consecutive policy steps).
 
-```text
-[tcp_x, tcp_y, tcp_z, gripper]
+| Evaluation | Strict Success | Cube Contact | Strict Grasp |
+|:-----------|:-------------:|:-----------:|:------------:|
+| **VLA, one attempt** | **81.0%** (162/200) | 91.5% | 87.0% |
+| **VLA + Local Recovery** | **94.5%** (189/200) | 99.5% | 98.0% |
+
+> 🏆 **Local recovery converted 27 previous failures into successes with zero regressions.**
+
+---
+
+## 🏗️ Architecture
+
+<div align="center">
+  <img src="media/bude_architecture.png" width="95%" alt="BUD-E Architecture Diagram">
+</div>
+
+### Core Design
+
+BUD-E is built around five from-scratch components plus a pretrained vision backbone:
+
+| Component | Details |
+|-----------|---------|
+| **👁️ Vision** | DINOv2 ViT-S/14 with 12-channel dual-camera/history adapter; last 4 blocks fine-tuned |
+| **💬 Language** | Compact learned BPE text transformer (64 tokens max) + 32 task-domain soft prompts |
+| **🦾 Proprioception** | 6-DOF affine feature projector (5 arm joints + gripper) |
+| **🧠 Fusion Backbone** | 8-layer, 256-wide multimodal transformer with 8 attention heads, FFN 1024 |
+| **🎯 Action Decoder** | Context transformer producing 16 absolute TCP/gripper targets |
+| **📐 Spatial Residual** | Zero-initialized raw-geometry residual for precise spatial response |
+
+**Input tokens:** `[soft_prompts(32) | state_token(1) | perception(1) | patch_tokens(196) | text_tokens(T)]`
+
+**Output:** 16-step action chunk of `[tcp_x, tcp_y, tcp_z, gripper]` at 31.25 Hz
+
+An orientation-constrained damped least-squares IK controller converts each TCP target into SO-101 joint commands.
+
+---
+
+## 🔁 Closed-Loop Local Grasp Recovery
+
+BUD-E's key innovation is **feedback-gated local recovery** that wraps the VLA only after a failed grasp — successful trajectories pass through bit-for-bit unchanged.
+
+```
+Policy ──▶ Close Request ──▶ Wait 2 frames ──▶ Measure Jaw Position
+                                    │
+                    Blocked (≥0.08) │ Empty (<0.08)
+                          ┌─────────┴─────────┐
+                          ▼                   ▼
+                   ✅ Grasp Verified     ❌ Begin Recovery
+                                               │
+                                               ▼
+                                        Reopen at current TCP
+                                               │
+                                               ▼
+                                        Back off 55 mm vertically
+                                               │
+                                               ▼
+                                   RGB reacquires displaced cube
+                                               │
+                                               ▼
+                              Visual servo: approach → descend → close → tighten
+                                               │
+                                               ▼
+                                   Verify → Lift → Fresh VLA replan
 ```
 
-An orientation-constrained damped least-squares IK controller converts each TCP
-target into SO-101 joint commands. Demonstrations and deployment both run at
-31.25 Hz, with four MuJoCo substeps per retained action.
+**Critical properties:**
+- ✅ No arm homing or cube reset
+- ✅ No simulator state at inference (only cameras, joints, gripper feedback)
+- ✅ Successful VLA rollouts are completely untouched
+- ✅ Aborts after 2 failed local cycles instead of carrying empty
 
-## Model
+---
 
-The selected checkpoint contains 40,716,382 parameters:
+## 🚀 Quick Start
 
-- DINOv2 ViT-S/14 vision tower with a 12-channel dual-camera/history adapter;
-- the last four DINOv2 transformer blocks fine-tuned;
-- a compact BPE text transformer and task-domain soft prompts;
-- affine proprioceptive and RGB-geometry projectors;
-- an 8-layer, 256-wide multimodal policy transformer;
-- a context action decoder producing 16 absolute TCP/gripper targets;
-- a zero-initialized raw-geometry residual for precise spatial response.
-
-The retained model is
-`checkpoints/pick_v43_strict_geometry/pick_v43_strict_geometry_best.pt`,
-selected at raw step 80,000 by strict closed-loop evaluation. Checkpoints,
-datasets, frame caches, and logs are intentionally not stored in Git.
-
-## Local Grasp Recovery
-
-Recovery wraps the VLA only after a failed close. Successful VLA trajectories
-pass through bit-for-bit unchanged.
-
-1. The VLA requests closure.
-2. The controller waits two policy frames and reads measured jaw position.
-3. A blocked aperture verifies the grasp and returns control to the VLA.
-4. An empty close reopens at the current TCP and backs away 55 mm.
-5. Calibrated top-camera RGB reacquires the displaced cube.
-6. RGB plus IK performs a local approach, descent, slow close, and bounded
-   tighten.
-7. Motor obstruction verifies the grasp before a local lift and fresh VLA
-   replan.
-8. Loss of aperture retries locally; exhausted retries abort rather than carry
-   an empty gripper.
-
-This is not a whole-task retry: the arm is not homed and the cube is not reset.
-Runtime recovery does not read simulator object position or contact state. The
-MuJoCo jaw threshold is not a real-hardware constant and must be calibrated on
-the physical gripper.
-
-## Installation
-
-Python 3.11 or newer and a CUDA-capable PyTorch installation are recommended.
-The final model was developed on an RTX 4060 Laptop GPU with 8 GiB VRAM.
+### Installation
 
 ```bash
 git clone https://github.com/LoopingOutLaw/BUD-E.git
 cd BUD-E
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install --upgrade pip
 pip install -e ".[sim,dev]"
 ```
 
-DINOv2 weights are downloaded by `timm` on first use. For headless MuJoCo:
+**Requirements:** Python 3.11+, CUDA-capable PyTorch. Developed on RTX 4060 Laptop (8 GB VRAM).
 
+For headless MuJoCo rendering:
 ```bash
 export MUJOCO_GL=egl
 export PYTHONPATH=src
 ```
 
-## Reproduce the Final Pipeline
-
-The final pipeline performs expert validation, fresh data recording,
-policy-rate replay validation, task-space conversion, bounded cache creation,
-training, checkpoint selection, broad benchmarking, and final video export.
-It has no wall-clock timeout and is resumable at completed stages.
+### Reproduce the Full Pipeline
 
 ```bash
 cd BUD-E
 bash scripts/run_v43_strict_geometry.sh
 ```
 
-The current recipe initializes from the retained v42 geometry checkpoint. Set
-`INIT_CKPT` to an equivalent compatible checkpoint when reproducing on a
-different machine.
+This 10-stage pipeline performs expert validation → fresh data recording → replay validation → task-space conversion → frame cache → training → checkpoint selection → benchmarking → video export. It is resumable and has no wall-clock timeout.
 
-Run the canonical local-recovery benchmark independently:
+### Run the Canonical Benchmark
 
 ```bash
-MUJOCO_GL=egl PYTHONPATH=src python scripts/benchmark_random_pick.py \\
-  --ckpt checkpoints/pick_v43_strict_geometry/pick_v43_strict_geometry_best.pt \\
-  --raw-weights --num-episodes 200 --max-steps 650 --max-tries 1 \\
-  --local-grasp-retry --local-grasp-retries 2 --seed 4311 \\
+MUJOCO_GL=egl PYTHONPATH=src python scripts/benchmark_random_pick.py \
+  --ckpt checkpoints/pick_v43_strict_geometry/pick_v43_strict_geometry_best.pt \
+  --raw-weights --num-episodes 200 --max-steps 650 --max-tries 1 \
+  --local-grasp-retry --local-grasp-retries 2 --seed 4311 \
   --min-success-rate 0.80
 ```
 
-Generate the final fixed-position video:
-
-```bash
-mkdir -p demos/videos
-MUJOCO_GL=egl PYTHONPATH=src python scripts/eval_pick_ball.py \\
-  --ckpt checkpoints/pick_v43_strict_geometry/pick_v43_strict_geometry_best.pt \\
-  --raw-weights --num-episodes 8 --max-steps 650 --max-tries 1 \\
-  --local-grasp-retry --local-grasp-retries 2 \\
-  --cube-positions '0.23,-0.02;0.25,0.00;0.27,0.02;0.29,0.04;0.31,-0.01;0.33,0.05;0.22,0.06;0.34,0.03' \\
-  --out demos/videos/eval_pick_v43_local_retry.mp4
-```
-
-## Tests
+### Run Tests
 
 ```bash
 MUJOCO_GL=egl PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-The suite covers observation compatibility, action conversion, cache sampling,
-placement semantics, local retry transitions, RGB reacquisition, and the rule
-that verified VLA actions remain unchanged.
+---
 
-## Repository Layout
+## 📋 System Contract
 
-```text
-media/                                  Curated milestone and final videos
-docs/pick_vla_training_notes.md         Final technical report
-scripts/run_v43_strict_geometry.sh      End-to-end final pipeline
-scripts/record_pick_episodes.py         Fresh demonstration recorder
-scripts/validate_dataset_replay.py      Persisted-action replay gate
-scripts/build_frame_cache.py            Bounded history-aware frame cache
-scripts/train.py                        Training and strict checkpoint selection
-scripts/benchmark_random_pick.py        Broad random-position benchmark
-scripts/eval_pick_ball.py               Video evaluation
-src/bude_vla/models/                    VLA model components
-src/bude_vla/grasp_retry.py             Feedback-gated local recovery
-src/bude_vla/visual_servo.py            RGB localization and homography
-src/bude_vla/envs/                      SO-101 MuJoCo environment
-tests/                                  Regression tests
+The learned policy receives **only signals available on a physical arm**:
+
+| Signal | Shape | Source |
+|--------|-------|--------|
+| Top RGB | 2 × 3 × 224 × 224 | Current + previous frame |
+| Wrist RGB | 2 × 3 × 224 × 224 | Current + previous frame |
+| Proprioception | 6 | 5 arm joints + gripper position |
+| Instruction | ≤64 tokens | Compact BPE tokenizer |
+| RGB Geometry | 3 | Normalized red centroid + visibility |
+
+**Never provided:** MuJoCo cube coordinates, target-relative vectors, episode progress, simulator contacts, or success labels.
+
+---
+
+## 📁 Repository Layout
+
+```
+BUD-E/
+├── media/                          # Curated milestone and final videos
+│   └── bude_architecture.png       # Architecture diagram
+├── docs/
+│   └── pick_vla_training_notes.md  # Complete technical report
+├── scripts/
+│   ├── run_v43_strict_geometry.sh  # End-to-end reproduction pipeline
+│   ├── train.py                    # Training + strict checkpoint selection
+│   ├── benchmark_random_pick.py    # Broad random-position benchmark
+│   ├── eval_pick_ball.py           # Video evaluation
+│   ├── record_pick_episodes.py     # Fresh demonstration recorder
+│   ├── validate_dataset_replay.py  # Persisted-action replay gate
+│   └── build_frame_cache.py        # Bounded history-aware frame cache
+├── src/bude_vla/
+│   ├── models/                     # VLA model components
+│   │   ├── policy.py               # Full BUD-E policy
+│   │   ├── vision.py               # DINOv2 + ViT towers
+│   │   ├── backbone.py             # 8-layer policy transformer
+│   │   ├── action_head.py          # Flow-matching + BC heads
+│   │   ├── soft_prompts.py         # Domain soft prompts
+│   │   └── text_encoder.py         # BPE text transformer
+│   ├── grasp_retry.py              # Feedback-gated local recovery
+│   ├── visual_servo.py             # RGB localization + homography
+│   ├── perception.py               # Red cube detection (camera-only)
+│   ├── ik.py                       # Damped least-squares IK
+│   └── envs/so101_mjx.py           # SO-101 MuJoCo environment
+├── tests/                          # Regression tests
+└── urdf/so101_official/            # Robot URDF and assets
 ```
 
-## Technical Report
+---
 
-The final architecture, data contract, training recipe, failure analysis,
-evaluation protocol, and sim-to-real requirements are documented in
-[docs/pick_vla_training_notes.md](docs/pick_vla_training_notes.md).
+## 🧪 Training Recipe (v43)
 
-## References
+| Setting | Value |
+|--------|------:|
+| Image size | 224 |
+| History frames | 2 |
+| Chunk size | 16 |
+| Batch size | 4 (×8 grad accum = 32 effective) |
+| Planned steps | 220,000 |
+| Main LR | 2e-5 |
+| Action decoder LR | 1e-4 |
+| DINOv2 LR | 1e-7 |
+| BC objective | Masked L1 (weight 8.0) |
+| Chunk-end weight | 4.0 |
+| Gripper weight | 5.0 |
+| Evaluation | 64 episodes on 8×8 grid every 10k steps |
+
+**Key insight:** Checkpoint selection uses strict closed-loop success, not supervised loss. Later checkpoints can overfit even while training loss decreases.
+
+---
+
+## 🔬 Technical Report
+
+The complete architecture specification, data pipeline, failure analysis, evaluation protocol, rejected approaches, and sim-to-real requirements are documented in:
+
+📄 **[docs/pick_vla_training_notes.md](docs/pick_vla_training_notes.md)**
+
+---
+
+## 🛡️ Sim-to-Real Requirements
+
+Before deploying on physical SO-101 hardware:
+
+1. **Calibrate** joint directions, offsets, and hard limits
+2. **Calibrate** top and wrist cameras; refit top-camera homography
+3. **Calibrate** empty/blocked gripper feedback thresholds
+4. **Limit** TCP velocity, joint velocity, gripper force, and recovery attempts
+5. **Add** operator emergency stop and workspace exclusion zones
+6. **Validate** perception and IK with the arm disabled
+7. **Replay** slowly above the table before enabling contact
+8. **Fine-tune** with real demonstrations for the visual/physics domain gap
+
+---
+
+## 📚 References
 
 - [LeRobot SO-101](https://huggingface.co/docs/lerobot/main/en/so101)
 - [LeRobot ACT](https://huggingface.co/docs/lerobot/act)
@@ -202,7 +278,25 @@ evaluation protocol, and sim-to-real requirements are documented in
 - [OpenVLA](https://github.com/openvla/openvla)
 - [OpenVLA-OFT](https://openvla-oft.github.io/)
 - [ALOHA and ACT](https://tonyzhaozh.github.io/aloha/)
+- [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/)
 
-## License
+---
 
-See [LICENSE](LICENSE).
+## 📝 Citation
+
+```bibtex
+@software{bude_vla_2026,
+  author = {Aditya},
+  title = {BUD-E: A Compact Vision-Language-Action System for Closed-Loop Pick-and-Place},
+  year = {2026},
+  url = {https://github.com/LoopingOutLaw/BUD-E}
+}
+```
+
+---
+
+<div align="center">
+
+**Built with ❤️ by Aditya, 2026**
+
+</div>
