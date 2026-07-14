@@ -148,6 +148,8 @@ class RedCubeWorldTracker:
         homography: PlanarHomography,
         workspace_x: tuple[float, float] = (0.13, 0.52),
         workspace_y: tuple[float, float] = (-0.13, 0.20),
+        initial_workspace_x: tuple[float, float] | None = None,
+        initial_workspace_y: tuple[float, float] | None = None,
         smoothing: float = 0.25,
         max_jump_m: float = 0.025,
         occlusion_radius_m: float = 0.055,
@@ -161,6 +163,8 @@ class RedCubeWorldTracker:
         self.homography = homography
         self.workspace_x = workspace_x
         self.workspace_y = workspace_y
+        self.initial_workspace_x = initial_workspace_x or workspace_x
+        self.initial_workspace_y = initial_workspace_y or workspace_y
         self.smoothing = float(smoothing)
         self.max_jump_m = float(max_jump_m)
         self.occlusion_radius_m = float(occlusion_radius_m)
@@ -201,6 +205,22 @@ class RedCubeWorldTracker:
         return bool(distance < self.occlusion_radius_m)
 
     def update(self, data: mujoco.MjData, force: bool = False) -> np.ndarray | None:
+        self.renderer.update_scene(data, camera=self.camera_id)
+        image = np.asarray(self.renderer.render()).copy()
+        return self.update_from_image(data, image, force=force)
+
+    def update_from_image(
+        self,
+        data: mujoco.MjData,
+        image: np.ndarray,
+        force: bool = False,
+    ) -> np.ndarray | None:
+        """Update from an already-rendered/captured frame.
+
+        Rollout code can reuse the policy's top-camera frame instead of
+        rendering a second image. ``force`` is reserved for reacquisition after
+        the gripper has physically backed out of the camera's view.
+        """
         now = float(data.time)
         if not force and self._last_time == now:
             return self.last_xy
@@ -208,25 +228,32 @@ class RedCubeWorldTracker:
         if not force and self._gripper_occludes_estimate(data):
             return self.last_xy
 
-        self.renderer.update_scene(data, camera=self.camera_id)
-        image = np.asarray(self.renderer.render()).copy()
         detections = detect_red_candidates(image)
         if not len(detections):
             self._last_detection = np.zeros(3, dtype=np.float32)
             return self.last_xy
 
         world_candidates = self.homography.image_to_world(detections[:, :2])
+        x_limits = (
+            self.initial_workspace_x if self._last_xy is None else self.workspace_x
+        )
+        y_limits = (
+            self.initial_workspace_y if self._last_xy is None else self.workspace_y
+        )
         valid = (
-            (world_candidates[:, 0] >= self.workspace_x[0])
-            & (world_candidates[:, 0] <= self.workspace_x[1])
-            & (world_candidates[:, 1] >= self.workspace_y[0])
-            & (world_candidates[:, 1] <= self.workspace_y[1])
+            (world_candidates[:, 0] >= x_limits[0])
+            & (world_candidates[:, 0] <= x_limits[1])
+            & (world_candidates[:, 1] >= y_limits[0])
+            & (world_candidates[:, 1] <= y_limits[1])
         )
         valid_indices = np.flatnonzero(valid)
         if not len(valid_indices):
             return self.last_xy
 
-        if self._last_xy is None:
+        if self._last_xy is None or force:
+            # Candidates are score-sorted. Explicit reacquisition happens only
+            # after the gripper has backed away, so prefer the strongest cube
+            # component even when a collision moved it farther than max_jump_m.
             selected = int(valid_indices[0])
         else:
             distances = np.linalg.norm(
@@ -242,7 +269,7 @@ class RedCubeWorldTracker:
             [detections[selected, 0], detections[selected, 1], 1.0],
             dtype=np.float32,
         )
-        if self._last_xy is None:
+        if self._last_xy is None or force:
             self._last_xy = candidate
         else:
             self._last_xy = (

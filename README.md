@@ -11,10 +11,10 @@ post-rollout metrics.
 
 ## Current Status
 
-V42 is the retained learned-policy baseline. It preserves camera and joint
-geometry, predicts absolute TCP targets plus gripper control, and executes them
-through IK. Its selected raw step-155k artifact is stored as
-`checkpoints/pick_v42_affine_geometry/pick_v42_affine_geometry_best.pt`.
+V43 is the retained learned-policy baseline. It predicts 16 absolute TCP
+targets plus gripper control and executes them through IK. Strict grid
+evaluation selected the raw step-80k artifact at
+`checkpoints/pick_v43_strict_geometry/pick_v43_strict_geometry_best.pt`.
 
 An outcome-audit found that all earlier evaluators declared success when a
 previously grasped cube came within 50 mm of the bowl in XY. They did not
@@ -24,16 +24,29 @@ transport-arrival metrics and must not be compared to the corrected metric.
 
 Success requires the cube center within 20 mm of the bowl center, below
 50 mm, moving slowly, free of both finger pads, for eight consecutive policy
-steps. V42 scores 4/8 on the fixed set with one attempt and 5/8 with one
-same-scene retry. Its independent 200-position one-try baseline is 81/200
-(40.5%) strict success, 132/200 contact, and 108/200 strict grasp. This broad
-result, rather than the fixed eight positions, is the starting point for v43.
+steps. V43's independent 200-position one-shot result is **162/200 (81.0%)**
+strict success, **183/200 (91.5%)** contact, and **174/200 (87.0%)** strict
+grasp. This is the canonical learned-policy result.
 
-The corrected failures are spatially systematic. One-try strict success is
-70.9% in central X but 11.8% at far X; the four Y bins score 24.4%, 41.7%,
-60.0%, and 29.8%. Full-chunk diagnostics explain the gap: the expert endpoint
-changes 1.021 m/m in X and 1.004 m/m in Y, while v42 changes only 0.799 and
-0.401. Its endpoint p95 error is 47.7 mm, well outside grasp tolerance.
+The old whole-attempt retry homed the arm and replayed the task. It reached
+170/200 (85.0%) but recovered only 8 of 38 first-shot failures. It did not
+implement the intended local grasp feedback and is no longer the default.
+
+The feedback-gated local recovery scores **189/200 (94.5%)** strict success,
+**199/200 (99.5%)** contact, and **196/200 (98.0%)** strict grasp on the same
+seeded positions. Twenty-seven previous failures became successes: 26 invoked
+local recovery and one completed only with the bounded 650-step horizon. Zero
+previous successes regressed. The fixed diagnostic video scores 7/8; two
+episodes use recovery and five remain pure VLA rollouts.
+
+Normal VLA actions are unchanged. On a close request, measured jaw position is
+allowed two policy frames to settle. A blocked aperture verifies the grasp and
+the policy continues untouched. An empty close opens the jaw, backs away
+without homing, reacquires a displaced cube from calibrated top-camera RGB,
+performs only local approach/descend/close, uses sustained motor obstruction to
+trigger bounded tightening, lifts into the demonstrated state distribution,
+and returns control to a freshly replanned VLA. Runtime recovery never reads
+MuJoCo cube coordinates or contact state.
 
 Inspection also found a demonstration bug. During CLOSE, the scripted teacher
 recomputed its target from the live cube every step. When the moving jaw nudged
@@ -43,7 +56,7 @@ after contact. CLOSE now captures one fixed world-space anchor; the corrected
 expert passed 100/100 strict randomized episodes, and its policy-rate recorder
 passed 19/20 in the preflight pilot.
 
-The active **pick_v43_strict_geometry** pipeline therefore regenerates all
+The **pick_v43_strict_geometry** pipeline regenerated all
 demonstrations instead of extending flawed data. It keeps the VLA, DINOv2,
 dual cameras, language, absolute TCP action chunks, and IK execution, and adds:
 
@@ -56,8 +69,8 @@ dual cameras, language, absolute TCP action chunks, and IK execution, and adds:
 
 The centroid is calculated from camera pixels and can run on the real camera;
 it is not a simulator coordinate. Simulator cube state remains restricted to
-the teacher and metrics. No progress clock, target coordinate, or simulator
-contact is supplied to the policy.
+the teacher and metrics. The recovery camera transform and jaw-aperture
+threshold must be calibrated on the physical installation.
 
 ## Run V43
 
@@ -68,23 +81,25 @@ The script has no timeout and is resumable at completed data/cache stages and
 recent training checkpoints. It records up to 5,000 fresh attempts, rejects
 failed policy-rate replays, validates both joint and converted `ee_abs`
 controls, builds a 52k-frame cache, and trains for 220k steps. It then compares
-five execution modes, logs separate 200-position one-try and two-try results,
-and claims the target only if autonomous same-scene retries reach at least 80%
+five execution modes, logs separate 200-position one-shot and local-feedback
+results, and claims the target only if feedback recovery reaches at least 80%
 under the strict released-and-settled metric.
 
-Correct fixed-set evaluation with one autonomous same-scene retry:
+Correct fixed-set evaluation with local feedback recovery:
 
     cd /home/aditya/bude_vla
     MUJOCO_GL=egl PYTHONPATH=src /home/aditya/venv-bude/bin/python \
       scripts/eval_pick_ball.py \
       --ckpt checkpoints/pick_v43_strict_geometry/pick_v43_strict_geometry_best.pt \
-      --raw-weights --num-episodes 8 --max-steps 450 --max-tries 2 \
+      --raw-weights --num-episodes 8 --max-steps 650 --max-tries 1 \
+      --local-grasp-retry --local-grasp-retries 2 \
       --cube-positions '0.23,-0.02;0.25,0.00;0.27,0.02;0.29,0.04;0.31,-0.01;0.33,0.05;0.22,0.06;0.34,0.03' \
-      --out demos/videos/eval_pick_v43_strict_geometry.mp4
+      --out demos/videos/eval_pick_v43_local_retry.mp4
 
-On a retry, only the arm is homed. The cube remains where the failed attempt
-left it, policy history is cleared, and the policy reobserves the scene from
-RGB. Simulator cube coordinates are not added to the policy input.
+On a local retry the arm is not homed and the cube is not reset. Stale action
+chunks are cleared only after feedback confirms a miss, then the current scene
+is reacquired from RGB. Simulator cube coordinates are not added to the policy
+or recovery controller.
 
 Watch progress:
 
@@ -92,7 +107,7 @@ Watch progress:
     tail -F \
       logs/pick_v43_train.log \
       logs/pick_v43_chunk_geometry.log \
-      logs/pick_v43_random_two_try.log
+      logs/pick_v43_local_retry_random200.log
 
 ## V39 Completed Result
 
