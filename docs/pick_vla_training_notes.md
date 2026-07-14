@@ -659,13 +659,86 @@ VRAM budget.
 4. 52k dual-camera cache with exact reset anchors;
 5. 220k training steps with strict 8x8 checkpoint evaluation;
 6. full-chunk geometry diagnostics and five deployment-mode comparisons;
-7. independent 200-position one-try and two-try benchmarks;
+7. independent 200-position one-shot and local-feedback benchmarks;
 8. a strict release-and-settle diagnostic video.
 
-The acceptance gate is at least 80% over 200 fresh random positions with at
-most one autonomous same-scene retry. The one-try rate is always reported
-separately. A retry homes only the arm, preserves the physically displaced
-cube, clears action/history state, and reobserves the scene from RGB.
+The acceptance gate is at least 80% over 200 fresh random positions. The
+one-shot rate is always reported separately. Feedback recovery never homes the
+arm or resets the cube and receives no simulator object/contact state.
+
+### Completed v43 result
+
+Strict training evaluation selected the raw step-80k checkpoint. The
+independent one-shot benchmark, using full 16-action chunk execution, scored:
+
+```text
+strict success: 162/200 (81.0%)
+any contact:    183/200 (91.5%)
+strict grasp:   174/200 (87.0%)
+```
+
+The old whole-attempt retry reached 170/200 (85.0%), but it recovered only 8
+of 38 first-shot failures. Homing and replaying the entire task was not the
+requested behavior and did not address deterministic local misses.
+
+### Feedback-gated local grasp recovery
+
+Direct simulator calibration established a large aperture margin. An empty
+hard close settles near `-0.175` rad, while 60 successful cube grasps first
+registered between `0.1635` and `0.1968` rad (median `0.1803`). The default
+`0.08` threshold lies between those distributions. It must be recalibrated on
+the physical gripper rather than copied blindly from MuJoCo.
+
+The deployed state machine is deliberately outside the learned policy and
+uses only signals available on a real arm:
+
+1. VLA actions pass through unchanged until it requests gripper closure.
+2. Two 31.25 Hz frames allow measured jaw position to settle.
+3. A blocked aperture verifies the grasp; all current and future VLA actions
+   remain bit-for-bit unchanged.
+4. An empty close opens at the current TCP, backs up 55 mm, clears the stale
+   action chunk, and reacquires the displaced red cube from top-camera RGB.
+5. Calibrated RGB plus IK performs only the local approach, descent, and fixed
+   close-anchor sequence. It does not restart the task.
+6. A slow close probe watches measured motor obstruction. Detection captures
+   that command, tightens by a bounded amount, and lifts to the demonstrated
+   post-grasp height before returning to a freshly replanned VLA.
+7. Loss of aperture during tightening/lift reopens and retries; exhaustion
+   aborts instead of transporting an empty gripper.
+
+The RGB homography is fitted from known calibration-marker placements before
+rollout. Runtime control reads only pixels and the fitted transform. MuJoCo
+cube pose and finger contacts remain diagnostic/metric-only and are never
+passed to `LocalGraspRetryController`.
+
+Several superficially plausible variants were rejected by paired tests:
+
+- reopen/backoff followed by another deterministic VLA query stayed at 32/40,
+  exactly equal to the one-shot prefix;
+- forcing a successful grasp through a synthetic hold/lift changed trajectories
+  that were already correct and caused regressions;
+- blind radial search repeated the offset without reliable direction;
+- waiting until full jaw closure reacted after transient grasps had already
+  ejected the cube.
+
+The final same-seed paired pilot improved from 32/40 to 39/40 with zero
+regressions and strict grasp in 40/40 episodes. The independent 200-position
+result is:
+
+```text
+strict success: 189/200 (94.5%)
+any contact:    199/200 (99.5%)
+strict grasp:   196/200 (98.0%)
+new successes:   27 prior failures
+  local retry:   26
+  longer horizon: 1
+regressed:        0 prior successes
+```
+
+The fixed diagnostic video scored 7/8; two episodes invoked local recovery.
+The recovery benchmark uses 650 maximum policy steps so two bounded local
+cycles have enough time. This is not a second whole-task attempt:
+`--max-tries 1` remains mandatory.
 
 Obsolete v37-v41 checkpoints/data, both old 6k/64k caches, temporary smoke
 artifacts, and redundant v42 step snapshots were removed after verifying the
@@ -732,6 +805,9 @@ MUJOCO_GL=egl PYTHONPATH=src \
 - [ALOHA ACT action chunking](https://tonyzhaozh.github.io/aloha/)
 - [LeRobot ACT documentation](https://huggingface.co/docs/lerobot/act)
 - [LeRobot SmolVLA documentation](https://huggingface.co/docs/lerobot/smolvla)
+- [LeRobot SO-101 documentation](https://huggingface.co/docs/lerobot/main/en/so101)
+- [LeRobot hardware integration](https://huggingface.co/docs/lerobot/main/en/integrate_hardware)
+- [Waveshare ST3215 servo manual](https://files.waveshare.com/upload/f/f4/ST3215_Servo_User_Manual.pdf)
 - [Octo generalist robot policy](https://octo-models.github.io/)
 - [RT-H action hierarchies](https://rt-hierarchy.github.io/)
 - [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/)

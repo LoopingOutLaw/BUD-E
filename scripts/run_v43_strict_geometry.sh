@@ -294,7 +294,7 @@ run_mode ensemble_4 --ensembling --ensembling-k 0.5 --replan-every 4
   printf '\n'
 } | tee "$LOG_DIR/pick_v43_execution_mode.txt"
 
-stage 9/10 "Broad strict one-shot and autonomous-retry benchmarks"
+stage 9/10 "Broad strict one-shot and local feedback-retry benchmarks"
 "$PYTHON" scripts/benchmark_random_pick.py \
   --ckpt "$SELECTED_CKPT" \
   --raw-weights \
@@ -309,11 +309,13 @@ set +e
   --ckpt "$SELECTED_CKPT" \
   --raw-weights \
   --num-episodes 200 \
-  --max-steps 450 \
-  --max-tries 2 \
+  --max-steps 650 \
+  --max-tries 1 \
+  --local-grasp-retry \
+  --local-grasp-retries 2 \
   --seed 4311 \
   "${DEPLOY_ARGS[@]}" \
-  --min-success-rate 0.80 2>&1 | tee "$LOG_DIR/pick_v43_random_two_try.log"
+  --min-success-rate 0.80 2>&1 | tee "$LOG_DIR/pick_v43_local_retry_random200.log"
 ACCEPT_STATUS=${PIPESTATUS[0]}
 set -e
 
@@ -322,23 +324,25 @@ stage 10/10 "Strict-placement diagnostic video and result"
   --ckpt "$SELECTED_CKPT" \
   --raw-weights \
   --num-episodes 8 \
-  --max-steps 450 \
-  --max-tries 2 \
+  --max-steps 650 \
+  --max-tries 1 \
+  --local-grasp-retry \
+  --local-grasp-retries 2 \
   "${DEPLOY_ARGS[@]}" \
   --cube-positions '0.23,-0.02;0.25,0.00;0.27,0.02;0.29,0.04;0.31,-0.01;0.33,0.05;0.22,0.06;0.34,0.03' \
-  --out "$VIDEO_DIR/eval_pick_v43_strict_geometry.mp4" \
-  2>&1 | tee "$LOG_DIR/pick_v43_video.log"
+  --out "$VIDEO_DIR/eval_pick_v43_local_retry.mp4" \
+  2>&1 | tee "$LOG_DIR/pick_v43_local_retry_video.log"
 
 echo "selected checkpoint: $SELECTED_CKPT"
 echo "deployment mode: $BEST_MODE"
 echo "geometry gate status: $GEOMETRY_STATUS"
 echo "one-try benchmark: $LOG_DIR/pick_v43_random_one_try.log"
-echo "two-try benchmark: $LOG_DIR/pick_v43_random_two_try.log"
-echo "video: $VIDEO_DIR/eval_pick_v43_strict_geometry.mp4"
+echo "local-retry benchmark: $LOG_DIR/pick_v43_local_retry_random200.log"
+echo "video: $VIDEO_DIR/eval_pick_v43_local_retry.mp4"
 df -h "$ROOT"
 
 if (( ACCEPT_STATUS != 0 )); then
-  echo "V43 completed, but did not meet the strict 80% two-try acceptance gate."
+  echo "V43 completed, but did not meet the strict 80% local-retry acceptance gate."
   exit "$ACCEPT_STATUS"
 fi
 

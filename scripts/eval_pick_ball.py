@@ -33,7 +33,13 @@ import numpy as np
 import torch
 from pathlib import Path
 
-from bude_vla.action_space import apply_policy_action, make_ik_controller, uses_ik_action_space
+from bude_vla.action_space import (
+    action_space_from_cfg,
+    apply_policy_action,
+    ee_delta_scale_from_cfg,
+    make_ik_controller,
+    uses_ik_action_space,
+)
 from bude_vla.data.action_normalization import denormalize_actions
 from bude_vla.data.lerobot_v3 import _tokenize_instruction, _domain_from_instruction
 from bude_vla.envs.so101_mjx import (
@@ -52,6 +58,16 @@ from bude_vla.envs.so101_mjx import (
 )
 from bude_vla.models.policy import BUDEPolicy, BUDEConfig, apply_saved_config
 from bude_vla.perception import detect_red_centroid
+from bude_vla.grasp_retry import (
+    LocalGraspRetryConfig,
+    LocalGraspRetryController,
+    add_local_grasp_retry_args,
+    local_grasp_retry_config_from_args,
+)
+from bude_vla.visual_servo import (
+    RedCubeWorldTracker,
+    calibrate_red_cube_homography,
+)
 
 INSTRUCTION = "pick up the red cube and place it in the blue target zone"
 MAX_STEPS = 4000
@@ -205,7 +221,9 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
              cube_x_range: tuple[float, float] = PICK_WORKSPACE_X_RANGE,
              cube_y_range: tuple[float, float] = PICK_WORKSPACE_Y_RANGE,
              max_steps: int = MAX_STEPS,
-             max_tries: int = 1):
+             max_tries: int = 1,
+             local_retry_config: LocalGraspRetryConfig | None = None,
+             visual_tracker: RedCubeWorldTracker | None = None):
     rng = np.random.default_rng(seed)
     all_frames = []
     n_success = 0
@@ -243,10 +261,18 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
         chunk = None
         cursor = 0
         action_queue: list = []  # only used when ensembling=True
+        last_policy_action: np.ndarray | None = None
         ever_grasped = False
         close_until = -1
         placement = BowlPlacementTracker()
         ik = make_ik_controller(model, data) if uses_ik_action_space(cfg) else None
+        local_retry = (
+            LocalGraspRetryController(action_space_from_cfg(cfg), local_retry_config)
+            if local_retry_config is not None else None
+        )
+        if visual_tracker is not None:
+            visual_tracker.reset()
+        local_events: list[str] = []
         img_buffer = []  # reset per episode
 
         for rollout_step in range(max_steps * max(1, max_tries)):
@@ -260,13 +286,35 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
                 chunk = None
                 cursor = 0
                 action_queue = []
+                last_policy_action = None
                 close_until = -1
                 placement.reset()
                 img_buffer = []
                 ik = make_ik_controller(model, data) if uses_ik_action_space(cfg) else None
+                if local_retry is not None:
+                    local_retry.reset()
+                if visual_tracker is not None:
+                    visual_tracker.reset()
             # Render from SAME cameras as training
             obs_renderer.update_scene(data, camera=front_top_cam)
             img_top = np.asarray(obs_renderer.render()).copy()
+            visual_target_xyz = None
+            if visual_tracker is not None:
+                force_reacquire = bool(
+                    local_retry is not None
+                    and local_retry.needs_visual_reacquire
+                )
+                if visual_tracker.last_xy is None or force_reacquire:
+                    visual_xy = visual_tracker.update_from_image(
+                        data, img_top, force=True
+                    )
+                else:
+                    visual_xy = visual_tracker.last_xy
+                if visual_xy is not None:
+                    visual_target_xyz = np.asarray(
+                        [visual_xy[0], visual_xy[1], CUBE_REST_Z],
+                        dtype=np.float64,
+                    )
             obs_renderer.update_scene(data, camera=wrist_cam)
             img_wrist = np.asarray(obs_renderer.render()).copy()
             img = np.concatenate([img_top, img_wrist], axis=-1)
@@ -300,7 +348,14 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
 
             batch = build_batch(stacked_img, arm_proprio, text_ids, device,
                                 n_history_frames=n_h)
-            if ensembling:
+            policy_paused = (
+                local_retry is not None
+                and local_retry.blocks_policy
+                and last_policy_action is not None
+            )
+            if policy_paused:
+                a = last_policy_action.copy()
+            elif ensembling:
                 # Replan every `replan_every` steps (default: every step) and
                 # blend with whatever's left in the queue instead of blindly
                 # committing to a full chunk_size-step open-loop sequence.
@@ -334,6 +389,30 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
                     cursor += 1
                     if action_lo is not None:
                         a = denormalize_actions(a, action_lo, action_hi)
+            if not policy_paused:
+                last_policy_action = np.asarray(a).copy()
+
+            if local_retry is not None and not np.any(np.isnan(a)):
+                if ik is None:
+                    raise RuntimeError("local grasp retry requires an IK action space")
+                retry_step = local_retry.step(
+                    a,
+                    ik.get_ee_position(),
+                    float(data.qpos[GRIPPER_QPOS_START]),
+                    visual_target_xyz=visual_target_xyz,
+                )
+                a = retry_step.action
+                if retry_step.reset_policy:
+                    chunk = None
+                    cursor = 0
+                    action_queue = []
+                    if not local_retry.blocks_policy:
+                        last_policy_action = None
+                if retry_step.event is not None:
+                    local_events.append(retry_step.event)
+                abort_local_attempt = retry_step.abort_attempt
+            else:
+                abort_local_attempt = False
 
             if not np.any(np.isnan(a)):
                 arm_target, gripper_ctrl = apply_policy_action(
@@ -360,7 +439,11 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
 
             frame = add_overlay(
                 vid_frame,
-                f"ep {ep} try {try_idx + 1}/{max_tries} step {step}",
+                f"ep {ep} try {try_idx + 1}/{max_tries} step {step}"
+                + (
+                    f" local={local_retry.phase} r={local_retry.retries_used}"
+                    if local_retry is not None else ""
+                ),
                                 grasped=(use_contact_signal and is_grasping > 0.5))
             all_frames.append(frame)
 
@@ -372,7 +455,20 @@ def run_eval(policy, model, data, obs_renderer, vid_renderer, text_ids,
                     vf = np.asarray(vid_renderer.render()).copy()
                     f = add_overlay(vf, f"ep {ep}", "SUCCESS", grasped=False)
                     all_frames.append(f)
-                print(f"SUCCESS (try {try_idx + 1}, step {step})")
+                local_suffix = (
+                    f", local_retries={local_retry.retries_used}"
+                    if local_retry is not None else ""
+                )
+                print(f"SUCCESS (try {try_idx + 1}, step {step}{local_suffix})")
+                break
+
+            if abort_local_attempt:
+                f = add_overlay(vid_frame, f"ep {ep}", "FAILED")
+                all_frames.append(f)
+                print(
+                    "FAILED (local grasp retries exhausted at "
+                    f"step {step})"
+                )
                 break
 
             if is_failure(data, step, max_steps=max_steps):
@@ -439,6 +535,7 @@ def main():
                     help="Robot-side reflex: close/hold gripper briefly after any-pad cube contact.")
     ap.add_argument("--contact-close-steps", type=int, default=120)
     ap.add_argument("--contact-close-value", type=float, default=-1.0)
+    add_local_grasp_retry_args(ap)
     ap.add_argument("--cube-positions", default=None,
                     help="Explicit eval cube positions as 'x,y;x,y'. Repeats if "
                          "--num-episodes is larger than the list.")
@@ -466,6 +563,59 @@ def main():
     obs_renderer = mujoco.Renderer(model, height=obs_img_size, width=obs_img_size)
     vid_renderer = mujoco.Renderer(model, height=args.video_size, width=args.video_size)
     text_ids = _tokenize_instruction(INSTRUCTION)
+    local_retry_config = None
+    visual_tracker = None
+    if args.local_grasp_retry:
+        if not uses_ik_action_space(cfg):
+            raise ValueError(
+                "--local-grasp-retry requires an ee_abs or ee_delta checkpoint"
+            )
+        local_retry_config = local_grasp_retry_config_from_args(
+            args,
+            ee_delta_scale=ee_delta_scale_from_cfg(cfg),
+        )
+        print(
+            "local grasp retry enabled: "
+            f"retries={local_retry_config.max_retries} "
+            f"qpos_threshold={local_retry_config.grasp_qpos_threshold:+.3f} "
+            f"recovery={local_retry_config.recovery_mode}"
+        )
+        if local_retry_config.recovery_mode == "rgb":
+            reset_arm(model, data)
+            front_top_cam = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_CAMERA, "front_top"
+            )
+            homography, calibration = calibrate_red_cube_homography(
+                model,
+                data,
+                obs_renderer,
+                front_top_cam,
+                x_range=tuple(args.cube_x_range),
+                y_range=tuple(args.cube_y_range),
+                grid_size=5,
+            )
+            print(
+                "local RGB calibration: "
+                f"points={int(calibration['points'])} "
+                f"mean={calibration['mean_error_m'] * 1000:.2f}mm "
+                f"p95={calibration['p95_error_m'] * 1000:.2f}mm",
+                flush=True,
+            )
+            visual_tracker = RedCubeWorldTracker(
+                obs_renderer,
+                front_top_cam,
+                homography,
+                workspace_x=(
+                    args.cube_x_range[0] - 0.03,
+                    args.cube_x_range[1] + 0.18,
+                ),
+                workspace_y=(
+                    args.cube_y_range[0] - 0.10,
+                    args.cube_y_range[1] + 0.12,
+                ),
+                initial_workspace_x=tuple(args.cube_x_range),
+                initial_workspace_y=tuple(args.cube_y_range),
+            )
 
     cube_positions = parse_cube_positions(args.cube_positions)
     if cube_positions:
@@ -489,6 +639,8 @@ def main():
         cube_y_range=tuple(args.cube_y_range),
         max_steps=args.max_steps,
         max_tries=args.max_tries,
+        local_retry_config=local_retry_config,
+        visual_tracker=visual_tracker,
     )
 
     rate = n_success / n_total * 100 if n_total > 0 else 0
