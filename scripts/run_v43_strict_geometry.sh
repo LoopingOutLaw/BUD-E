@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-ROOT=/home/aditya/bude_vla
-PYTHON=/home/aditya/venv-bude/bin/python
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+if [[ -z "${PYTHON:-}" ]]; then
+  if [[ -x "$ROOT/.venv/bin/python" ]]; then
+    PYTHON="$ROOT/.venv/bin/python"
+  elif [[ -x /home/aditya/venv-bude/bin/python ]]; then
+    PYTHON=/home/aditya/venv-bude/bin/python
+  else
+    PYTHON=$(command -v python3 || true)
+  fi
+elif [[ "$PYTHON" != */* ]]; then
+  PYTHON=$(command -v "$PYTHON" || true)
+fi
 JOINT_DATA_ROOT="$ROOT/data/pick_v43_strict_joint"
 EE_DATA_ROOT="$ROOT/data/pick_v43_strict_ee_abs"
 CACHE_DIR="$EE_DATA_ROOT/cache_224_h2_reset52k"
-INIT_CKPT="$ROOT/checkpoints/pick_v42_affine_geometry/pick_v42_affine_geometry_best.pt"
+INIT_CKPT=${INIT_CKPT:-"$ROOT/checkpoints/pick_v42_affine_geometry/pick_v42_affine_geometry_best.pt"}
 TASK=pick_v43_strict_geometry
 CKPT_DIR="$ROOT/checkpoints/$TASK"
 LOG_DIR="$ROOT/logs"
@@ -50,7 +60,10 @@ require_available_ram_gb() {
 }
 
 stage 0/10 "Preflight"
-test -x "$PYTHON"
+if [[ -z "$PYTHON" || ! -x "$PYTHON" ]]; then
+  echo "FATAL: no Python interpreter found; activate a venv or set PYTHON"
+  exit 1
+fi
 test -s "$INIT_CKPT"
 require_free_gb 70
 require_available_ram_gb 6

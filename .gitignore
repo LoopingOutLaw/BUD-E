@@ -19,6 +19,8 @@ data/
 !src/bude_vla/data/
 !src/bude_vla/data/**
 *.mp4
+!media/
+!media/*.mp4
 *.parquet
 .DS_Store
 __pycache__/
